@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from config import AGENT_PORT, MCP_SERVERS
+from config import AGENT_PORT, MCP_SERVERS, TTS_VOICES, TTS_VOICE
 from conversation import Conversation
 from mcp_manager import MCPManager
 from stt import transcribe
@@ -48,6 +48,11 @@ async def health():
     return JSONResponse({"status": "ok"})
 
 
+@app.get("/api/voices")
+async def voices():
+    return JSONResponse({"voices": TTS_VOICES, "default": TTS_VOICE})
+
+
 async def send_json(ws: WebSocket, msg_type: str, text: str):
     await ws.send_text(json.dumps({"type": msg_type, "text": text}))
 
@@ -57,12 +62,13 @@ async def websocket_endpoint(ws: WebSocket):
     global conversation
     await ws.accept()
     log.info("WebSocket connected")
+    voice = TTS_VOICE
 
     try:
         while True:
             message = await ws.receive()
 
-            # Text message — control commands (e.g. reset)
+            # Text message — control commands
             if "text" in message:
                 try:
                     data = json.loads(message["text"])
@@ -70,6 +76,11 @@ async def websocket_endpoint(ws: WebSocket):
                         conversation.reset()
                         await send_json(ws, "status", "Conversation reset.")
                         log.info("Conversation reset by client")
+                        continue
+                    if data.get("type") == "settings":
+                        if "voice" in data:
+                            voice = data["voice"]
+                            log.info("Voice set to %s", voice)
                         continue
                 except json.JSONDecodeError:
                     continue
@@ -113,7 +124,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # 3. TTS
                 await send_json(ws, "status", "Speaking...")
                 try:
-                    wav_bytes = await synthesize(reply)
+                    wav_bytes = await synthesize(reply, voice=voice)
                     await ws.send_bytes(wav_bytes)
                 except Exception as e:
                     log.exception("TTS failed")

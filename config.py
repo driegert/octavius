@@ -7,6 +7,28 @@ TTS_URL = "http://triplestuffed:8020/v1/audio/speech"
 TTS_MODEL = "/media/extra_stuff/huggingface/mistralai/Voxtral-4B-TTS-2603"
 TTS_VOICE = "de_male"
 TTS_FORMAT = "wav"
+TTS_VOICES = [
+    "de_male",
+    "de_female",
+    "neutral_male",
+    "neutral_female",
+    "casual_male",
+    "casual_female",
+    "cheerful_female",
+    "ar_male",
+    "es_female",
+    "es_male",
+    "fr_female",
+    "fr_male",
+    "hi_female",
+    "hi_male",
+    "it_female",
+    "it_male",
+    "nl_female",
+    "nl_male",
+    "pt_female",
+    "pt_male",
+]
 
 AGENT_PORT = 8030
 MAX_TOOL_ROUNDS = 10
