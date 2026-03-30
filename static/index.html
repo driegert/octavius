@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Octavius</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: #0a0a0f;
+    color: #c8c8d0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 2rem;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+    font-weight: 400;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: #6a6a7a;
+    margin-bottom: 2rem;
+  }
+
+  #status {
+    font-size: 0.9rem;
+    color: #8888a0;
+    margin-bottom: 1.5rem;
+    min-height: 1.2em;
+    transition: color 0.2s;
+  }
+
+  #status.active { color: #60a0ff; }
+
+  #talk-btn {
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    border: 2px solid #333;
+    background: #151520;
+    color: #8888a0;
+    font-size: 0.8rem;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    transition: all 0.2s;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  #talk-btn:hover { border-color: #555; color: #aaa; }
+  #talk-btn.recording {
+    border-color: #ff4444;
+    background: #201015;
+    color: #ff6666;
+    box-shadow: 0 0 30px rgba(255, 68, 68, 0.15);
+  }
+  #talk-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  #transcript-area {
+    margin-top: 2rem;
+    width: 100%;
+    max-width: 600px;
+    text-align: center;
+  }
+
+  .label {
+    font-size: 0.7rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: #555;
+    margin-bottom: 0.3rem;
+  }
+
+  #user-text, #assistant-text {
+    font-size: 0.95rem;
+    line-height: 1.5;
+    margin-bottom: 1.2rem;
+    min-height: 1.4em;
+    color: #aaa;
+  }
+
+  #assistant-text { color: #d0d0e0; }
+
+  #controls {
+    margin-top: 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1.2rem;
+  }
+
+  #speed-control {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  #speed-control label {
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #555;
+  }
+
+  #speed-slider {
+    width: 100px;
+    accent-color: #60a0ff;
+    cursor: pointer;
+  }
+
+  #speed-value {
+    font-size: 0.75rem;
+    color: #8888a0;
+    min-width: 3em;
+    text-align: center;
+  }
+
+  #trim-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+  }
+
+  #trim-toggle label {
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #555;
+    cursor: pointer;
+  }
+
+  #trim-cb {
+    accent-color: #60a0ff;
+    cursor: pointer;
+  }
+
+  #reset-btn {
+    background: none;
+    border: 1px solid #2a2a35;
+    color: #555;
+    padding: 0.4rem 1rem;
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+
+  #reset-btn:hover { border-color: #555; color: #888; }
+</style>
+</head>
+<body>
+
+<h1>Octavius</h1>
+<div id="status">Connecting...</div>
+<button id="talk-btn" disabled>HOLD TO<br>TALK</button>
+
+<div id="transcript-area">
+  <div class="label">You said</div>
+  <div id="user-text"></div>
+  <div class="label">Octavius</div>
+  <div id="assistant-text"></div>
+</div>
+
+<div id="controls">
+  <div id="speed-control">
+    <label for="speed-slider">Speed</label>
+    <input type="range" id="speed-slider" min="1.0" max="2.0" step="0.1" value="1.4">
+    <span id="speed-value">1.4x</span>
+  </div>
+  <div id="trim-toggle">
+    <input type="checkbox" id="trim-cb" checked>
+    <label for="trim-cb">Trim silence</label>
+  </div>
+  <button id="reset-btn">Reset conversation</button>
+</div>
+
+<script>
+(function() {
+  const statusEl   = document.getElementById('status');
+  const talkBtn    = document.getElementById('talk-btn');
+  const userText   = document.getElementById('user-text');
+  const assistText = document.getElementById('assistant-text');
+  const resetBtn   = document.getElementById('reset-btn');
+  const speedSlider = document.getElementById('speed-slider');
+  const speedValue  = document.getElementById('speed-value');
+  const trimCb      = document.getElementById('trim-cb');
+
+  let ws = null;
+  let mediaRecorder = null;
+  let audioChunks = [];
+  let reconnectDelay = 1000;
+  let audioCtx = null;
+  let currentSource = null;
+
+  function getAudioCtx() {
+    if (!audioCtx) audioCtx = new AudioContext();
+    return audioCtx;
+  }
+
+  // Restore saved settings
+  const savedSpeed = localStorage.getItem('octavius-speed');
+  const savedTrim  = localStorage.getItem('octavius-trim');
+  if (savedSpeed !== null) {
+    speedSlider.value = savedSpeed;
+    speedValue.textContent = parseFloat(savedSpeed).toFixed(1) + 'x';
+  }
+  if (savedTrim !== null) {
+    trimCb.checked = savedTrim === 'true';
+  }
+
+  speedSlider.addEventListener('input', () => {
+    speedValue.textContent = parseFloat(speedSlider.value).toFixed(1) + 'x';
+    localStorage.setItem('octavius-speed', speedSlider.value);
+  });
+
+  trimCb.addEventListener('change', () => {
+    localStorage.setItem('octavius-trim', trimCb.checked);
+  });
+
+  function setStatus(text, active) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle('active', !!active);
+  }
+
+  // Trim silence from an AudioBuffer.
+  // Detects runs of samples below a threshold and shortens them.
+  function trimSilence(audioBuffer) {
+    const sampleRate = audioBuffer.sampleRate;
+    const numChannels = audioBuffer.numberOfChannels;
+
+    // Work from channel 0 for silence detection
+    const data = audioBuffer.getChannelData(0);
+    const len = data.length;
+
+    // Threshold: samples below this RMS (over a small window) are "silent"
+    const silenceThreshold = 0.01;
+    const windowSize = Math.floor(sampleRate * 0.02); // 20ms window for RMS
+    const minSilenceDuration = Math.floor(sampleRate * 0.15); // silences longer than 150ms get trimmed
+    const keepSilence = Math.floor(sampleRate * 0.06); // keep 60ms of each silence gap
+
+    // Compute RMS energy per window
+    function rms(start, end) {
+      let sum = 0;
+      const n = Math.min(end, len) - start;
+      if (n <= 0) return 0;
+      for (let i = start; i < start + n; i++) {
+        sum += data[i] * data[i];
+      }
+      return Math.sqrt(sum / n);
+    }
+
+    // Find silent regions
+    const silentRegions = [];
+    let inSilence = false;
+    let silenceStart = 0;
+
+    for (let i = 0; i < len; i += windowSize) {
+      const energy = rms(i, i + windowSize);
+      if (energy < silenceThreshold) {
+        if (!inSilence) {
+          inSilence = true;
+          silenceStart = i;
+        }
+      } else {
+        if (inSilence) {
+          const duration = i - silenceStart;
+          if (duration > minSilenceDuration) {
+            silentRegions.push({ start: silenceStart, end: i });
+          }
+          inSilence = false;
+        }
+      }
+    }
+    // Handle trailing silence
+    if (inSilence && (len - silenceStart) > minSilenceDuration) {
+      silentRegions.push({ start: silenceStart, end: len });
+    }
+
+    if (silentRegions.length === 0) return audioBuffer;
+
+    // Build list of segments to keep
+    const segments = [];
+    let pos = 0;
+    for (const region of silentRegions) {
+      // Keep audio before this silent region
+      if (region.start > pos) {
+        segments.push({ start: pos, end: region.start });
+      }
+      // Keep a small bit of the silence (for natural pacing)
+      const trimmedStart = region.start;
+      const trimmedEnd = Math.min(region.start + keepSilence, region.end);
+      segments.push({ start: trimmedStart, end: trimmedEnd });
+      pos = region.end;
+    }
+    // Keep audio after last silent region
+    if (pos < len) {
+      segments.push({ start: pos, end: len });
+    }
+
+    // Calculate new length
+    let newLen = 0;
+    for (const seg of segments) newLen += (seg.end - seg.start);
+
+    if (newLen >= len * 0.95) return audioBuffer; // barely any trimming, skip
+
+    const ctx = getAudioCtx();
+    const newBuffer = ctx.createBuffer(numChannels, newLen, sampleRate);
+
+    for (let ch = 0; ch < numChannels; ch++) {
+      const src = audioBuffer.getChannelData(ch);
+      const dst = newBuffer.getChannelData(ch);
+      let writePos = 0;
+      for (const seg of segments) {
+        const chunk = src.subarray(seg.start, seg.end);
+        dst.set(chunk, writePos);
+        writePos += chunk.length;
+      }
+    }
+
+    return newBuffer;
+  }
+
+  // Play audio with silence trimming via Web Audio API, then speed via
+  // HTMLMediaElement.preservesPitch (browser's built-in pitch-preserving stretch).
+  async function playProcessedAudio(arrayBuffer) {
+    const speed = parseFloat(speedSlider.value);
+
+    if (trimCb.checked) {
+      // Decode, trim silence, re-encode to WAV blob for the Audio element
+      const ctx = getAudioCtx();
+      if (ctx.state === 'suspended') await ctx.resume();
+      const buffer = trimSilence(await ctx.decodeAudioData(arrayBuffer));
+      arrayBuffer = audioBufferToWav(buffer);
+    }
+
+    const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.preservesPitch = true;
+    audio.playbackRate = speed;
+
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      setStatus('Ready');
+      talkBtn.disabled = false;
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      setStatus('Ready');
+      talkBtn.disabled = false;
+    };
+
+    audio.play().catch(() => {
+      setStatus('Ready');
+      talkBtn.disabled = false;
+    });
+  }
+
+  // Encode an AudioBuffer back to a WAV ArrayBuffer
+  function audioBufferToWav(buffer) {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const length = buffer.length;
+    const bytesPerSample = 2; // 16-bit PCM
+    const dataSize = length * numChannels * bytesPerSample;
+    const headerSize = 44;
+    const out = new ArrayBuffer(headerSize + dataSize);
+    const view = new DataView(out);
+
+    function writeStr(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);           // chunk size
+    view.setUint16(20, 1, true);            // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+    view.setUint16(32, numChannels * bytesPerSample, true);
+    view.setUint16(34, 16, true);           // bits per sample
+    writeStr(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    // Interleave channels and convert float32 -> int16
+    let offset = 44;
+    const channels = [];
+    for (let ch = 0; ch < numChannels; ch++) channels.push(buffer.getChannelData(ch));
+
+    for (let i = 0; i < length; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        const s = Math.max(-1, Math.min(1, channels[ch][i]));
+        view.setInt16(offset, s * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+
+    return out;
+  }
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+    ws.onopen = () => {
+      setStatus('Ready');
+      talkBtn.disabled = false;
+      reconnectDelay = 1000;
+    };
+
+    ws.onmessage = (evt) => {
+      if (typeof evt.data === 'string') {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'status')     setStatus(msg.text, true);
+        if (msg.type === 'transcript') userText.textContent = msg.text;
+        if (msg.type === 'response') {
+          assistText.textContent = msg.text;
+          setStatus('Speaking...', true);
+        }
+      }
+    };
+
+    ws.binaryType = 'arraybuffer';
+    ws.addEventListener('message', (evt) => {
+      if (evt.data instanceof ArrayBuffer) {
+        playProcessedAudio(evt.data).catch(() => {
+          setStatus('Ready');
+          talkBtn.disabled = false;
+        });
+      }
+    });
+
+    ws.onclose = () => {
+      talkBtn.disabled = true;
+      setStatus('Disconnected. Reconnecting...');
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    };
+
+    ws.onerror = () => ws.close();
+  }
+
+  async function startRecording() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunks = [];
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(blob);
+          talkBtn.disabled = true;
+          setStatus('Sending audio...', true);
+        }
+      };
+      mediaRecorder.start();
+      talkBtn.classList.add('recording');
+      setStatus('Recording...', true);
+    } catch (err) {
+      setStatus('Microphone access denied.');
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+      talkBtn.classList.remove('recording');
+    }
+  }
+
+  // Hold-to-talk (mouse + touch)
+  talkBtn.addEventListener('mousedown', (e) => { e.preventDefault(); startRecording(); });
+  talkBtn.addEventListener('mouseup', stopRecording);
+  talkBtn.addEventListener('mouseleave', stopRecording);
+  talkBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+  talkBtn.addEventListener('touchend', stopRecording);
+  talkBtn.addEventListener('touchcancel', stopRecording);
+
+  resetBtn.addEventListener('click', () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'reset' }));
+      userText.textContent = '';
+      assistText.textContent = '';
+    }
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+[project]
+name = "voice-assistant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.135.2",
+    "httpx>=0.28.1",
+    "mcp>=1.26.0",
+    "uvicorn[standard]>=0.42.0",
+    "websockets>=16.0",
+]
