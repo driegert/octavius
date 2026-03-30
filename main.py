@@ -10,7 +10,7 @@ from conversation import Conversation
 from mcp_manager import MCPManager
 from stt import transcribe
 from tts import synthesize
-from agent import run_agent_turn
+from agent import run_agent_turn, stream_agent_turn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,33 +58,43 @@ async def send_json(ws: WebSocket, msg_type: str, text: str):
 
 
 async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled):
-    """Run agent loop + optional TTS for a single user turn."""
+    """Run agent loop with streaming TTS: synthesize each sentence as it arrives."""
     await send_json(ws, "status", "Thinking...")
 
     async def status_cb(text: str):
         await send_json(ws, "status", text)
 
+    full_reply_parts = []
+    first_sentence = True
+
     try:
-        reply = await run_agent_turn(
+        async for sentence in stream_agent_turn(
             conversation, mcp_manager, user_text, status_callback=status_cb
-        )
+        ):
+            full_reply_parts.append(sentence)
+
+            if tts_enabled:
+                if first_sentence:
+                    await send_json(ws, "status", "Speaking...")
+                    first_sentence = False
+                try:
+                    wav_bytes = await synthesize(sentence, voice=voice)
+                    await ws.send_bytes(wav_bytes)
+                except Exception as e:
+                    log.exception("TTS failed for chunk")
+                    # Continue with remaining sentences
+
     except Exception as e:
         log.exception("Agent failed")
         await send_json(ws, "status", f"Agent error: {e}")
         return
 
-    await send_json(ws, "response", reply)
+    full_reply = "".join(full_reply_parts).strip()
+    if full_reply:
+        await send_json(ws, "response", full_reply)
 
-    if tts_enabled:
-        await send_json(ws, "status", "Speaking...")
-        try:
-            wav_bytes = await synthesize(reply, voice=voice)
-            await ws.send_bytes(wav_bytes)
-        except Exception as e:
-            log.exception("TTS failed")
-            await send_json(ws, "status", f"TTS failed: {e}")
-    else:
-        await send_json(ws, "status", "Ready")
+    # Signal end of audio stream
+    await send_json(ws, "status", "audio_done")
 
 
 @app.websocket("/ws")

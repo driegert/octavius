@@ -2,6 +2,7 @@ import json
 import re
 import uuid
 import logging
+from collections.abc import AsyncGenerator
 
 import httpx
 
@@ -13,6 +14,9 @@ log = logging.getLogger(__name__)
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+# Sentence-ending punctuation followed by space or end-of-string
+SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
 
 async def run_agent_turn(
     conversation: Conversation,
@@ -20,7 +24,24 @@ async def run_agent_turn(
     user_text: str,
     status_callback=None,
 ) -> str:
-    """Run one user turn through the agentic loop. Returns assistant text."""
+    """Run one user turn (non-streaming). Returns full assistant text."""
+    result_parts = []
+    async for chunk in stream_agent_turn(conversation, mcp, user_text, status_callback):
+        result_parts.append(chunk)
+    return "".join(result_parts)
+
+
+async def stream_agent_turn(
+    conversation: Conversation,
+    mcp: MCPManager,
+    user_text: str,
+    status_callback=None,
+) -> AsyncGenerator[str, None]:
+    """Run one user turn, yielding sentence chunks as the LLM streams them.
+
+    Tool call rounds are handled internally (non-streaming). Only the final
+    text response is streamed sentence-by-sentence.
+    """
     conversation.add_user(user_text)
     conversation.trim()
 
@@ -29,57 +50,128 @@ async def run_agent_turn(
         payload = {
             "model": LLM_MODEL,
             "messages": messages,
+            "stream": True,
         }
         if mcp.tools:
             payload["tools"] = mcp.tools
 
+        # --- Streaming request ---
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(LLM_URL, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+                async with client.stream("POST", LLM_URL, json=payload) as resp:
+                    resp.raise_for_status()
+
+                    # Accumulators
+                    full_content = ""
+                    tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
+                    in_think = False
+                    sentence_buffer = ""
+
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        delta = data["choices"][0].get("delta", {})
+
+                        # --- Tool call deltas ---
+                        if "tool_calls" in delta:
+                            for tc_delta in delta["tool_calls"]:
+                                idx = tc_delta["index"]
+                                if idx not in tool_calls_acc:
+                                    tool_calls_acc[idx] = {
+                                        "id": tc_delta.get("id", ""),
+                                        "name": tc_delta.get("function", {}).get("name", ""),
+                                        "arguments": "",
+                                    }
+                                else:
+                                    if tc_delta.get("id"):
+                                        tool_calls_acc[idx]["id"] = tc_delta["id"]
+                                    if tc_delta.get("function", {}).get("name"):
+                                        tool_calls_acc[idx]["name"] = tc_delta["function"]["name"]
+                                args_chunk = tc_delta.get("function", {}).get("arguments", "")
+                                if args_chunk:
+                                    tool_calls_acc[idx]["arguments"] += args_chunk
+                            continue
+
+                        # --- Content deltas ---
+                        token = delta.get("content", "")
+                        if not token:
+                            continue
+
+                        full_content += token
+
+                        # Strip <think> blocks on the fly
+                        if "<think>" in token:
+                            in_think = True
+                        if in_think:
+                            if "</think>" in token:
+                                in_think = False
+                            continue
+
+                        sentence_buffer += token
+
+                        # Check for sentence boundaries and yield complete sentences
+                        parts = SENTENCE_END.split(sentence_buffer)
+                        if len(parts) > 1:
+                            # Yield all complete sentences, keep the last partial
+                            for sentence in parts[:-1]:
+                                sentence = sentence.strip()
+                                if sentence:
+                                    yield sentence + " "
+                            sentence_buffer = parts[-1]
+
         except Exception as e:
             log.exception("LLM request failed")
-            return f"I'm having trouble reaching my brain right now. Error: {e}"
+            yield f"I'm having trouble reaching my brain right now. Error: {e}"
+            return
 
-        choice = data["choices"][0]
-        message = choice["message"]
-
-        # Check for tool calls
-        tool_calls = message.get("tool_calls")
-        if tool_calls:
-            for tc in tool_calls:
-                func = tc["function"]
-                call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
-                name = func["name"]
-                args_str = func.get("arguments", "{}")
+        # --- Handle tool calls if any ---
+        if tool_calls_acc:
+            for idx in sorted(tool_calls_acc.keys()):
+                tc = tool_calls_acc[idx]
+                call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
+                name = tc["name"]
+                args_str = tc["arguments"]
 
                 if status_callback:
                     await status_callback(f"Using tool: {name}...")
 
                 try:
-                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    args = json.loads(args_str) if args_str else {}
                 except json.JSONDecodeError:
                     args = {}
 
-                conversation.add_tool_call(call_id, name, args_str if isinstance(args_str, str) else json.dumps(args_str))
+                conversation.add_tool_call(call_id, name, args_str)
                 result = await mcp.call_tool(name, args)
                 conversation.add_tool_result(call_id, result)
 
             conversation.trim()
-            continue  # Loop back for the LLM to process tool results
+            continue  # Loop back for LLM to process tool results
 
-        # No tool calls — we have a final text response
-        content = message.get("content", "")
-        content = THINK_RE.sub("", content).strip()
+        # --- Final text response (no tool calls) ---
+        # Flush remaining sentence buffer
+        remaining = sentence_buffer.strip()
+        if remaining:
+            yield remaining
 
-        if not content:
-            content = "I'm not sure how to respond to that."
+        # Clean full content for conversation history
+        clean = THINK_RE.sub("", full_content).strip()
+        if not clean:
+            clean = "I'm not sure how to respond to that."
+            yield clean
 
-        conversation.add_assistant(content)
-        return content
+        conversation.add_assistant(clean)
+        return
 
     # Safety limit reached
     fallback = "I've been going back and forth with my tools for a while. Let me just give you what I have so far."
     conversation.add_assistant(fallback)
-    return fallback
+    yield fallback

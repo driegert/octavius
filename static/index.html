@@ -663,15 +663,47 @@
     return newBuffer;
   }
 
-  // --- Audio playback
-  async function playProcessedAudio(arrayBuffer) {
+  // --- Audio queue for streaming playback
+  const audioQueue = [];
+  let isPlaying = false;
+  let audioDone = false; // true when server signals all chunks sent
+
+  function enqueueAudio(arrayBuffer) {
+    audioQueue.push(arrayBuffer);
+    if (!isPlaying) playNext();
+  }
+
+  function signalAudioDone() {
+    audioDone = true;
+    // If nothing is playing and queue is empty, we're done
+    if (!isPlaying && audioQueue.length === 0) finishPlayback();
+  }
+
+  function finishPlayback() {
+    setStatus('Ready');
+    talkBtn.disabled = false;
+    textSend.disabled = !textInput.value.trim();
+    audioDone = false;
+  }
+
+  async function playNext() {
+    if (audioQueue.length === 0) {
+      isPlaying = false;
+      if (audioDone) finishPlayback();
+      return;
+    }
+
+    isPlaying = true;
+    let arrayBuffer = audioQueue.shift();
     const speed = parseFloat(speedSlider.value);
 
     if (trimCb.checked) {
-      const ctx = getAudioCtx();
-      if (ctx.state === 'suspended') await ctx.resume();
-      const buffer = trimSilence(await ctx.decodeAudioData(arrayBuffer));
-      arrayBuffer = audioBufferToWav(buffer);
+      try {
+        const ctx = getAudioCtx();
+        if (ctx.state === 'suspended') await ctx.resume();
+        const buffer = trimSilence(await ctx.decodeAudioData(arrayBuffer));
+        arrayBuffer = audioBufferToWav(buffer);
+      } catch (e) { /* use original if decode fails */ }
     }
 
     const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
@@ -682,22 +714,14 @@
 
     audio.onended = () => {
       URL.revokeObjectURL(url);
-      setStatus('Ready');
-      talkBtn.disabled = false;
-      textSend.disabled = !textInput.value.trim();
+      playNext();
     };
     audio.onerror = () => {
       URL.revokeObjectURL(url);
-      setStatus('Ready');
-      talkBtn.disabled = false;
-      textSend.disabled = !textInput.value.trim();
+      playNext();
     };
 
-    audio.play().catch(() => {
-      setStatus('Ready');
-      talkBtn.disabled = false;
-      textSend.disabled = !textInput.value.trim();
-    });
+    audio.play().catch(() => playNext());
   }
 
   function audioBufferToWav(buffer) {
@@ -760,18 +784,21 @@
       if (typeof evt.data === 'string') {
         const msg = JSON.parse(evt.data);
         if (msg.type === 'status') {
-          setStatus(msg.text, true);
-          if (msg.text === 'Ready') {
-            talkBtn.disabled = false;
-            textSend.disabled = !textInput.value.trim();
+          if (msg.text === 'audio_done') {
+            // Server finished sending all audio chunks
+            signalAudioDone();
+          } else {
+            setStatus(msg.text, true);
+            if (msg.text === 'Ready') {
+              talkBtn.disabled = false;
+              textSend.disabled = !textInput.value.trim();
+            }
           }
         }
         if (msg.type === 'transcript') userText.textContent = msg.text;
         if (msg.type === 'response') {
           assistText.textContent = msg.text;
-          if (ttsEnabled) {
-            setStatus('Speaking...', true);
-          } else {
+          if (!ttsEnabled) {
             setStatus('Ready');
             talkBtn.disabled = false;
             textSend.disabled = !textInput.value.trim();
@@ -783,11 +810,8 @@
     ws.binaryType = 'arraybuffer';
     ws.addEventListener('message', (evt) => {
       if (evt.data instanceof ArrayBuffer) {
-        playProcessedAudio(evt.data).catch(() => {
-          setStatus('Ready');
-          talkBtn.disabled = false;
-          textSend.disabled = !textInput.value.trim();
-        });
+        setStatus('Speaking...', true);
+        enqueueAudio(evt.data);
       }
     });
 
