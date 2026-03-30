@@ -1,11 +1,16 @@
-import json
+from datetime import datetime
 
 from config import SYSTEM_PROMPT, MAX_CONVERSATION_MESSAGES
 
 
+def _build_system_prompt() -> str:
+    now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+    return f"{SYSTEM_PROMPT}\n\nCurrent date and time: {now}"
+
+
 class Conversation:
     def __init__(self):
-        self._messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._messages: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
 
     def add_user(self, text: str):
         self._messages.append({"role": "user", "content": text})
@@ -47,4 +52,4 @@ class Conversation:
             self._messages = [self._messages[0]] + non_system[-MAX_CONVERSATION_MESSAGES:]
 
     def reset(self):
-        self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._messages = [{"role": "system", "content": _build_system_prompt()}]

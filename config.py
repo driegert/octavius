@@ -51,7 +51,7 @@ MCP_SERVERS = {
         ],
         "env": {
             "SEARX_HOST": "https://searxng.riegert.xyz",
-            "SSL_CERT_FILE": "/usr/lib/ssl/cert.pem",
+            "SSL_CERT_FILE": "/etc/ssl/cert.pem",
         },
     },
 }
