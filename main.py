@@ -57,39 +57,82 @@ async def send_json(ws: WebSocket, msg_type: str, text: str):
     await ws.send_text(json.dumps({"type": msg_type, "text": text}))
 
 
+async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled):
+    """Run agent loop + optional TTS for a single user turn."""
+    await send_json(ws, "status", "Thinking...")
+
+    async def status_cb(text: str):
+        await send_json(ws, "status", text)
+
+    try:
+        reply = await run_agent_turn(
+            conversation, mcp_manager, user_text, status_callback=status_cb
+        )
+    except Exception as e:
+        log.exception("Agent failed")
+        await send_json(ws, "status", f"Agent error: {e}")
+        return
+
+    await send_json(ws, "response", reply)
+
+    if tts_enabled:
+        await send_json(ws, "status", "Speaking...")
+        try:
+            wav_bytes = await synthesize(reply, voice=voice)
+            await ws.send_bytes(wav_bytes)
+        except Exception as e:
+            log.exception("TTS failed")
+            await send_json(ws, "status", f"TTS failed: {e}")
+    else:
+        await send_json(ws, "status", "Ready")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     global conversation
     await ws.accept()
     log.info("WebSocket connected")
     voice = TTS_VOICE
+    tts_enabled = True
 
     try:
         while True:
             message = await ws.receive()
 
-            # Text message — control commands
+            # Text message — control commands or typed input
             if "text" in message:
                 try:
                     data = json.loads(message["text"])
-                    if data.get("type") == "reset":
-                        conversation.reset()
-                        await send_json(ws, "status", "Conversation reset.")
-                        log.info("Conversation reset by client")
-                        continue
-                    if data.get("type") == "settings":
-                        if "voice" in data:
-                            voice = data["voice"]
-                            log.info("Voice set to %s", voice)
-                        continue
                 except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") == "reset":
+                    conversation.reset()
+                    await send_json(ws, "status", "Conversation reset.")
+                    log.info("Conversation reset by client")
+                    continue
+
+                if data.get("type") == "settings":
+                    if "voice" in data:
+                        voice = data["voice"]
+                        log.info("Voice set to %s", voice)
+                    if "tts" in data:
+                        tts_enabled = data["tts"]
+                        log.info("TTS %s", "enabled" if tts_enabled else "disabled")
+                    continue
+
+                if data.get("type") == "text_input":
+                    user_text = data.get("text", "").strip()
+                    if not user_text:
+                        continue
+                    await send_json(ws, "transcript", user_text)
+                    await _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled)
                     continue
 
             # Binary message — audio blob
             if "bytes" in message:
                 audio_bytes = message["bytes"]
 
-                # 1. Transcribe
                 await send_json(ws, "status", "Transcribing...")
                 try:
                     user_text = await transcribe(audio_bytes)
@@ -103,32 +146,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
 
                 await send_json(ws, "transcript", user_text)
-
-                # 2. Agent loop
-                await send_json(ws, "status", "Thinking...")
-
-                async def status_cb(text: str):
-                    await send_json(ws, "status", text)
-
-                try:
-                    reply = await run_agent_turn(
-                        conversation, mcp_manager, user_text, status_callback=status_cb
-                    )
-                except Exception as e:
-                    log.exception("Agent failed")
-                    await send_json(ws, "status", f"Agent error: {e}")
-                    continue
-
-                await send_json(ws, "response", reply)
-
-                # 3. TTS
-                await send_json(ws, "status", "Speaking...")
-                try:
-                    wav_bytes = await synthesize(reply, voice=voice)
-                    await ws.send_bytes(wav_bytes)
-                except Exception as e:
-                    log.exception("TTS failed")
-                    await send_json(ws, "status", f"TTS failed: {e}")
+                await _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled)
 
     except (WebSocketDisconnect, RuntimeError):
         log.info("WebSocket disconnected")

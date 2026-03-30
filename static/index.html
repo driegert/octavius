@@ -25,8 +25,65 @@
     letter-spacing: 0.3em;
     text-transform: uppercase;
     color: #6a6a7a;
-    margin-bottom: 2rem;
+    margin-bottom: 0.6rem;
   }
+
+  /* Mode toggles below title */
+  #mode-toggles {
+    display: flex;
+    gap: 1.2rem;
+    margin-bottom: 1.8rem;
+  }
+
+  .mode-toggle {
+    position: relative;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0.3rem;
+    transition: all 0.2s;
+  }
+
+  .mode-toggle svg {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: #60a0ff;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: stroke 0.2s, opacity 0.2s;
+    opacity: 0.7;
+  }
+
+  .mode-toggle:hover svg { opacity: 1; }
+
+  .mode-toggle.off svg { stroke: #444; opacity: 0.4; }
+
+  .mode-toggle .strike {
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 28px;
+    height: 0;
+    border-top: 1.5px solid #ff5555;
+    transform: translate(-50%, -50%) rotate(-45deg);
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+  }
+
+  .mode-toggle.off .strike { opacity: 0.8; }
+
+  .mode-label {
+    font-size: 0.55rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #555;
+    text-align: center;
+    margin-top: 0.15rem;
+  }
+
+  .mode-toggle.off .mode-label { color: #333; }
 
   #status {
     font-size: 0.9rem;
@@ -38,6 +95,7 @@
 
   #status.active { color: #60a0ff; }
 
+  /* Talk button */
   #talk-btn {
     width: 120px;
     height: 120px;
@@ -70,6 +128,46 @@
     cursor: not-allowed;
     box-shadow: none;
   }
+
+  /* Text input (visible when STT off) */
+  #text-input-area {
+    display: none;
+    width: 100%;
+    max-width: 500px;
+  }
+
+  #text-input-area.visible { display: flex; gap: 0.5rem; }
+
+  #text-input {
+    flex: 1;
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #c8c8d0;
+    font-family: inherit;
+    font-size: 0.9rem;
+    padding: 0.7rem 0.9rem;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  #text-input:focus { border-color: #60a0ff; }
+
+  #text-input::placeholder { color: #444; }
+
+  #text-send {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #8888a0;
+    padding: 0.7rem 1rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  #text-send:hover { border-color: #555; color: #ccc; }
+  #text-send:disabled { opacity: 0.3; cursor: not-allowed; }
 
   #transcript-area {
     margin-top: 2rem;
@@ -266,8 +364,35 @@
 </div>
 
 <h1>Octavius</h1>
+
+<div id="mode-toggles">
+  <button class="mode-toggle" id="stt-toggle" title="Speech input">
+    <!-- Speech bubble icon -->
+    <svg viewBox="0 0 24 24">
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+    </svg>
+    <div class="strike"></div>
+    <div class="mode-label">voice in</div>
+  </button>
+  <button class="mode-toggle" id="tts-toggle" title="Audio output">
+    <!-- Speaker/audio icon -->
+    <svg viewBox="0 0 24 24">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+    </svg>
+    <div class="strike"></div>
+    <div class="mode-label">voice out</div>
+  </button>
+</div>
+
 <div id="status">Connecting...</div>
 <button id="talk-btn" disabled>HOLD TO<br>TALK</button>
+
+<div id="text-input-area">
+  <input type="text" id="text-input" placeholder="Type your message..." autocomplete="off">
+  <button id="text-send" disabled>Send</button>
+</div>
 
 <div id="transcript-area">
   <div class="label">You said</div>
@@ -282,18 +407,23 @@
 
 <script>
 (function() {
-  const statusEl     = document.getElementById('status');
-  const talkBtn      = document.getElementById('talk-btn');
-  const userText     = document.getElementById('user-text');
-  const assistText   = document.getElementById('assistant-text');
-  const resetBtn     = document.getElementById('reset-btn');
-  const settingsBtn  = document.getElementById('settings-btn');
-  const settingsOver = document.getElementById('settings-overlay');
-  const settingsClose= document.getElementById('settings-close');
-  const voiceSelect  = document.getElementById('voice-select');
-  const speedSlider  = document.getElementById('speed-slider');
-  const speedValue   = document.getElementById('speed-value');
-  const trimCb       = document.getElementById('trim-cb');
+  const statusEl      = document.getElementById('status');
+  const talkBtn       = document.getElementById('talk-btn');
+  const userText      = document.getElementById('user-text');
+  const assistText    = document.getElementById('assistant-text');
+  const resetBtn      = document.getElementById('reset-btn');
+  const settingsBtn   = document.getElementById('settings-btn');
+  const settingsOver  = document.getElementById('settings-overlay');
+  const settingsClose = document.getElementById('settings-close');
+  const voiceSelect   = document.getElementById('voice-select');
+  const speedSlider   = document.getElementById('speed-slider');
+  const speedValue    = document.getElementById('speed-value');
+  const trimCb        = document.getElementById('trim-cb');
+  const sttToggle     = document.getElementById('stt-toggle');
+  const ttsToggle     = document.getElementById('tts-toggle');
+  const textInputArea = document.getElementById('text-input-area');
+  const textInput     = document.getElementById('text-input');
+  const textSend      = document.getElementById('text-send');
 
   let ws = null;
   let mediaRecorder = null;
@@ -301,13 +431,67 @@
   let reconnectDelay = 1000;
   let audioCtx = null;
   let currentVoice = 'de_male';
+  let sttEnabled = true;
+  let ttsEnabled = true;
 
   function getAudioCtx() {
     if (!audioCtx) audioCtx = new AudioContext();
     return audioCtx;
   }
 
-  // --- Per-voice settings stored as: octavius-prefs = { voice, voices: { "de_male": { speed, trim }, ... } }
+  // --- Mode toggles
+  function updateInputMode() {
+    if (sttEnabled) {
+      talkBtn.style.display = '';
+      textInputArea.classList.remove('visible');
+    } else {
+      talkBtn.style.display = 'none';
+      textInputArea.classList.add('visible');
+      textInput.focus();
+    }
+    sttToggle.classList.toggle('off', !sttEnabled);
+    ttsToggle.classList.toggle('off', !ttsEnabled);
+
+    // Persist
+    const prefs = loadPrefs();
+    prefs.sttEnabled = sttEnabled;
+    prefs.ttsEnabled = ttsEnabled;
+    savePrefs(prefs);
+  }
+
+  sttToggle.addEventListener('click', () => {
+    sttEnabled = !sttEnabled;
+    updateInputMode();
+  });
+
+  ttsToggle.addEventListener('click', () => {
+    ttsEnabled = !ttsEnabled;
+    updateInputMode();
+    sendSettings();
+  });
+
+  // --- Text input submission
+  function submitText() {
+    const text = textInput.value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'text_input', text }));
+    textInput.value = '';
+    textSend.disabled = true;
+    setStatus('Sending...', true);
+  }
+
+  textSend.addEventListener('click', submitText);
+  textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitText();
+    }
+  });
+  textInput.addEventListener('input', () => {
+    textSend.disabled = !textInput.value.trim();
+  });
+
+  // --- Per-voice settings
   function loadPrefs() {
     try { return JSON.parse(localStorage.getItem('octavius-prefs')) || {}; } catch { return {}; }
   }
@@ -341,10 +525,13 @@
     saveVoicePrefs(currentVoice, parseFloat(speedSlider.value), trimCb.checked);
   }
 
-  // Restore last-used voice
+  // Restore saved state
   const prefs = loadPrefs();
   if (prefs.voice) currentVoice = prefs.voice;
+  if (prefs.sttEnabled !== undefined) sttEnabled = prefs.sttEnabled;
+  if (prefs.ttsEnabled !== undefined) ttsEnabled = prefs.ttsEnabled;
   applyVoicePrefs(currentVoice);
+  updateInputMode();
 
   // --- Settings panel
   settingsBtn.addEventListener('click', () => settingsOver.classList.add('open'));
@@ -353,7 +540,6 @@
     if (e.target === settingsOver) settingsOver.classList.remove('open');
   });
 
-  // Fetch voices from server and populate dropdown
   fetch('/api/voices').then(r => r.json()).then(data => {
     voiceSelect.innerHTML = '';
     for (const v of data.voices) {
@@ -362,7 +548,6 @@
       opt.textContent = v.replace(/_/g, ' ');
       voiceSelect.appendChild(opt);
     }
-    // Restore saved voice or use server default
     if (data.voices.includes(currentVoice)) {
       voiceSelect.value = currentVoice;
     } else {
@@ -395,7 +580,7 @@
 
   function sendSettings() {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'settings', voice: currentVoice }));
+      ws.send(JSON.stringify({ type: 'settings', voice: currentVoice, tts: ttsEnabled }));
     }
   }
 
@@ -404,8 +589,7 @@
     statusEl.classList.toggle('active', !!active);
   }
 
-  // Trim silence from an AudioBuffer.
-  // Shortens long silent gaps while keeping enough for natural sentence pacing.
+  // --- Silence trimming
   function trimSilence(audioBuffer) {
     const sampleRate = audioBuffer.sampleRate;
     const numChannels = audioBuffer.numberOfChannels;
@@ -413,9 +597,9 @@
     const len = data.length;
 
     const silenceThreshold = 0.008;
-    const windowSize = Math.floor(sampleRate * 0.025);    // 25ms RMS window
-    const minSilenceDuration = Math.floor(sampleRate * 0.4);  // only trim silences > 400ms
-    const keepSilence = Math.floor(sampleRate * 0.25);        // keep 250ms of each gap
+    const windowSize = Math.floor(sampleRate * 0.025);
+    const minSilenceDuration = Math.floor(sampleRate * 0.4);
+    const keepSilence = Math.floor(sampleRate * 0.25);
 
     function rms(start, end) {
       let sum = 0;
@@ -434,10 +618,7 @@
     for (let i = 0; i < len; i += windowSize) {
       const energy = rms(i, i + windowSize);
       if (energy < silenceThreshold) {
-        if (!inSilence) {
-          inSilence = true;
-          silenceStart = i;
-        }
+        if (!inSilence) { inSilence = true; silenceStart = i; }
       } else {
         if (inSilence) {
           if (i - silenceStart > minSilenceDuration) {
@@ -456,19 +637,14 @@
     const segments = [];
     let pos = 0;
     for (const region of silentRegions) {
-      if (region.start > pos) {
-        segments.push({ start: pos, end: region.start });
-      }
+      if (region.start > pos) segments.push({ start: pos, end: region.start });
       segments.push({ start: region.start, end: Math.min(region.start + keepSilence, region.end) });
       pos = region.end;
     }
-    if (pos < len) {
-      segments.push({ start: pos, end: len });
-    }
+    if (pos < len) segments.push({ start: pos, end: len });
 
     let newLen = 0;
     for (const seg of segments) newLen += (seg.end - seg.start);
-
     if (newLen >= len * 0.95) return audioBuffer;
 
     const ctx = getAudioCtx();
@@ -479,15 +655,15 @@
       const dst = newBuffer.getChannelData(ch);
       let writePos = 0;
       for (const seg of segments) {
-        const chunk = src.subarray(seg.start, seg.end);
-        dst.set(chunk, writePos);
-        writePos += chunk.length;
+        dst.set(src.subarray(seg.start, seg.end), writePos);
+        writePos += (seg.end - seg.start);
       }
     }
 
     return newBuffer;
   }
 
+  // --- Audio playback
   async function playProcessedAudio(arrayBuffer) {
     const speed = parseFloat(speedSlider.value);
 
@@ -508,16 +684,19 @@
       URL.revokeObjectURL(url);
       setStatus('Ready');
       talkBtn.disabled = false;
+      textSend.disabled = !textInput.value.trim();
     };
     audio.onerror = () => {
       URL.revokeObjectURL(url);
       setStatus('Ready');
       talkBtn.disabled = false;
+      textSend.disabled = !textInput.value.trim();
     };
 
     audio.play().catch(() => {
       setStatus('Ready');
       talkBtn.disabled = false;
+      textSend.disabled = !textInput.value.trim();
     });
   }
 
@@ -564,6 +743,7 @@
     return out;
   }
 
+  // --- WebSocket
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -571,6 +751,7 @@
     ws.onopen = () => {
       setStatus('Ready');
       talkBtn.disabled = false;
+      textSend.disabled = !textInput.value.trim();
       reconnectDelay = 1000;
       sendSettings();
     };
@@ -578,11 +759,23 @@
     ws.onmessage = (evt) => {
       if (typeof evt.data === 'string') {
         const msg = JSON.parse(evt.data);
-        if (msg.type === 'status')     setStatus(msg.text, true);
+        if (msg.type === 'status') {
+          setStatus(msg.text, true);
+          if (msg.text === 'Ready') {
+            talkBtn.disabled = false;
+            textSend.disabled = !textInput.value.trim();
+          }
+        }
         if (msg.type === 'transcript') userText.textContent = msg.text;
         if (msg.type === 'response') {
           assistText.textContent = msg.text;
-          setStatus('Speaking...', true);
+          if (ttsEnabled) {
+            setStatus('Speaking...', true);
+          } else {
+            setStatus('Ready');
+            talkBtn.disabled = false;
+            textSend.disabled = !textInput.value.trim();
+          }
         }
       }
     };
@@ -593,12 +786,14 @@
         playProcessedAudio(evt.data).catch(() => {
           setStatus('Ready');
           talkBtn.disabled = false;
+          textSend.disabled = !textInput.value.trim();
         });
       }
     });
 
     ws.onclose = () => {
       talkBtn.disabled = true;
+      textSend.disabled = true;
       setStatus('Disconnected. Reconnecting...');
       setTimeout(connect, reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, 15000);
@@ -607,7 +802,9 @@
     ws.onerror = () => ws.close();
   }
 
+  // --- Recording
   async function startRecording() {
+    if (!sttEnabled) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioChunks = [];
