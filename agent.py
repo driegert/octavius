@@ -3,10 +3,13 @@ import re
 import uuid
 import logging
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 import httpx
 
-from config import LLM_URL, LLM_MODEL, MAX_TOOL_ROUNDS
+from config import (
+    LLM_URL, LLM_MODEL, LLM_FALLBACK_URL, LLM_FALLBACK_MODEL, MAX_TOOL_ROUNDS,
+)
 from conversation import Conversation
 from mcp_manager import MCPManager
 
@@ -16,6 +19,23 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 # Sentence-ending punctuation followed by space or end-of-string
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
+
+@asynccontextmanager
+async def _llm_stream(client: httpx.AsyncClient, payload: dict):
+    """Try primary LLM, fall back to secondary on connection/HTTP failure."""
+    try:
+        async with client.stream("POST", LLM_URL, json=payload) as resp:
+            resp.raise_for_status()
+            yield resp
+            return
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+        log.warning("Primary LLM failed (%s), falling back to %s", e, LLM_FALLBACK_URL)
+
+    payload["model"] = LLM_FALLBACK_MODEL
+    async with client.stream("POST", LLM_FALLBACK_URL, json=payload) as resp:
+        resp.raise_for_status()
+        yield resp
 
 
 async def run_agent_turn(
@@ -58,8 +78,7 @@ async def stream_agent_turn(
         # --- Streaming request ---
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream("POST", LLM_URL, json=payload) as resp:
-                    resp.raise_for_status()
+                async with _llm_stream(client, payload) as resp:
 
                     # Accumulators
                     full_content = ""

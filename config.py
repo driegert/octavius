@@ -1,7 +1,11 @@
 STT_URL = "http://127.0.0.1:8502/api/transcribe"
 
-LLM_URL = "http://triplestuffed:8010/v1/chat/completions"
+LLM_URL = "http://127.0.0.1:8001/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-a3b"
+
+# Fallback LLM (triplestuffed)
+LLM_FALLBACK_URL = "http://triplestuffed:8010/v1/chat/completions"
+LLM_FALLBACK_MODEL = "qwen3.5-35b-a3b"
 
 TTS_URL = "http://triplestuffed:8020/v1/audio/speech"
 TTS_MODEL = "/media/extra_stuff/huggingface/mistralai/Voxtral-4B-TTS-2603"
@@ -29,6 +33,11 @@ TTS_VOICES = [
     "pt_female",
     "pt_male",
 ]
+
+# Fallback TTS (Kokoro on lilbuddy)
+TTS_FALLBACK_URL = "http://lilbuddy:8880/v1/audio/speech"
+TTS_FALLBACK_MODEL = "kokoro"
+TTS_FALLBACK_VOICE = "bm_lewis"
 
 AGENT_PORT = 8030
 MAX_TOOL_ROUNDS = 10
