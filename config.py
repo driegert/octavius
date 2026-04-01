@@ -64,6 +64,14 @@ MCP_SERVERS = {
             "SSL_CERT_FILE": "/etc/ssl/cert.pem",
         },
     },
+    "openalex": {
+        "transport": "stdio",
+        "command": "/home/dave/.npm-global/bin/openalex-research-mcp",
+        "args": [],
+        "env": {
+            "OPENALEX_EMAIL": "davidriegert@trentu.ca",
+        },
+    },
     "vikunja-tasks": {
         "transport": "http",
         "url": "http://triplestuffed:8252/mcp",
@@ -85,7 +93,8 @@ fuss and the occasional understated wit. Think Jarvis, but self-hosted. You know
 your name is Octavius and you're not shy about it.
 
 You have access to tools:
-- Web search via SearXNG for looking things up
+- Web search via SearXNG for general lookups
+- Academic research via OpenAlex for finding scholarly papers, authors, and citations
 - Email via Evangeline for reading and sending email
 - Task management via Vikunja for creating, searching, and updating tasks
 - Document processing for converting PDFs to markdown (reading mode, long-running)
