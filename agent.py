@@ -12,6 +12,7 @@ from config import (
 )
 from conversation import Conversation
 from mcp_manager import MCPManager
+import tools as local_tools
 
 log = logging.getLogger(__name__)
 
@@ -72,8 +73,9 @@ async def stream_agent_turn(
             "messages": messages,
             "stream": True,
         }
-        if mcp.tools:
-            payload["tools"] = mcp.tools
+        all_tools = mcp.tools + local_tools.TOOLS
+        if all_tools:
+            payload["tools"] = all_tools
 
         # --- Streaming request ---
         try:
@@ -169,7 +171,12 @@ async def stream_agent_turn(
                     args = {}
 
                 conversation.add_tool_call(call_id, name, args_str)
-                result = await mcp.call_tool(name, args)
+                # Route to local tools or MCP
+                local_tool_names = {t["function"]["name"] for t in local_tools.TOOLS}
+                if name in local_tool_names:
+                    result = await local_tools.call_tool(name, args)
+                else:
+                    result = await mcp.call_tool(name, args)
                 conversation.add_tool_result(call_id, result)
 
             conversation.trim()

@@ -331,6 +331,29 @@
   }
 
   #reset-btn:hover { border-color: #555; color: #888; }
+
+  #stop-btn {
+    display: none;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    border: 1.5px solid #ff5555;
+    background: #1a1015;
+    color: #ff6666;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    position: fixed;
+    bottom: 2rem;
+    right: 2rem;
+    z-index: 50;
+    box-shadow: 0 0 15px rgba(255, 85, 85, 0.1);
+  }
+  #stop-btn:hover {
+    background: #251520;
+    box-shadow: 0 0 20px rgba(255, 85, 85, 0.2);
+  }
+  #stop-btn.visible { display: block; }
 </style>
 </head>
 <body>
@@ -407,6 +430,8 @@
   <button id="reset-btn">Reset conversation</button>
 </div>
 
+<button id="stop-btn" title="Stop playback">&#9632;</button>
+
 <script>
 (function() {
   const statusEl      = document.getElementById('status');
@@ -414,6 +439,7 @@
   const userText      = document.getElementById('user-text');
   const assistText    = document.getElementById('assistant-text');
   const resetBtn      = document.getElementById('reset-btn');
+  const stopBtn       = document.getElementById('stop-btn');
   const settingsBtn   = document.getElementById('settings-btn');
   const settingsOver  = document.getElementById('settings-overlay');
   const settingsClose = document.getElementById('settings-close');
@@ -668,17 +694,32 @@
   // --- Audio queue for streaming playback
   const audioQueue = [];
   let isPlaying = false;
-  let audioDone = false; // true when server signals all chunks sent
+  let audioDone = false;
+  let currentAudio = null; // reference to currently playing Audio element
 
   function enqueueAudio(arrayBuffer) {
     audioQueue.push(arrayBuffer);
+    stopBtn.classList.add('visible');
     if (!isPlaying) playNext();
   }
 
   function signalAudioDone() {
     audioDone = true;
-    // If nothing is playing and queue is empty, we're done
     if (!isPlaying && audioQueue.length === 0) finishPlayback();
+  }
+
+  function stopPlayback() {
+    audioQueue.length = 0;
+    audioDone = false;
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
+    isPlaying = false;
+    stopBtn.classList.remove('visible');
+    setStatus('Ready');
+    talkBtn.disabled = false;
+    textSend.disabled = !textInput.value.trim();
   }
 
   function finishPlayback() {
@@ -686,6 +727,8 @@
     talkBtn.disabled = false;
     textSend.disabled = !textInput.value.trim();
     audioDone = false;
+    stopBtn.classList.remove('visible');
+    currentAudio = null;
   }
 
   async function playNext() {
@@ -713,18 +756,23 @@
     const audio = new Audio(url);
     audio.preservesPitch = true;
     audio.playbackRate = speed;
+    currentAudio = audio;
 
     audio.onended = () => {
       URL.revokeObjectURL(url);
+      if (currentAudio === audio) currentAudio = null;
       playNext();
     };
     audio.onerror = () => {
       URL.revokeObjectURL(url);
+      if (currentAudio === audio) currentAudio = null;
       playNext();
     };
 
     audio.play().catch(() => playNext());
   }
+
+  stopBtn.addEventListener('click', stopPlayback);
 
   function audioBufferToWav(buffer) {
     const numChannels = buffer.numberOfChannels;

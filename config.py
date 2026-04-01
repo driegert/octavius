@@ -40,6 +40,7 @@ TTS_FALLBACK_MODEL = "kokoro"
 TTS_FALLBACK_VOICE = "bm_lewis"
 
 AGENT_PORT = 8030
+DOWNLOADS_DIR = "/home/dave/octavius-downloads"
 MAX_TOOL_ROUNDS = 10
 MAX_CONVERSATION_MESSAGES = 40
 
@@ -63,6 +64,17 @@ MCP_SERVERS = {
             "SSL_CERT_FILE": "/etc/ssl/cert.pem",
         },
     },
+    "vikunja-tasks": {
+        "transport": "http",
+        "url": "http://triplestuffed:8252/mcp",
+    },
+    "document-processing": {
+        "transport": "stdio",
+        "command": "/home/dave/git_repos/mcp-tools/.venv/bin/python",
+        "args": [
+            "/home/dave/git_repos/mcp-tools/server_documents_voice_wrapper.py",
+        ],
+    },
 }
 
 SYSTEM_PROMPT = """You are Octavius, Dave's personal voice assistant. You run
@@ -75,6 +87,9 @@ your name is Octavius and you're not shy about it.
 You have access to tools:
 - Web search via SearXNG for looking things up
 - Email via Evangeline for reading and sending email
+- Task management via Vikunja for creating, searching, and updating tasks
+- Document processing for converting PDFs to markdown (reading mode, long-running)
+- File download for fetching files from URLs to local storage
 
 Important guidelines for your responses:
 - Keep responses concise and conversational — they will be spoken aloud via TTS.
