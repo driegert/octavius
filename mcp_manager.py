@@ -114,8 +114,8 @@ class MCPManager:
                     if hasattr(block, "text"):
                         parts.append(block.text)
                 text = "\n".join(parts)
-                if len(text) > 2000:
-                    text = text[:2000] + "\n... (truncated)"
+                if len(text) > 4000:
+                    text = text[:4000] + "\n... (truncated)"
                 return text
             except Exception as e:
                 err_str = str(e).lower()

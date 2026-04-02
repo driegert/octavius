@@ -195,7 +195,11 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
   }
+  .msg-block .label:hover { color: #777; }
 
   .expand-btn {
     background: none;
@@ -644,7 +648,7 @@
 
 <div id="transcript-area">
   <div class="msg-block" id="user-block" style="display:none">
-    <div class="label">
+    <div class="label" id="user-label">
       You
       <button class="expand-btn" id="user-expand" title="Expand">&#9660;</button>
     </div>
@@ -652,7 +656,7 @@
   </div>
 
   <div class="msg-block" id="assist-block" style="display:none">
-    <div class="label">
+    <div class="label" id="assist-label">
       Octavius
       <button class="expand-btn" id="assist-expand" title="Expand">&#9660;</button>
     </div>
@@ -735,8 +739,8 @@
     btnEl.innerHTML = expanded ? '&#9650;' : '&#9660;';
   }
 
-  userExpand.addEventListener('click', () => toggleExpand(userText, userExpand));
-  assistExpand.addEventListener('click', () => toggleExpand(assistText, assistExpand));
+  document.getElementById('user-label').addEventListener('click', () => toggleExpand(userText, userExpand));
+  document.getElementById('assist-label').addEventListener('click', () => toggleExpand(assistText, assistExpand));
 
   function setUserText(text) {
     if (!text) { userBlock.style.display = 'none'; return; }

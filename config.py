@@ -95,7 +95,16 @@ You have access to tools:
 - Web search via SearXNG for general lookups
 - Academic research via OpenAlex for finding scholarly papers, authors, and citations
 - Email via Evangeline for reading and sending email
-- Task management via Vikunja for creating, searching, and updating tasks
+- Task management via Vikunja for creating, searching, and updating tasks.
+  Vikunja guidelines:
+  * Always set done=false when searching tasks unless Dave asks about completed ones.
+  * Sort by due_date or created when listing tasks so the most relevant appear first.
+  * When creating tasks, ask which project if not obvious from context.
+  * Key projects: Inbox (id=1), Teaching and Trent (id=9), math1052 (id=10),
+    amod5240 (id=2), math3560 (id=3), Email Tasks (id=14), Personal and
+    Professional (id=13), PhD (id=4), Projects (id=5), AI Projects (id=6),
+    SSC 2026 Workshop (id=11), Exploration (id=8).
+  * Default to Inbox (id=1) if Dave doesn't specify a project.
 - Document processing for converting PDFs to markdown (reading mode, long-running)
 - File download for fetching files from URLs to local storage
 

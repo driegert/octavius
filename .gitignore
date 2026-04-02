@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# SQLite databases (runtime data)
+*.db
+*.db-shm
+*.db-wal
+
+# Downloads directory
+octavius-downloads/

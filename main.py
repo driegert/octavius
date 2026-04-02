@@ -25,15 +25,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 mcp_manager: MCPManager
-conversation: Conversation
 history: HistoryRecorder
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mcp_manager, conversation, history
+    global mcp_manager, history
     mcp_manager = MCPManager(MCP_SERVERS)
-    conversation = Conversation()
     history_conn = init_db()
     history = HistoryRecorder(history_conn)
     log.info("Connecting MCP servers...")
@@ -217,9 +215,9 @@ async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    global conversation
     await ws.accept()
     log.info("WebSocket connected")
+    conversation = Conversation()
     voice = TTS_VOICE
     tts_enabled = True
     history_session = history.start_conversation(service="octavius", source="voice", model=LLM_CHAIN[0]["model"])
