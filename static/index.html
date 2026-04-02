@@ -4,8 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Octavius</title>
-<link rel="icon" type="image/png" href="/static/Octavius-favicon1.png">
-<link rel="apple-touch-icon" href="/static/Octavius-bookmark.png">
+<link rel="icon" type="image/png" href="/static/octavius-dapper_cyber_punk.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="manifest" href="/static/manifest.json">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -306,8 +307,14 @@
   }
   .top-btn:hover { color: #777; }
 
-  #inbox-link { font-size: 1.6rem; }
-  #history-btn { font-size: 1.4rem; }
+  .top-btn img {
+    width: 28px;
+    height: 28px;
+    opacity: 0.5;
+    transition: opacity 0.2s;
+    vertical-align: middle;
+  }
+  .top-btn:hover img { opacity: 0.8; }
 
   #inbox-link { position: relative; }
 
@@ -567,8 +574,9 @@
 <body>
 
 <div id="top-controls">
-  <a id="inbox-link" class="top-btn" href="/inbox" title="Knowledge Inbox">&#9993;<span id="inbox-badge"></span></a>
-  <button class="top-btn" id="history-btn" title="Conversation history">&#128214;</button>
+  <a id="inbox-link" class="top-btn" href="/inbox" title="Knowledge Inbox"><img src="/static/icon-knowledge_inbox.png" alt="Inbox"><span id="inbox-badge"></span></a>
+  <a class="top-btn" href="/reader" title="Document Reader">&#128362;</a>
+  <button class="top-btn" id="history-btn" title="Conversation history"><img src="/static/icon-conversation_history.png" alt="History"></button>
   <button class="top-btn" id="settings-btn" title="Settings">&#9881;</button>
 </div>
 

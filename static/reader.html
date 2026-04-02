@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Octavius — Reader</title>
+<link rel="icon" type="image/png" href="/static/octavius-dapper_cyber_punk.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="manifest" href="/static/manifest.json">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: #0a0a0f;
+    color: #c8c8d0;
+    min-height: 100vh;
+    padding: 1.5rem 1rem;
+    max-width: 448px;
+    margin: 0 auto;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    margin-bottom: 1.2rem;
+  }
+
+  header a {
+    color: #555;
+    text-decoration: none;
+    font-size: 0.8rem;
+    transition: color 0.2s;
+  }
+  header a:hover { color: #888; }
+
+  header h1 {
+    font-size: 1.1rem;
+    font-weight: 400;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: #6a6a7a;
+    flex: 1;
+  }
+
+  /* Ingest bar */
+  .ingest-bar {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 1.2rem;
+  }
+
+  .ingest-bar input {
+    flex: 1;
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #c8c8d0;
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 0.5rem 0.7rem;
+    outline: none;
+  }
+  .ingest-bar input:focus { border-color: #60a0ff; }
+  .ingest-bar input::placeholder { color: #444; }
+
+  .ingest-bar button, .small-btn {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #888;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  .ingest-bar button:hover, .small-btn:hover { border-color: #555; color: #ccc; }
+
+  /* Document list */
+  #doc-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+  }
+
+  .doc-card {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    padding: 0.6rem 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .doc-card:hover { border-color: #60a0ff; }
+
+  .doc-card .dc-title { flex: 1; font-size: 0.85rem; color: #d0d0e0; }
+  .doc-card .dc-status {
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+  }
+  .dc-status.ready { color: #6abf6a; background: #1a2a1a; }
+  .dc-status.processing { color: #bfa06a; background: #2a2a1a; }
+  .dc-status.failed { color: #bf6a6a; background: #2a1a1a; }
+
+  .doc-card .dc-delete {
+    background: none;
+    border: none;
+    color: #444;
+    font-size: 0.9rem;
+    cursor: pointer;
+    padding: 0.2rem;
+    transition: color 0.2s;
+  }
+  .doc-card .dc-delete:hover { color: #bf6a6a; }
+
+  .empty-state {
+    text-align: center;
+    color: #555;
+    font-size: 0.85rem;
+    padding: 2rem 0;
+  }
+
+  /* Player view */
+  #player {
+    display: none;
+  }
+  #player.active { display: block; }
+
+  #player-title {
+    font-size: 1rem;
+    color: #d0d0e0;
+    margin-bottom: 0.8rem;
+    text-align: center;
+  }
+
+  #player-back {
+    font-size: 0.75rem;
+    color: #555;
+    cursor: pointer;
+    margin-bottom: 0.6rem;
+    display: inline-block;
+  }
+  #player-back:hover { color: #888; }
+
+  /* Section list */
+  #sections {
+    max-height: 30vh;
+    overflow-y: auto;
+    margin-bottom: 1rem;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+  }
+
+  .section-item {
+    padding: 0.45rem 0.7rem;
+    font-size: 0.78rem;
+    color: #888;
+    cursor: pointer;
+    border-bottom: 1px solid #1a1a25;
+    transition: all 0.15s;
+  }
+  .section-item:last-child { border-bottom: none; }
+  .section-item:hover { background: #1a1a25; color: #ccc; }
+  .section-item.active { background: #1a1a2a; color: #60a0ff; }
+
+  /* Progress bar */
+  .progress-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.8rem;
+  }
+
+  #progress-bar {
+    flex: 1;
+    accent-color: #60a0ff;
+    cursor: pointer;
+    height: 6px;
+  }
+
+  .progress-label {
+    font-size: 0.65rem;
+    color: #555;
+    min-width: 3.5em;
+    text-align: right;
+  }
+
+  /* Transport controls */
+  .transport {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 0.8rem;
+    margin-bottom: 0.8rem;
+  }
+
+  .transport button {
+    background: #151520;
+    border: 1.5px solid #2a2a35;
+    border-radius: 50%;
+    color: #888;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .transport button:hover { border-color: #555; color: #ccc; }
+
+  .transport .skip-btn {
+    width: 36px;
+    height: 36px;
+    font-size: 0.8rem;
+  }
+
+  #play-pause-btn {
+    width: 52px;
+    height: 52px;
+    font-size: 1.2rem;
+    border-color: #60a0ff;
+    color: #60a0ff;
+  }
+  #play-pause-btn:hover { background: #1a1a2a; }
+
+
+  /* Settings row */
+  .settings-row {
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+
+  .settings-row label {
+    font-size: 0.65rem;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .settings-row select, .settings-row input[type="range"] {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 4px;
+    color: #c8c8d0;
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem;
+    cursor: pointer;
+  }
+
+  .settings-row .speed-val {
+    font-size: 0.75rem;
+    color: #8888a0;
+    min-width: 2.5em;
+  }
+
+  /* Read-along text */
+  #read-along {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    padding: 0.8rem;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: #999;
+    min-height: 4em;
+    max-height: 20vh;
+    overflow-y: auto;
+  }
+
+  #read-along .current-sentence {
+    color: #e0e0f0;
+    font-weight: 500;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="/">&larr; Octavius</a>
+  <h1>Reader</h1>
+</header>
+
+<!-- Document list view -->
+<div id="list-view">
+  <div class="ingest-bar">
+    <input type="text" id="ingest-input" placeholder="File path or URL...">
+    <button id="ingest-btn">Add</button>
+  </div>
+  <div id="doc-list"></div>
+</div>
+
+<!-- Player view -->
+<div id="player">
+  <span id="player-back">&larr; Back to list</span>
+  <div id="player-title"></div>
+
+  <div id="sections"></div>
+
+  <div class="progress-row">
+    <span class="progress-label" id="progress-current">0</span>
+    <input type="range" id="progress-bar" min="0" max="100" value="0">
+    <span class="progress-label" id="progress-total">0</span>
+  </div>
+
+  <div class="transport">
+    <button class="skip-btn" id="skip-back" title="Previous section">&#9198;</button>
+    <button id="play-pause-btn" title="Play">&#9654;</button>
+    <button class="skip-btn" id="skip-fwd" title="Next section">&#9197;</button>
+  </div>
+
+  <div class="settings-row">
+    <label>Speed</label>
+    <input type="range" id="reader-speed" min="1.0" max="2.0" step="0.1" value="1.4">
+    <span class="speed-val" id="reader-speed-val">1.4x</span>
+    <label>Voice</label>
+    <select id="reader-voice"></select>
+  </div>
+
+  <div id="read-along"></div>
+</div>
+
+<script>
+(function() {
+  const listView     = document.getElementById('list-view');
+  const docList      = document.getElementById('doc-list');
+  const ingestInput  = document.getElementById('ingest-input');
+  const ingestBtn    = document.getElementById('ingest-btn');
+  const playerDiv    = document.getElementById('player');
+  const playerBack   = document.getElementById('player-back');
+  const playerTitle  = document.getElementById('player-title');
+  const sectionsEl   = document.getElementById('sections');
+  const progressBar  = document.getElementById('progress-bar');
+  const progressCur  = document.getElementById('progress-current');
+  const progressTot  = document.getElementById('progress-total');
+  const playPauseBtn = document.getElementById('play-pause-btn');
+  // stop functionality merged into play/pause
+  const skipBack     = document.getElementById('skip-back');
+  const skipFwd      = document.getElementById('skip-fwd');
+  const speedSlider  = document.getElementById('reader-speed');
+  const speedVal     = document.getElementById('reader-speed-val');
+  const voiceSelect  = document.getElementById('reader-voice');
+  const readAlong    = document.getElementById('read-along');
+
+  let ws = null;
+  let currentDocId = null;
+  let currentDoc = null; // full doc metadata with sections
+  let isPlaying = false;
+  let currentChunk = 0;
+  let currentSentence = 0;
+  let totalSentences = 0;
+  let audioCtx = null;
+  let currentAudio = null;
+  const audioQueue = [];
+  let audioDone = false;
+  let seekPending = false;
+
+  // --- Audio playback (reused from index.html pattern)
+  function getAudioCtx() {
+    if (!audioCtx) audioCtx = new AudioContext();
+    return audioCtx;
+  }
+
+  // Position queue — paired with audio queue so display updates on playback, not receipt
+  const positionQueue = [];
+  let pendingPosition = null; // holds the next reader_position until its audio arrives
+
+  function enqueuePosition(pos) {
+    positionQueue.push(pos);
+  }
+
+  function enqueueAudio(arrayBuffer) {
+    audioQueue.push(arrayBuffer);
+    if (audioQueue.length === 1 && !currentAudio) playNextAudio();
+  }
+
+  function applyPosition(pos) {
+    if (!pos) return;
+    currentChunk = pos.chunk_index;
+    currentSentence = pos.sentence_index;
+    totalSentences = pos.total_sentences;
+    progressBar.max = totalSentences;
+    progressBar.value = pos.sentence_global;
+    progressCur.textContent = pos.sentence_global;
+    progressTot.textContent = totalSentences;
+
+    // Highlight active section
+    document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
+    const secEl = document.querySelector(`.section-item[data-chunk="${pos.chunk_index}"]`);
+    if (secEl) {
+      secEl.classList.add('active');
+      secEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    // Read-along text
+    if (pos.sentence_text) {
+      readAlong.innerHTML = '<span class="current-sentence">' + esc(pos.sentence_text) + '</span>';
+    }
+  }
+
+  async function playNextAudio() {
+    if (audioQueue.length === 0) {
+      currentAudio = null;
+      return;
+    }
+    const arrayBuffer = audioQueue.shift();
+    const pos = positionQueue.shift();
+    const speed = parseFloat(speedSlider.value);
+
+    // Update display when this chunk starts playing
+    applyPosition(pos);
+
+    const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.preservesPitch = true;
+    audio.playbackRate = speed;
+    currentAudio = audio;
+
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      if (currentAudio === audio) currentAudio = null;
+      playNextAudio();
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      if (currentAudio === audio) currentAudio = null;
+      playNextAudio();
+    };
+    audio.play().catch(() => playNextAudio());
+  }
+
+  function clearAudioQueue() {
+    audioQueue.length = 0;
+    positionQueue.length = 0;
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
+  }
+
+  // --- WebSocket
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+    ws.binaryType = 'arraybuffer';
+
+    ws.onmessage = (evt) => {
+      if (evt.data instanceof ArrayBuffer) {
+        enqueueAudio(evt.data);
+        return;
+      }
+      const msg = JSON.parse(evt.data);
+
+      if (msg.type === 'reader_position') {
+        // Queue position — it will be applied when the paired audio starts playing
+        enqueuePosition(msg);
+      }
+
+      if (msg.type === 'reader_audio_done') {
+        isPlaying = false;
+        playPauseBtn.innerHTML = '&#9654;';
+      }
+    };
+
+    ws.onclose = () => {
+      setTimeout(connectWS, 2000);
+    };
+    ws.onerror = () => ws.close();
+  }
+
+  function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // --- Voice loading
+  fetch('/api/voices').then(r => r.json()).then(data => {
+    for (const v of data.voices) {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v.replace(/_/g, ' ');
+      voiceSelect.appendChild(opt);
+    }
+    voiceSelect.value = data.default;
+  }).catch(() => {});
+
+  speedSlider.addEventListener('input', () => {
+    speedVal.textContent = parseFloat(speedSlider.value).toFixed(1) + 'x';
+    // Update playback rate of currently playing audio
+    if (currentAudio) currentAudio.playbackRate = parseFloat(speedSlider.value);
+  });
+
+  // --- Document list
+  let pollTimer = null;
+
+  async function loadDocList() {
+    let docs = [];
+    try {
+      const resp = await fetch('/api/reader/documents');
+      const data = await resp.json();
+      docs = data.documents || [];
+      if (docs.length === 0) {
+        docList.innerHTML = '<div class="empty-state">No documents yet. Add one above.</div>';
+        return;
+      }
+      docList.innerHTML = '';
+      for (const doc of docs) {
+        const card = document.createElement('div');
+        card.className = 'doc-card';
+        card.innerHTML = `
+          <span class="dc-title">${esc(doc.title)}</span>
+          <span class="dc-status ${doc.status}">${doc.status}</span>
+          <button class="dc-delete" title="Delete">&times;</button>
+        `;
+        card.querySelector('.dc-title').addEventListener('click', () => {
+          if (doc.status === 'ready') openDocument(doc.id);
+          else if (doc.status === 'processing') loadDocList(); // refresh
+        });
+        card.querySelector('.dc-delete').addEventListener('click', async (e) => {
+          e.stopPropagation();
+          await fetch(`/api/reader/documents/${doc.id}`, { method: 'DELETE' });
+          loadDocList();
+        });
+        docList.appendChild(card);
+      }
+    } catch {
+      docList.innerHTML = '<div class="empty-state">Failed to load.</div>';
+    }
+
+    // Auto-poll if any documents are still processing
+    clearTimeout(pollTimer);
+    if (docs.some(d => d.status === 'processing')) {
+      pollTimer = setTimeout(loadDocList, 5000);
+    }
+  }
+
+  // --- Ingest
+  ingestBtn.addEventListener('click', async () => {
+    const val = ingestInput.value.trim();
+    if (!val) return;
+
+    const isUrl = val.startsWith('http://') || val.startsWith('https://');
+    const body = {
+      source: isUrl ? 'url' : 'file',
+      path: isUrl ? undefined : val,
+      url: isUrl ? val : undefined,
+      title: val.split('/').pop() || 'Document',
+    };
+
+    // For URLs, download first then ingest
+    if (isUrl) {
+      body.source = 'file';
+      // Let the server handle it — for now just send as file path
+      // TODO: URL download support
+      body.source = 'url';
+    }
+
+    try {
+      await fetch('/api/reader/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      ingestInput.value = '';
+      loadDocList();
+    } catch (e) {
+      console.error('Ingest failed:', e);
+    }
+  });
+
+  ingestInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') ingestBtn.click();
+  });
+
+  // --- Open document in player
+  async function openDocument(docId) {
+    try {
+      const resp = await fetch(`/api/reader/documents/${docId}`);
+      const data = await resp.json();
+      currentDoc = data.document;
+      currentDocId = docId;
+      totalSentences = currentDoc.total_sentences || 0;
+
+      listView.style.display = 'none';
+      playerDiv.classList.add('active');
+      playerTitle.textContent = currentDoc.title;
+
+      // Render sections
+      sectionsEl.innerHTML = '';
+      const sections = currentDoc.sections || [];
+      let sentenceOffset = 0;
+      for (const sec of sections) {
+        if (!sec.heading) {
+          sentenceOffset += sec.sentence_count;
+          continue;
+        }
+        const item = document.createElement('div');
+        item.className = 'section-item';
+        item.dataset.chunk = sec.index;
+        item.dataset.sentenceOffset = sentenceOffset;
+        item.textContent = sec.heading;
+        item.addEventListener('click', () => seekTo(sec.index, 0));
+        sectionsEl.appendChild(item);
+        sentenceOffset += sec.sentence_count;
+      }
+
+      // Reset progress
+      progressBar.max = totalSentences;
+      // Restore saved position
+      currentChunk = currentDoc.last_chunk || 0;
+      currentSentence = currentDoc.last_sentence || 0;
+
+      // Compute global sentence offset for saved position
+      let savedGlobal = 0;
+      for (const sec of sections) {
+        if (sec.index < currentChunk) savedGlobal += sec.sentence_count;
+        else if (sec.index === currentChunk) { savedGlobal += currentSentence; break; }
+      }
+
+      progressBar.max = totalSentences;
+      progressBar.value = savedGlobal;
+      progressCur.textContent = savedGlobal;
+      progressTot.textContent = totalSentences;
+      readAlong.innerHTML = currentChunk > 0 || currentSentence > 0
+        ? '<span style="color:#666">Resuming from saved position...</span>' : '';
+      isPlaying = false;
+      playPauseBtn.innerHTML = '&#9654;';
+
+      // Highlight saved section
+      if (currentChunk > 0) {
+        const secEl = document.querySelector(`.section-item[data-chunk="${currentChunk}"]`);
+        if (secEl) secEl.classList.add('active');
+      }
+
+    } catch (e) {
+      console.error('Failed to open document:', e);
+    }
+  }
+
+  playerBack.addEventListener('click', () => {
+    // Stop playback and go back to list
+    if (isPlaying) sendPause();
+    clearAudioQueue();
+    playerDiv.classList.remove('active');
+    listView.style.display = '';
+    currentDocId = null;
+    currentDoc = null;
+    loadDocList();
+  });
+
+  // --- Transport controls
+  function sendPlay(chunkIdx, sentIdx) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !currentDocId) return;
+    clearAudioQueue();
+    ws.send(JSON.stringify({
+      type: 'reader_play',
+      doc_id: currentDocId,
+      chunk_index: chunkIdx !== undefined ? chunkIdx : currentChunk,
+      sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
+      voice: voiceSelect.value,
+    }));
+    isPlaying = true;
+    playPauseBtn.innerHTML = '&#10074;&#10074;';
+  }
+
+  function sendPause() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'reader_pause' }));
+    clearAudioQueue();
+    isPlaying = false;
+    playPauseBtn.innerHTML = '&#9654;';
+  }
+
+  function seekTo(chunkIdx, sentIdx) {
+    clearAudioQueue();
+    if (isPlaying) {
+      sendPlay(chunkIdx, sentIdx);
+    } else {
+      currentChunk = chunkIdx;
+      currentSentence = sentIdx;
+      // Update section highlight
+      document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
+      const secEl = document.querySelector(`.section-item[data-chunk="${chunkIdx}"]`);
+      if (secEl) secEl.classList.add('active');
+    }
+  }
+
+  playPauseBtn.addEventListener('click', () => {
+    if (isPlaying) {
+      sendPause();
+    } else {
+      sendPlay(currentChunk, currentSentence);
+    }
+  });
+
+  // Long-press play/pause to reset to beginning
+  // (stop functionality removed — pause is sufficient)
+
+  skipBack.addEventListener('click', () => {
+    const newChunk = Math.max(0, currentChunk - 1);
+    seekTo(newChunk, 0);
+  });
+
+  skipFwd.addEventListener('click', () => {
+    const sections = currentDoc?.sections || [];
+    const maxChunk = sections.length > 0 ? sections[sections.length - 1].index : 0;
+    const newChunk = Math.min(maxChunk, currentChunk + 1);
+    seekTo(newChunk, 0);
+  });
+
+  // Progress bar seeking
+  let seekDebounce = null;
+  progressBar.addEventListener('input', () => {
+    clearTimeout(seekDebounce);
+    seekDebounce = setTimeout(() => {
+      // Find which chunk/sentence corresponds to this global position
+      const target = parseInt(progressBar.value);
+      const sections = currentDoc?.sections || [];
+      let accum = 0;
+      for (const sec of sections) {
+        if (accum + sec.sentence_count > target) {
+          seekTo(sec.index, target - accum);
+          return;
+        }
+        accum += sec.sentence_count;
+      }
+    }, 200);
+  });
+
+  // --- Check for inbox_id query param
+  const params = new URLSearchParams(location.search);
+  const inboxId = params.get('inbox_id');
+  if (inboxId) {
+    fetch('/api/reader/documents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'inbox', saved_item_id: parseInt(inboxId) }),
+    }).then(() => loadDocList());
+  }
+  // Check for doc_id query param (from voice command)
+  const docIdParam = params.get('doc_id');
+  if (docIdParam) {
+    openDocument(parseInt(docIdParam));
+  }
+
+  // --- Init
+  connectWS();
+  if (!inboxId && !docIdParam) loadDocList();
+  else if (!docIdParam) loadDocList();
+})();
+</script>
+</body>
+</html>

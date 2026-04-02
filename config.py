@@ -40,6 +40,7 @@ TTS_FALLBACK_VOICE = "bm_lewis"
 
 AGENT_PORT = 8030
 DOWNLOADS_DIR = "/home/dave/octavius-downloads"
+READER_DIR = "/home/dave/octavius-reader"
 MAX_TOOL_ROUNDS = 10
 MAX_CONVERSATION_MESSAGES = 40
 
@@ -107,6 +108,10 @@ You have access to tools:
   * Default to Inbox (id=1) if Dave doesn't specify a project.
 - Document processing for converting PDFs to markdown (reading mode, long-running)
 - File download for fetching files from URLs to local storage
+- Document reader via read_document for reading papers and documents aloud.
+  When Dave says "read this document", "read this paper", or provides a file
+  path to read aloud, use read_document. Math expressions are automatically
+  converted to natural speech. The document will be available at /reader.
 
 Important guidelines for your responses:
 - Keep responses concise and conversational — they will be spoken aloud via TTS.

@@ -13,6 +13,7 @@ import httpx
 
 from config import DOWNLOADS_DIR
 from history import save_item
+import reader
 
 if TYPE_CHECKING:
     from history import ConversationSession
@@ -87,6 +88,31 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_document",
+            "description": (
+                "Start the document reader for a PDF, markdown file, or article. "
+                "Ingests the document, converts math expressions to speech-friendly text, "
+                "and prepares it for audio playback in the reader UI at /reader."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path to the document (PDF or markdown).",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Title for the document.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 
@@ -115,6 +141,8 @@ async def call_tool(
         return await _download_file(arguments)
     if name == "save_to_inbox":
         return _save_to_inbox(arguments, history_session)
+    if name == "read_document":
+        return await _read_document(arguments, history_session)
     return f"Error: unknown local tool '{name}'"
 
 
@@ -170,3 +198,38 @@ async def _download_file(args: dict) -> str:
     except Exception as e:
         log.exception("Download failed: %s", url)
         return f"Error downloading {url}: {e}"
+
+
+async def _read_document(args: dict, session: ConversationSession | None) -> str:
+    import asyncio
+
+    path = args.get("path", "")
+    if not path:
+        return "Error: path is required."
+
+    p = Path(path)
+    if not p.exists():
+        return f"Error: file not found: {path}"
+
+    title = args.get("title", p.stem)
+    conn = session.conn if session else None
+    if conn is None:
+        return "Error: no database connection available."
+
+    if p.suffix.lower() == ".pdf":
+        doc_id = reader.create_document(conn, title, "pdf", source_path=path)
+        # PDF ingest is handled by main.py's _ingest_pdf — just create the record
+        # and let the user know to check /reader
+        return (
+            f"Document '{title}' has been queued for processing (document #{doc_id}). "
+            f"Since it's a PDF, it needs to be converted to text first, which takes a few minutes. "
+            f"You can check the reader at /reader when it's ready."
+        )
+    else:
+        markdown = p.read_text()
+        doc_id = reader.create_document(conn, title, "markdown", source_path=path)
+        asyncio.create_task(reader.ingest_document(conn, doc_id, markdown, title, original_md_path=path))
+        return (
+            f"Document '{title}' is being prepared for reading (document #{doc_id}). "
+            f"It will be available at /reader in a minute or two."
+        )

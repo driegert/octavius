@@ -4,8 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Octavius — Inbox</title>
-<link rel="icon" type="image/png" href="/static/Octavius-favicon1.png">
-<link rel="apple-touch-icon" href="/static/Octavius-bookmark.png">
+<link rel="icon" type="image/png" href="/static/octavius-dapper_cyber_punk.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="manifest" href="/static/manifest.json">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -200,6 +201,7 @@
   .card-actions button:hover { border-color: #555; color: #ccc; }
   .card-actions button.done-btn:hover { border-color: #4a8a4a; color: #6abf6a; }
   .card-actions button.dismiss-btn:hover { border-color: #8a4a4a; color: #bf6a6a; }
+  .card-actions button.read-btn:hover { border-color: #4a6a8a; color: #6aabbf; }
 
   .status-badge {
     font-size: 0.6rem;
@@ -339,6 +341,9 @@
           ` : `
             <button onclick="event.stopPropagation(); updateStatus(${item.id}, 'pending', this)">Restore to pending</button>
           `}
+          ${item.item_type === 'article' ? `
+            <button class="read-btn" onclick="event.stopPropagation(); window.location.href='/reader?inbox_id=${item.id}'">Read aloud</button>
+          ` : ''}
         </div>
       `;
 

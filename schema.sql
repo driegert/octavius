@@ -126,3 +126,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS saved_item_embeddings USING vec0(
     saved_item_id INTEGER PRIMARY KEY,
     embedding     float[1024]
 );
+
+-- Reader documents (document-to-speech pipeline)
+CREATE TABLE IF NOT EXISTS reader_documents (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    title             TEXT    NOT NULL,
+    source_type       TEXT    NOT NULL,        -- 'pdf', 'markdown', 'url', 'inbox_item'
+    source_path       TEXT,
+    saved_item_id     INTEGER REFERENCES saved_items(id),
+    speech_file       TEXT,                    -- path to speech-ready JSON on disk
+    original_md_file  TEXT,
+    chunk_count       INTEGER NOT NULL DEFAULT 0,
+    status            TEXT    NOT NULL DEFAULT 'processing', -- 'processing', 'ready', 'failed'
+    error             TEXT,
+    last_chunk        INTEGER NOT NULL DEFAULT 0,
+    last_sentence     INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reader_documents_status
+    ON reader_documents(status, created_at);

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from mcp_manager import MCPManager
 from stt import transcribe
 from tts import synthesize
 from agent import run_agent_turn, stream_agent_turn
+import reader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -144,6 +146,172 @@ async def conversation_messages(conv_id: int):
     return JSONResponse({"messages": msgs})
 
 
+# -- Document Reader API -------------------------------------------------------
+
+@app.get("/reader")
+async def reader_page():
+    return FileResponse("static/reader.html")
+
+
+@app.post("/api/reader/documents")
+async def reader_ingest(request: Request):
+    """Ingest a document for reading. Kicks off background processing."""
+    body = await request.json()
+    source = body.get("source", "file")
+    title = body.get("title", "Untitled")
+    path = body.get("path")
+    saved_item_id = body.get("saved_item_id")
+    text = body.get("text")
+
+    conn = history.conn
+
+    # Determine source type and get markdown content
+    if source == "inbox" and saved_item_id:
+        item = get_saved_item(conn, saved_item_id)
+        if not item:
+            return JSONResponse({"error": "Inbox item not found"}, status_code=404)
+        markdown = item["content"]
+        title = title or item["title"]
+        doc_id = reader.create_document(conn, title, "inbox_item", saved_item_id=saved_item_id)
+
+    elif source == "text" and text:
+        markdown = text
+        doc_id = reader.create_document(conn, title, "markdown")
+
+    elif source == "url" and (body.get("url") or path):
+        url = body.get("url") or path
+        doc_id = reader.create_document(conn, title, "url", source_path=url)
+        asyncio.create_task(_ingest_url(conn, doc_id, url, title))
+        return JSONResponse({"id": doc_id, "status": "processing"})
+
+    elif source == "file" and path:
+        from pathlib import Path as P
+        p = P(path)
+        if not p.exists():
+            return JSONResponse({"error": f"File not found: {path}"}, status_code=404)
+        if p.suffix.lower() == ".pdf":
+            doc_id = reader.create_document(conn, title, "pdf", source_path=path)
+            asyncio.create_task(_ingest_pdf(conn, doc_id, path, title))
+            return JSONResponse({"id": doc_id, "status": "processing"})
+        else:
+            markdown = p.read_text()
+            doc_id = reader.create_document(conn, title, "markdown", source_path=path)
+
+    else:
+        return JSONResponse({"error": "Provide source + path/url, text, or saved_item_id"}, status_code=400)
+
+    # Start background ingest for non-PDF sources
+    asyncio.create_task(reader.ingest_document(conn, doc_id, markdown, title))
+    return JSONResponse({"id": doc_id, "status": "processing"})
+
+
+async def _ingest_pdf(conn, doc_id: int, pdf_path: str, title: str):
+    """Convert PDF to markdown via MCP, then run the reader ingest pipeline."""
+    try:
+        # Start conversion
+        result = await mcp_manager.call_tool("convert_pdf_to_md", {"file_path": pdf_path})
+        import re
+        job_match = re.search(r'Job ID:\s*(\S+)', result)
+        if not job_match:
+            reader.update_document(conn, doc_id, status="failed", error=f"PDF conversion failed: {result}")
+            return
+
+        job_id = job_match.group(1)
+        log.info("Reader: PDF conversion job %s started for document %d", job_id, doc_id)
+
+        # Poll for completion
+        for _ in range(120):  # up to 10 minutes
+            await asyncio.sleep(5)
+            poll_result = await mcp_manager.call_tool("get_conversion_result", {"job_id": job_id})
+            if "still processing" in poll_result.lower() or "not yet" in poll_result.lower():
+                continue
+            # Check for markdown file path in result
+            md_match = re.search(r'(/\S+\.md)', poll_result)
+            if md_match:
+                md_path = md_match.group(1)
+                from pathlib import Path as P
+                markdown = P(md_path).read_text()
+                await reader.ingest_document(conn, doc_id, markdown, title, original_md_path=md_path)
+                return
+            if "error" in poll_result.lower() or "failed" in poll_result.lower():
+                reader.update_document(conn, doc_id, status="failed", error=poll_result[:500])
+                return
+
+        reader.update_document(conn, doc_id, status="failed", error="PDF conversion timed out")
+
+    except Exception as e:
+        log.exception("Reader: PDF ingest failed for document %d", doc_id)
+        reader.update_document(conn, doc_id, status="failed", error=str(e))
+
+
+async def _ingest_url(conn, doc_id: int, url: str, title: str):
+    """Download a URL, then route to PDF or markdown ingest."""
+    try:
+        import httpx as _httpx
+        from pathlib import Path as P
+
+        log.info("Reader: downloading URL for document %d: %s", doc_id, url)
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+
+        # Determine file type from content-type or URL
+        content_type = resp.headers.get("content-type", "")
+        is_pdf = "pdf" in content_type or url.lower().endswith(".pdf")
+
+        # Save to downloads dir
+        from config import DOWNLOADS_DIR
+        dl_dir = P(DOWNLOADS_DIR)
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        ext = ".pdf" if is_pdf else ".md"
+        dest = dl_dir / f"reader_{doc_id}{ext}"
+        dest.write_bytes(resp.content)
+        log.info("Reader: downloaded %s (%d KB)", dest, len(resp.content) // 1024)
+
+        if is_pdf:
+            await _ingest_pdf(conn, doc_id, str(dest), title)
+        else:
+            # Treat as markdown/text
+            markdown = resp.text
+            await reader.ingest_document(conn, doc_id, markdown, title, original_md_path=str(dest))
+
+    except Exception as e:
+        log.exception("Reader: URL ingest failed for document %d", doc_id)
+        reader.update_document(conn, doc_id, status="failed", error=str(e))
+
+
+@app.get("/api/reader/documents")
+async def reader_list():
+    docs = reader.list_documents(history.conn)
+    return JSONResponse({"documents": docs})
+
+
+@app.get("/api/reader/documents/{doc_id}")
+async def reader_get(doc_id: int):
+    doc = reader.get_document(history.conn, doc_id)
+    if not doc:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # Include chunk headings if ready
+    if doc["status"] == "ready":
+        speech = reader.load_speech_data(doc)
+        if speech:
+            doc["total_sentences"] = speech.get("total_sentences", 0)
+            doc["sections"] = [
+                {"index": c["index"], "heading": c["heading"],
+                 "sentence_count": len(c["sentences"])}
+                for c in speech["chunks"]
+            ]
+    return JSONResponse({"document": doc})
+
+
+@app.delete("/api/reader/documents/{doc_id}")
+async def reader_delete(doc_id: int):
+    ok = reader.delete_document(history.conn, doc_id)
+    if not ok:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
 async def send_json(ws: WebSocket, msg_type: str, text: str):
     await ws.send_text(json.dumps({"type": msg_type, "text": text}))
 
@@ -220,6 +388,7 @@ async def websocket_endpoint(ws: WebSocket):
     conversation = Conversation()
     voice = TTS_VOICE
     tts_enabled = True
+    reader_task: asyncio.Task | None = None
     history_session = history.start_conversation(service="octavius", source="voice", model=LLM_CHAIN[0]["model"])
 
     try:
@@ -288,6 +457,42 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     continue
 
+                # -- Reader controls --
+                if data.get("type") == "reader_play":
+                    if reader_task and not reader_task.done():
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    reader_task = asyncio.create_task(
+                        reader.stream_reader_audio(
+                            ws, data["doc_id"], history.conn,
+                            chunk_index=data.get("chunk_index", 0),
+                            sentence_index=data.get("sentence_index", 0),
+                            voice=data.get("voice", voice),
+                        )
+                    )
+                    continue
+
+                if data.get("type") == "reader_pause":
+                    if reader_task and not reader_task.done():
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    continue
+
+                if data.get("type") == "reader_stop":
+                    if reader_task and not reader_task.done():
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    continue
+
             # Binary message — audio blob
             if "bytes" in message:
                 audio_bytes = message["bytes"]
@@ -312,6 +517,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     except (WebSocketDisconnect, RuntimeError):
         log.info("WebSocket disconnected")
+        if reader_task and not reader_task.done():
+            reader_task.cancel()
         history_session.end()
 
 
