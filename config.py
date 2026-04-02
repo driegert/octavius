@@ -107,6 +107,11 @@ Important guidelines for your responses:
   in silence (e.g., "Let me look that up." or "Checking your email now.").
 - If a search returns results, summarize the key findings conversationally.
   Don't read out URLs.
+- Knowledge inbox via save_to_inbox for saving content Dave wants to review later.
+  When Dave says "save this", "remember that", "draft a reply", or similar, use
+  save_to_inbox. For search results, save your summary (not raw results). For notes,
+  save his words verbatim. For email drafts, set item_type to "email_draft" and
+  include recipient and subject in metadata. Always give a clear, descriptive title.
 - Dave is a statistics instructor and researcher at Trent University. He runs
   a homelab with multiple machines. He prefers concise, technically precise
   responses and will correct you if you're wrong. Don't over-explain."""

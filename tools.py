@@ -1,13 +1,21 @@
 """Local tools that don't need an MCP server."""
 
+from __future__ import annotations
+
+import json
 import logging
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse, unquote
 
 import httpx
 
 from config import DOWNLOADS_DIR
+from history import save_item
+
+if TYPE_CHECKING:
+    from history import ConversationSession
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +49,44 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_to_inbox",
+            "description": (
+                "Save content to Dave's knowledge inbox for later review. "
+                "Use for: saving search summaries, article content, freeform notes, "
+                "or email drafts that Dave wants to review or act on later."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short descriptive title for the saved item.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full content to save.",
+                    },
+                    "item_type": {
+                        "type": "string",
+                        "enum": ["note", "search_summary", "article", "email_draft"],
+                        "description": "Type of content being saved.",
+                    },
+                    "source_url": {
+                        "type": "string",
+                        "description": "Source URL if applicable.",
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Type-specific data. For email_draft: {to, subject, in_reply_to}.",
+                    },
+                },
+                "required": ["title", "content", "item_type"],
+            },
+        },
+    },
 ]
 
 
@@ -59,11 +105,41 @@ def _safe_filename(url: str, filename: str | None) -> str:
     return name
 
 
-async def call_tool(name: str, arguments: dict) -> str:
+async def call_tool(
+    name: str,
+    arguments: dict,
+    history_session: ConversationSession | None = None,
+) -> str:
     """Execute a local tool by name. Returns result string."""
     if name == "download_file":
         return await _download_file(arguments)
+    if name == "save_to_inbox":
+        return _save_to_inbox(arguments, history_session)
     return f"Error: unknown local tool '{name}'"
+
+
+def _save_to_inbox(args: dict, session: ConversationSession | None) -> str:
+    title = args.get("title", "")
+    content = args.get("content", "")
+    item_type = args.get("item_type", "note")
+    if not title or not content:
+        return "Error: title and content are required."
+
+    conn = session.conn if session else None
+    if conn is None:
+        return "Error: no database connection available."
+
+    conversation_id = session.conv_id if session else None
+    item_id = save_item(
+        conn=conn,
+        item_type=item_type,
+        title=title,
+        content=content,
+        conversation_id=conversation_id,
+        source_url=args.get("source_url"),
+        metadata=args.get("metadata"),
+    )
+    return f"Saved to inbox (item #{item_id}): {title}"
 
 
 async def _download_file(args: dict) -> str:

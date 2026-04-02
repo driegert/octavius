@@ -176,7 +176,7 @@ async def stream_agent_turn(
                 local_tool_names = {t["function"]["name"] for t in local_tools.TOOLS}
                 tc_start = time.monotonic()
                 if name in local_tool_names:
-                    result = await local_tools.call_tool(name, args)
+                    result = await local_tools.call_tool(name, args, history_session=history_session)
                     server_name = "local"
                 else:
                     result = await mcp.call_tool(name, args)

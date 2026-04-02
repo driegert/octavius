@@ -2,13 +2,17 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import AGENT_PORT, LLM_CHAIN, MCP_SERVERS, TTS_MODEL, TTS_VOICES, TTS_VOICE
 from conversation import Conversation
-from history import HistoryRecorder, init_db
+from history import (
+    HistoryRecorder, init_db,
+    list_saved_items, search_saved_items, get_saved_item, update_saved_item_status,
+    get_conversation_messages,
+)
 from mcp_manager import MCPManager
 from stt import transcribe
 from tts import synthesize
@@ -58,6 +62,88 @@ async def health():
 @app.get("/api/voices")
 async def voices():
     return JSONResponse({"voices": TTS_VOICES, "default": TTS_VOICE})
+
+
+# -- Knowledge Inbox API -------------------------------------------------------
+
+@app.get("/inbox")
+async def inbox_page():
+    return FileResponse("static/inbox.html")
+
+
+@app.get("/api/inbox")
+async def inbox_list(
+    status: str | None = None,
+    type: str | None = None,
+    q: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    conn = history.conn
+    if q:
+        items = search_saved_items(conn, q, limit=limit)
+    else:
+        items = list_saved_items(conn, status=status, item_type=type, limit=limit, offset=offset)
+    return JSONResponse({"items": items})
+
+
+@app.get("/api/inbox/{item_id}")
+async def inbox_get(item_id: int):
+    item = get_saved_item(history.conn, item_id)
+    if not item:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"item": item})
+
+
+@app.patch("/api/inbox/{item_id}")
+async def inbox_update(item_id: int, request: Request):
+    body = await request.json()
+    new_status = body.get("status")
+    if new_status not in ("pending", "done", "dismissed"):
+        return JSONResponse({"error": "invalid status"}, status_code=400)
+    ok = update_saved_item_status(history.conn, item_id, new_status)
+    if not ok:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+# -- Conversation History API --------------------------------------------------
+
+@app.get("/api/conversations")
+async def conversations_list(limit: int = 20, offset: int = 0):
+    """List recent Octavius conversations with summaries."""
+    conn = history.conn
+    rows = conn.execute(
+        """SELECT id, session_id, started_at, ended_at, summary, message_count
+           FROM conversations
+           WHERE service = 'octavius' AND message_count > 0
+           ORDER BY started_at DESC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ).fetchall()
+    items = []
+    for r in rows:
+        # Fetch tags
+        tags = conn.execute(
+            """SELECT t.name FROM tags t
+               JOIN conversation_tags ct ON t.id = ct.tag_id
+               WHERE ct.conversation_id = ?""",
+            (r[0],),
+        ).fetchall()
+        items.append({
+            "id": r[0], "session_id": r[1][:8],
+            "started_at": r[2], "ended_at": r[3],
+            "summary": r[4], "message_count": r[5],
+            "tags": [t[0] for t in tags],
+        })
+    return JSONResponse({"conversations": items})
+
+
+@app.get("/api/conversations/{conv_id}/messages")
+async def conversation_messages(conv_id: int):
+    """Get all messages for a conversation."""
+    msgs = get_conversation_messages(history.conn, conv_id)
+    return JSONResponse({"messages": msgs})
 
 
 async def send_json(ws: WebSocket, msg_type: str, text: str):
@@ -157,6 +243,31 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     await send_json(ws, "status", "Conversation reset.")
                     log.info("Conversation reset by client")
+                    continue
+
+                if data.get("type") == "load_conversation":
+                    conv_id = data.get("conversation_id")
+                    if conv_id:
+                        msgs = get_conversation_messages(history.conn, conv_id)
+                        if msgs:
+                            history_session.end()
+                            conversation.load_from_history(msgs)
+                            history_session = history.start_conversation(
+                                source="voice", model=LLM_CHAIN[0]["model"],
+                            )
+                            # Send conversation history to client for display
+                            history_pairs = []
+                            for m in msgs:
+                                if m["role"] in ("user", "assistant") and m.get("content"):
+                                    history_pairs.append({"role": m["role"], "content": m["content"]})
+                            await ws.send_text(json.dumps({
+                                "type": "conversation_loaded",
+                                "conversation_id": conv_id,
+                                "messages": history_pairs,
+                            }))
+                            log.info("Loaded conversation %d (%d messages)", conv_id, len(msgs))
+                        else:
+                            await send_json(ws, "status", "Conversation not found.")
                     continue
 
                 if data.get("type") == "settings":

@@ -26,7 +26,7 @@ EMBEDDING_TIMEOUT = 5  # seconds
 SUMMARY_URL = "http://127.0.0.1:8001/v1/chat/completions"
 SUMMARY_MODEL = "qwen3.5-35b-a3b"
 SUMMARY_FALLBACK_URL = "http://triplestuffed:8010/v1/chat/completions"
-SUMMARY_TIMEOUT = 30  # seconds
+SUMMARY_TIMEOUT = 60  # seconds
 
 # Truncation limits
 RESULT_SUMMARY_MAX_CHARS = 500
@@ -125,7 +125,7 @@ def _generate_summary(messages: list[dict]) -> str | None:
             {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
             {"role": "user", "content": transcript},
         ],
-        "max_tokens": 256,
+        "max_tokens": 1024,
         "temperature": 0.3,
     }
 
@@ -176,7 +176,7 @@ def _generate_tags(messages: list[dict]) -> list[str]:
             {"role": "system", "content": TAG_SYSTEM_PROMPT},
             {"role": "user", "content": transcript},
         ],
-        "max_tokens": 100,
+        "max_tokens": 768,
         "temperature": 0.2,
     }
 
@@ -567,6 +567,145 @@ def get_conversation_messages(conn: sqlite3.Connection,
 
         messages.append(msg)
     return messages
+
+
+# -- Saved Items (Knowledge Inbox) API -------------------------------------------
+
+def save_item(
+    conn: sqlite3.Connection,
+    item_type: str,
+    title: str,
+    content: str,
+    conversation_id: int | None = None,
+    source_url: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    """Save an item to the knowledge inbox. Returns the item ID."""
+    now = _now()
+    metadata_json = json.dumps(metadata) if metadata else None
+    cursor = conn.execute(
+        """INSERT INTO saved_items
+           (conversation_id, item_type, title, content, source_url, metadata, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
+        (conversation_id, item_type, title, content, source_url, metadata_json, now),
+    )
+    conn.commit()
+    item_id = cursor.lastrowid
+    log.info("Saved inbox item %d: [%s] %s", item_id, item_type, title[:60])
+
+    # Embed title + content for semantic search
+    embed_text = f"{title}\n{content[:500]}"
+    _store_embedding(conn, "saved_item_embeddings", "saved_item_id", item_id, embed_text)
+
+    return item_id
+
+
+def list_saved_items(
+    conn: sqlite3.Connection,
+    status: str | None = None,
+    item_type: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """List saved items, optionally filtered by status and/or type."""
+    sql = "SELECT id, conversation_id, item_type, title, content, source_url, metadata, status, created_at, updated_at FROM saved_items WHERE 1=1"
+    params: list = []
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    if item_type:
+        sql += " AND item_type = ?"
+        params.append(item_type)
+    sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "id": r[0], "conversation_id": r[1], "item_type": r[2],
+            "title": r[3], "content": r[4][:200], "source_url": r[5],
+            "metadata": json.loads(r[6]) if r[6] else None,
+            "status": r[7], "created_at": r[8], "updated_at": r[9],
+        }
+        for r in rows
+    ]
+
+
+def search_saved_items(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Semantic search over saved items."""
+    query_bytes = _embed(query)
+    if query_bytes is None:
+        # Fall back to text search
+        pattern = f"%{query}%"
+        rows = conn.execute(
+            """SELECT id, conversation_id, item_type, title, content, source_url,
+                      metadata, status, created_at
+               FROM saved_items
+               WHERE (title LIKE ? OR content LIKE ?) AND status != 'dismissed'
+               ORDER BY created_at DESC LIMIT ?""",
+            (pattern, pattern, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT s.id, s.conversation_id, s.item_type, s.title, s.content,
+                      s.source_url, s.metadata, s.status, s.created_at,
+                      vec_distance_cosine(e.embedding, ?) as distance
+               FROM saved_items s
+               JOIN saved_item_embeddings e ON s.id = e.saved_item_id
+               WHERE s.status != 'dismissed'
+               ORDER BY distance ASC LIMIT ?""",
+            (query_bytes, limit),
+        ).fetchall()
+
+    results = []
+    for r in rows:
+        d = {
+            "id": r[0], "conversation_id": r[1], "item_type": r[2],
+            "title": r[3], "content": r[4][:200], "source_url": r[5],
+            "metadata": json.loads(r[6]) if r[6] else None,
+            "status": r[7], "created_at": r[8],
+        }
+        if len(r) > 9:
+            d["distance"] = r[9]
+        results.append(d)
+    return results
+
+
+def get_saved_item(conn: sqlite3.Connection, item_id: int) -> dict | None:
+    """Get a single saved item with full content."""
+    row = conn.execute(
+        """SELECT id, conversation_id, item_type, title, content, source_url,
+                  metadata, status, created_at, updated_at
+           FROM saved_items WHERE id = ?""",
+        (item_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "conversation_id": row[1], "item_type": row[2],
+        "title": row[3], "content": row[4], "source_url": row[5],
+        "metadata": json.loads(row[6]) if row[6] else None,
+        "status": row[7], "created_at": row[8], "updated_at": row[9],
+    }
+
+
+def update_saved_item_status(
+    conn: sqlite3.Connection,
+    item_id: int,
+    status: str,
+) -> bool:
+    """Update a saved item's status. Returns True if the item existed."""
+    now = _now()
+    cursor = conn.execute(
+        "UPDATE saved_items SET status = ?, updated_at = ? WHERE id = ?",
+        (status, now, item_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def get_stats(conn: sqlite3.Connection) -> dict:

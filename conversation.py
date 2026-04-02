@@ -53,3 +53,18 @@ class Conversation:
 
     def reset(self):
         self._messages = [{"role": "system", "content": _build_system_prompt()}]
+
+    def load_from_history(self, messages: list[dict]):
+        """Restore conversation state from history DB messages.
+
+        Accepts the format returned by history.get_conversation_messages().
+        Skips tool-role messages (they were part of the agent loop, the LLM
+        doesn't need them to continue the conversation).
+        """
+        self._messages = [{"role": "system", "content": _build_system_prompt()}]
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                self._messages.append({"role": role, "content": content})
+        self.trim()

@@ -103,3 +103,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS summary_embeddings USING vec0(
     conversation_id INTEGER PRIMARY KEY,
     embedding       float[1024]
 );
+
+-- Saved items (knowledge inbox)
+CREATE TABLE IF NOT EXISTS saved_items (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id   INTEGER REFERENCES conversations(id),
+    item_type         TEXT    NOT NULL,        -- 'note', 'search_summary', 'article', 'email_draft'
+    title             TEXT    NOT NULL,
+    content           TEXT    NOT NULL,         -- full content, NOT truncated
+    source_url        TEXT,
+    metadata          TEXT,                     -- JSON for type-specific data (e.g. email recipients, subject)
+    status            TEXT    NOT NULL DEFAULT 'pending',  -- 'pending', 'done', 'dismissed'
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_saved_items_status
+    ON saved_items(status, created_at);
+
+-- Embeddings (sqlite-vec) — saved item semantic search
+CREATE VIRTUAL TABLE IF NOT EXISTS saved_item_embeddings USING vec0(
+    saved_item_id INTEGER PRIMARY KEY,
+    embedding     float[1024]
+);
