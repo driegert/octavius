@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import uuid
 import logging
 from collections.abc import AsyncGenerator
@@ -7,9 +8,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 
-from config import (
-    LLM_URL, LLM_MODEL, LLM_FALLBACK_URL, LLM_FALLBACK_MODEL, MAX_TOOL_ROUNDS,
-)
+from config import LLM_CHAIN, MAX_TOOL_ROUNDS
 from conversation import Conversation
 from mcp_manager import MCPManager
 import tools as local_tools
@@ -24,19 +23,19 @@ SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 @asynccontextmanager
 async def _llm_stream(client: httpx.AsyncClient, payload: dict):
-    """Try primary LLM, fall back to secondary on connection/HTTP failure."""
-    try:
-        async with client.stream("POST", LLM_URL, json=payload) as resp:
-            resp.raise_for_status()
-            yield resp
-            return
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-        log.warning("Primary LLM failed (%s), falling back to %s", e, LLM_FALLBACK_URL)
-
-    payload["model"] = LLM_FALLBACK_MODEL
-    async with client.stream("POST", LLM_FALLBACK_URL, json=payload) as resp:
-        resp.raise_for_status()
-        yield resp
+    """Try each LLM in the chain until one succeeds."""
+    for i, entry in enumerate(LLM_CHAIN):
+        try:
+            payload["model"] = entry["model"]
+            async with client.stream("POST", entry["url"], json=payload) as resp:
+                resp.raise_for_status()
+                yield resp
+                return
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            if i < len(LLM_CHAIN) - 1:
+                log.warning("LLM %s failed (%s), trying next", entry["url"], e)
+            else:
+                raise
 
 
 async def run_agent_turn(
@@ -44,10 +43,11 @@ async def run_agent_turn(
     mcp: MCPManager,
     user_text: str,
     status_callback=None,
+    history_session=None,
 ) -> str:
     """Run one user turn (non-streaming). Returns full assistant text."""
     result_parts = []
-    async for chunk in stream_agent_turn(conversation, mcp, user_text, status_callback):
+    async for chunk in stream_agent_turn(conversation, mcp, user_text, status_callback, history_session):
         result_parts.append(chunk)
     return "".join(result_parts)
 
@@ -57,6 +57,7 @@ async def stream_agent_turn(
     mcp: MCPManager,
     user_text: str,
     status_callback=None,
+    history_session=None,
 ) -> AsyncGenerator[str, None]:
     """Run one user turn, yielding sentence chunks as the LLM streams them.
 
@@ -69,7 +70,7 @@ async def stream_agent_turn(
     for round_num in range(MAX_TOOL_ROUNDS):
         messages = conversation.get_messages()
         payload = {
-            "model": LLM_MODEL,
+            "model": LLM_CHAIN[0]["model"],
             "messages": messages,
             "stream": True,
         }
@@ -173,11 +174,35 @@ async def stream_agent_turn(
                 conversation.add_tool_call(call_id, name, args_str)
                 # Route to local tools or MCP
                 local_tool_names = {t["function"]["name"] for t in local_tools.TOOLS}
+                tc_start = time.monotonic()
                 if name in local_tool_names:
                     result = await local_tools.call_tool(name, args)
+                    server_name = "local"
                 else:
                     result = await mcp.call_tool(name, args)
+                    server_name = mcp.get_server_for_tool(name)
+                tc_duration_ms = int((time.monotonic() - tc_start) * 1000)
                 conversation.add_tool_result(call_id, result)
+
+                # Record tool call in history
+                if history_session:
+                    tc_status = "error" if result.startswith("Error") else "success"
+                    # Use the last recorded assistant message as parent,
+                    # or record a synthetic tool-role message
+                    history_msg_id = history_session.add_message(
+                        role="tool", content=result[:500],
+                        model=None, latency_ms=tc_duration_ms,
+                    )
+                    history_session.add_tool_call(
+                        message_id=history_msg_id,
+                        tool_name=name,
+                        server_name=server_name,
+                        arguments=args,
+                        status=tc_status,
+                        result_summary=result[:500],
+                        result_size=len(result),
+                        duration_ms=tc_duration_ms,
+                    )
 
             conversation.trim()
             continue  # Loop back for LLM to process tool results

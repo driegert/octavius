@@ -6,8 +6,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import AGENT_PORT, MCP_SERVERS, TTS_VOICES, TTS_VOICE
+from config import AGENT_PORT, LLM_CHAIN, MCP_SERVERS, TTS_MODEL, TTS_VOICES, TTS_VOICE
 from conversation import Conversation
+from history import HistoryRecorder, init_db
 from mcp_manager import MCPManager
 from stt import transcribe
 from tts import synthesize
@@ -21,19 +22,23 @@ log = logging.getLogger(__name__)
 
 mcp_manager: MCPManager
 conversation: Conversation
+history: HistoryRecorder
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mcp_manager, conversation
+    global mcp_manager, conversation, history
     mcp_manager = MCPManager(MCP_SERVERS)
     conversation = Conversation()
+    history_conn = init_db()
+    history = HistoryRecorder(history_conn)
     log.info("Connecting MCP servers...")
     await mcp_manager.connect_all()
     log.info("MCP ready — %d tools available", len(mcp_manager.tools))
     yield
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
+    history_conn.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -59,9 +64,20 @@ async def send_json(ws: WebSocket, msg_type: str, text: str):
     await ws.send_text(json.dumps({"type": msg_type, "text": text}))
 
 
-async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled):
+async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled,
+                    history_session=None, source="voice"):
     """Run agent loop with streaming TTS: synthesize each sentence as it arrives."""
+    import time
+    turn_start = time.monotonic()
+
     await send_json(ws, "status", "Thinking...")
+
+    # Record user message
+    if history_session:
+        user_kwargs = {}
+        if source == "voice":
+            user_kwargs["stt_model"] = "whisper"
+        history_session.add_message(role="user", content=user_text, **user_kwargs)
 
     async def status_cb(text: str):
         await send_json(ws, "status", text)
@@ -71,7 +87,8 @@ async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled
 
     try:
         async for sentence in stream_agent_turn(
-            conversation, mcp_manager, user_text, status_callback=status_cb
+            conversation, mcp_manager, user_text,
+            status_callback=status_cb, history_session=history_session,
         ):
             full_reply_parts.append(sentence)
 
@@ -89,11 +106,24 @@ async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled
     except Exception as e:
         log.exception("Agent failed")
         await send_json(ws, "status", f"Agent error: {e}")
+        if history_session:
+            history_session.add_message(
+                role="assistant", content=f"Error: {e}", error=str(e),
+            )
         return
 
     full_reply = "".join(full_reply_parts).strip()
     if full_reply:
         await send_json(ws, "response", full_reply)
+
+    # Record assistant message
+    if history_session and full_reply:
+        latency_ms = int((time.monotonic() - turn_start) * 1000)
+        history_session.add_message(
+            role="assistant", content=full_reply,
+            model=LLM_CHAIN[0]["model"], latency_ms=latency_ms,
+            tts_model=TTS_MODEL if tts_enabled else None,
+        )
 
     # Signal end of audio stream
     await send_json(ws, "status", "audio_done")
@@ -106,6 +136,7 @@ async def websocket_endpoint(ws: WebSocket):
     log.info("WebSocket connected")
     voice = TTS_VOICE
     tts_enabled = True
+    history_session = history.start_conversation(service="octavius", source="voice", model=LLM_CHAIN[0]["model"])
 
     try:
         while True:
@@ -119,7 +150,11 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
 
                 if data.get("type") == "reset":
+                    history_session.end()
                     conversation.reset()
+                    history_session = history.start_conversation(
+                        source="voice", model=LLM_CHAIN[0]["model"],
+                    )
                     await send_json(ws, "status", "Conversation reset.")
                     log.info("Conversation reset by client")
                     continue
@@ -138,7 +173,10 @@ async def websocket_endpoint(ws: WebSocket):
                     if not user_text:
                         continue
                     await send_json(ws, "transcript", user_text)
-                    await _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled)
+                    await _run_turn(
+                        ws, conversation, mcp_manager, user_text, voice,
+                        tts_enabled, history_session=history_session, source="text",
+                    )
                     continue
 
             # Binary message — audio blob
@@ -158,10 +196,14 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
 
                 await send_json(ws, "transcript", user_text)
-                await _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled)
+                await _run_turn(
+                    ws, conversation, mcp_manager, user_text, voice,
+                    tts_enabled, history_session=history_session, source="voice",
+                )
 
     except (WebSocketDisconnect, RuntimeError):
         log.info("WebSocket disconnected")
+        history_session.end()
 
 
 if __name__ == "__main__":

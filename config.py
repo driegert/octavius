@@ -1,11 +1,10 @@
 STT_URL = "http://127.0.0.1:8502/api/transcribe"
 
-LLM_URL = "http://127.0.0.1:8001/v1/chat/completions"
-LLM_MODEL = "qwen3.5-35b-a3b"
-
-# Fallback LLM (triplestuffed)
-LLM_FALLBACK_URL = "http://triplestuffed:8010/v1/chat/completions"
-LLM_FALLBACK_MODEL = "qwen3.5-35b-a3b"
+LLM_CHAIN = [
+    {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
+    {"url": "http://127.0.0.1:8001/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
+    {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
+]
 
 TTS_URL = "http://triplestuffed:8020/v1/audio/speech"
 TTS_MODEL = "/media/extra_stuff/huggingface/mistralai/Voxtral-4B-TTS-2603"

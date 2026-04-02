@@ -384,6 +384,13 @@
       </div>
     </div>
 
+    <div class="setting-group">
+      <div class="setting-row">
+        <input type="checkbox" id="toggle-talk-cb">
+        <span class="cb-label" onclick="document.getElementById('toggle-talk-cb').click()">Toggle-to-talk</span>
+      </div>
+    </div>
+
     <button id="settings-close">Done</button>
   </div>
 </div>
@@ -452,6 +459,7 @@
   const textInputArea = document.getElementById('text-input-area');
   const textInput     = document.getElementById('text-input');
   const textSend      = document.getElementById('text-send');
+  const toggleTalkCb  = document.getElementById('toggle-talk-cb');
 
   let ws = null;
   let mediaRecorder = null;
@@ -461,6 +469,7 @@
   let currentVoice = 'de_male';
   let sttEnabled = true;
   let ttsEnabled = true;
+  let toggleToTalk = false;
 
   function getAudioCtx() {
     if (!audioCtx) audioCtx = new AudioContext();
@@ -472,6 +481,7 @@
     if (sttEnabled) {
       talkBtn.style.display = '';
       textInputArea.classList.remove('visible');
+      talkBtn.innerHTML = toggleToTalk ? 'TAP TO<br>TALK' : 'HOLD TO<br>TALK';
     } else {
       talkBtn.style.display = 'none';
       textInputArea.classList.add('visible');
@@ -479,11 +489,13 @@
     }
     sttToggle.classList.toggle('off', !sttEnabled);
     ttsToggle.classList.toggle('off', !ttsEnabled);
+    toggleTalkCb.checked = toggleToTalk;
 
     // Persist
     const prefs = loadPrefs();
     prefs.sttEnabled = sttEnabled;
     prefs.ttsEnabled = ttsEnabled;
+    prefs.toggleToTalk = toggleToTalk;
     savePrefs(prefs);
   }
 
@@ -558,6 +570,7 @@
   if (prefs.voice) currentVoice = prefs.voice;
   if (prefs.sttEnabled !== undefined) sttEnabled = prefs.sttEnabled;
   if (prefs.ttsEnabled !== undefined) ttsEnabled = prefs.ttsEnabled;
+  if (prefs.toggleToTalk !== undefined) toggleToTalk = prefs.toggleToTalk;
   applyVoicePrefs(currentVoice);
   updateInputMode();
 
@@ -604,6 +617,11 @@
 
   trimCb.addEventListener('change', () => {
     persistCurrent();
+  });
+
+  toggleTalkCb.addEventListener('change', () => {
+    toggleToTalk = toggleTalkCb.checked;
+    updateInputMode();
   });
 
   function sendSettings() {
@@ -908,12 +926,30 @@
     }
   }
 
-  talkBtn.addEventListener('mousedown', (e) => { e.preventDefault(); startRecording(); });
-  talkBtn.addEventListener('mouseup', stopRecording);
-  talkBtn.addEventListener('mouseleave', stopRecording);
-  talkBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
-  talkBtn.addEventListener('touchend', stopRecording);
-  talkBtn.addEventListener('touchcancel', stopRecording);
+  // Push-to-talk: hold to record, release to stop
+  // Toggle-to-talk: tap to start, tap again to stop
+  function handleTalkDown(e) {
+    e.preventDefault();
+    if (toggleToTalk) {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    } else {
+      startRecording();
+    }
+  }
+  function handleTalkUp() {
+    if (!toggleToTalk) stopRecording();
+  }
+
+  talkBtn.addEventListener('mousedown', handleTalkDown);
+  talkBtn.addEventListener('mouseup', handleTalkUp);
+  talkBtn.addEventListener('mouseleave', handleTalkUp);
+  talkBtn.addEventListener('touchstart', handleTalkDown);
+  talkBtn.addEventListener('touchend', handleTalkUp);
+  talkBtn.addEventListener('touchcancel', handleTalkUp);
 
   resetBtn.addEventListener('click', () => {
     if (ws && ws.readyState === WebSocket.OPEN) {

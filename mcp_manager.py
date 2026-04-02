@@ -94,6 +94,10 @@ class MCPManager:
             log.exception("Reconnect failed for MCP server %s", server_name)
             return False
 
+    def get_server_for_tool(self, name: str) -> str | None:
+        """Return the server name that hosts a given tool."""
+        return self._tool_route.get(name)
+
     async def call_tool(self, name: str, arguments: dict) -> str:
         server_name = self._tool_route.get(name)
         if not server_name:
