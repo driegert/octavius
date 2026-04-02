@@ -12,7 +12,7 @@ from conversation import Conversation
 from history import (
     HistoryRecorder, init_db,
     list_saved_items, search_saved_items, get_saved_item, update_saved_item_status,
-    get_conversation_messages,
+    get_conversation_messages, set_item_chat_conversation, get_item_chat_conversation_id,
 )
 from mcp_manager import MCPManager
 from stt import transcribe
@@ -389,6 +389,8 @@ async def websocket_endpoint(ws: WebSocket):
     voice = TTS_VOICE
     tts_enabled = True
     reader_task: asyncio.Task | None = None
+    item_conversations: dict[int, Conversation] = {}
+    item_history_sessions: dict[int, object] = {}
     history_session = history.start_conversation(service="octavius", source="voice", model=LLM_CHAIN[0]["model"])
 
     try:
@@ -493,6 +495,173 @@ async def websocket_endpoint(ws: WebSocket):
                             pass
                     continue
 
+                # -- Item chat controls --
+                if data.get("type") == "item_chat_load":
+                    item_id = data.get("item_id")
+                    item = get_saved_item(history.conn, item_id)
+                    if not item:
+                        await ws.send_text(json.dumps({
+                            "type": "item_chat_status", "item_id": item_id,
+                            "text": "Item not found.",
+                        }))
+                        continue
+
+                    chat_conv_id = get_item_chat_conversation_id(history.conn, item_id)
+                    if chat_conv_id:
+                        # Load existing conversation
+                        msgs = get_conversation_messages(history.conn, chat_conv_id)
+                        conv = Conversation()
+                        # Inject item context into system prompt
+                        preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
+                        conv._messages[0]["content"] += (
+                            f"\n\nYou are discussing a saved inbox item with Dave.\n"
+                            f"Title: {item['title']}\nType: {item['item_type']}\n"
+                            f"Preview: {preview}\n\n"
+                            f"Use the read_item_content tool to fetch the full content "
+                            f"or specific sections when you need more detail. The item ID is {item_id}."
+                        )
+                        # Restore conversation history
+                        for m in msgs:
+                            if m["role"] in ("user", "assistant") and m.get("content"):
+                                conv._messages.append({"role": m["role"], "content": m["content"]})
+                        conv.trim()
+                        item_conversations[item_id] = conv
+
+                        # Restore history session
+                        item_history_sessions[item_id] = history.start_conversation(
+                            service="octavius", source="inbox_chat",
+                            model=LLM_CHAIN[0]["model"],
+                        )
+
+                        # Send existing messages to client
+                        history_pairs = [
+                            {"role": m["role"], "content": m["content"]}
+                            for m in msgs
+                            if m["role"] in ("user", "assistant") and m.get("content")
+                        ]
+                        await ws.send_text(json.dumps({
+                            "type": "item_chat_loaded", "item_id": item_id,
+                            "messages": history_pairs,
+                        }))
+                    else:
+                        # Create new conversation with item context
+                        conv = Conversation()
+                        preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
+                        conv._messages[0]["content"] += (
+                            f"\n\nYou are discussing a saved inbox item with Dave.\n"
+                            f"Title: {item['title']}\nType: {item['item_type']}\n"
+                            f"Preview: {preview}\n\n"
+                            f"Use the read_item_content tool to fetch the full content "
+                            f"or specific sections when you need more detail. The item ID is {item_id}."
+                        )
+                        item_conversations[item_id] = conv
+
+                        hsess = history.start_conversation(
+                            service="octavius", source="inbox_chat",
+                            model=LLM_CHAIN[0]["model"],
+                        )
+                        item_history_sessions[item_id] = hsess
+                        set_item_chat_conversation(history.conn, item_id, hsess.conv_id)
+
+                        await ws.send_text(json.dumps({
+                            "type": "item_chat_loaded", "item_id": item_id,
+                            "messages": [],
+                        }))
+                    continue
+
+                if data.get("type") == "item_chat":
+                    item_id = data.get("item_id")
+                    user_text = data.get("text", "").strip()
+                    if not user_text or item_id not in item_conversations:
+                        continue
+
+                    conv = item_conversations[item_id]
+                    hsess = item_history_sessions.get(item_id)
+
+                    await ws.send_text(json.dumps({
+                        "type": "item_chat_status", "item_id": item_id,
+                        "text": "Thinking...",
+                    }))
+
+                    # Record user message
+                    if hsess:
+                        hsess.add_message(role="user", content=user_text)
+
+                    # Run agent turn (text-only, no TTS)
+                    import time as _time
+                    turn_start = _time.monotonic()
+
+                    async def item_status_cb(text):
+                        await ws.send_text(json.dumps({
+                            "type": "item_chat_status", "item_id": item_id,
+                            "text": text,
+                        }))
+
+                    full_parts = []
+                    try:
+                        async for sentence in stream_agent_turn(
+                            conv, mcp_manager, user_text,
+                            status_callback=item_status_cb,
+                            history_session=hsess,
+                        ):
+                            full_parts.append(sentence)
+                    except Exception as e:
+                        log.exception("Item chat agent failed")
+                        await ws.send_text(json.dumps({
+                            "type": "item_chat_response", "item_id": item_id,
+                            "text": f"Error: {e}",
+                        }))
+                        continue
+
+                    full_reply = "".join(full_parts).strip()
+                    if hsess and full_reply:
+                        latency_ms = int((_time.monotonic() - turn_start) * 1000)
+                        hsess.add_message(
+                            role="assistant", content=full_reply,
+                            model=LLM_CHAIN[0]["model"], latency_ms=latency_ms,
+                        )
+
+                    await ws.send_text(json.dumps({
+                        "type": "item_chat_response", "item_id": item_id,
+                        "text": full_reply or "I'm not sure how to respond to that.",
+                    }))
+                    continue
+
+                if data.get("type") == "item_chat_reset":
+                    item_id = data.get("item_id")
+                    # End old session if exists
+                    old_hsess = item_history_sessions.pop(item_id, None)
+                    if old_hsess:
+                        old_hsess.end()
+                    item_conversations.pop(item_id, None)
+
+                    # Create fresh conversation
+                    item = get_saved_item(history.conn, item_id)
+                    if item:
+                        conv = Conversation()
+                        preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
+                        conv._messages[0]["content"] += (
+                            f"\n\nYou are discussing a saved inbox item with Dave.\n"
+                            f"Title: {item['title']}\nType: {item['item_type']}\n"
+                            f"Preview: {preview}\n\n"
+                            f"Use the read_item_content tool to fetch the full content "
+                            f"or specific sections when you need more detail. The item ID is {item_id}."
+                        )
+                        item_conversations[item_id] = conv
+
+                        hsess = history.start_conversation(
+                            service="octavius", source="inbox_chat",
+                            model=LLM_CHAIN[0]["model"],
+                        )
+                        item_history_sessions[item_id] = hsess
+                        set_item_chat_conversation(history.conn, item_id, hsess.conv_id)
+
+                    await ws.send_text(json.dumps({
+                        "type": "item_chat_loaded", "item_id": item_id,
+                        "messages": [],
+                    }))
+                    continue
+
             # Binary message — audio blob
             if "bytes" in message:
                 audio_bytes = message["bytes"]
@@ -519,6 +688,8 @@ async def websocket_endpoint(ws: WebSocket):
         log.info("WebSocket disconnected")
         if reader_task and not reader_task.done():
             reader_task.cancel()
+        for hsess in item_history_sessions.values():
+            hsess.end()
         history_session.end()
 
 

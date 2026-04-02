@@ -113,6 +113,61 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_item_content",
+            "description": (
+                "Read a chunk of content from a saved inbox item. Use this to access "
+                "the full content of an item you're discussing with Dave. Returns the "
+                "content from the given offset with the specified character limit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "The inbox item ID to read from.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Character offset to start reading from. Default 0.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum characters to return. Default 4000.",
+                    },
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process_pdf",
+            "description": (
+                "Convert a PDF to markdown in the background. Returns immediately — "
+                "the result will be saved to Dave's knowledge inbox when processing "
+                "completes. Use this instead of convert_pdf_to_md for a non-blocking "
+                "experience."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the PDF file to process.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Title for the inbox item.",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
 ]
 
 
@@ -141,8 +196,12 @@ async def call_tool(
         return await _download_file(arguments)
     if name == "save_to_inbox":
         return _save_to_inbox(arguments, history_session)
+    if name == "read_item_content":
+        return _read_item_content(arguments, history_session)
     if name == "read_document":
         return await _read_document(arguments, history_session)
+    if name == "process_pdf":
+        return await _process_pdf_background(arguments, history_session)
     return f"Error: unknown local tool '{name}'"
 
 
@@ -200,6 +259,37 @@ async def _download_file(args: dict) -> str:
         return f"Error downloading {url}: {e}"
 
 
+def _read_item_content(args: dict, session: ConversationSession | None) -> str:
+    from history import get_saved_item
+
+    item_id = args.get("item_id")
+    if not item_id:
+        return "Error: item_id is required."
+
+    conn = session.conn if session else None
+    if conn is None:
+        return "Error: no database connection available."
+
+    item = get_saved_item(conn, item_id)
+    if not item:
+        return f"Error: inbox item {item_id} not found."
+
+    content = item.get("content", "")
+    offset = args.get("offset", 0)
+    limit = args.get("limit", 4000)
+
+    chunk = content[offset:offset + limit]
+    total_len = len(content)
+    remaining = max(0, total_len - offset - limit)
+
+    return (
+        f"[Item #{item_id}: {total_len} chars total, showing {offset}-{offset + len(chunk)}]"
+        f"\n\n{chunk}"
+        + (f"\n\n[{remaining} more characters available — use offset={offset + limit} to continue]"
+           if remaining > 0 else "\n\n[End of content]")
+    )
+
+
 async def _read_document(args: dict, session: ConversationSession | None) -> str:
     import asyncio
 
@@ -233,3 +323,115 @@ async def _read_document(args: dict, session: ConversationSession | None) -> str
             f"Document '{title}' is being prepared for reading (document #{doc_id}). "
             f"It will be available at /reader in a minute or two."
         )
+
+
+async def _process_pdf_background(args: dict, session: ConversationSession | None) -> str:
+    """Kick off PDF processing in the background and return immediately.
+
+    The result is saved to the knowledge inbox when processing completes.
+    """
+    import asyncio
+
+    file_path = args.get("file_path", "")
+    if not file_path:
+        return "Error: file_path is required."
+
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: file not found: {file_path}"
+    if p.suffix.lower() != ".pdf":
+        return f"Error: {file_path} is not a PDF file."
+
+    title = args.get("title", p.stem)
+    conn = session.conn if session else None
+    if conn is None:
+        return "Error: no database connection available."
+
+    conv_id = session.conv_id if session else None
+
+    # Save a placeholder inbox item
+    item_id = save_item(
+        conn=conn,
+        item_type="article",
+        title=f"{title} (processing...)",
+        content=f"PDF is being converted to text. Source: {file_path}",
+        conversation_id=conv_id,
+    )
+
+    # Kick off background task
+    asyncio.create_task(_run_pdf_processing(conn, item_id, file_path, title))
+
+    return (
+        f"PDF '{title}' is being processed in the background (inbox item #{item_id}). "
+        f"It will appear in the knowledge inbox when ready. You can keep talking to me in the meantime."
+    )
+
+
+async def _run_pdf_processing(conn, item_id: int, file_path: str, title: str):
+    """Background task: call MCP tools to convert PDF, then update inbox item."""
+    import asyncio
+    from history import update_saved_item_status
+
+    try:
+        # Import mcp_manager at runtime to avoid circular import
+        from main import mcp_manager
+
+        # Start conversion
+        result = await mcp_manager.call_tool("convert_pdf_to_md", {"file_path": file_path})
+
+        import re as _re
+        job_match = _re.search(r'Job ID:\s*(\S+)', result)
+        if not job_match:
+            conn.execute(
+                "UPDATE saved_items SET title = ?, content = ? WHERE id = ?",
+                (f"{title} (failed)", f"PDF conversion failed: {result}", item_id),
+            )
+            conn.commit()
+            return
+
+        job_id = job_match.group(1)
+        log.info("Background PDF processing started: job %s for inbox item %d", job_id, item_id)
+
+        # Poll for completion
+        for _ in range(120):  # up to 10 minutes
+            await asyncio.sleep(5)
+            poll_result = await mcp_manager.call_tool("get_conversion_result", {"job_id": job_id})
+
+            if "still processing" in poll_result.lower() or "not yet" in poll_result.lower():
+                continue
+
+            md_match = _re.search(r'(/\S+\.md)', poll_result)
+            if md_match:
+                md_path = md_match.group(1)
+                markdown = Path(md_path).read_text()
+                # Update inbox item with the converted content
+                conn.execute(
+                    "UPDATE saved_items SET title = ?, content = ? WHERE id = ?",
+                    (title, markdown, item_id),
+                )
+                conn.commit()
+                log.info("Background PDF processing complete: inbox item %d", item_id)
+                return
+
+            if "error" in poll_result.lower() or "failed" in poll_result.lower():
+                conn.execute(
+                    "UPDATE saved_items SET title = ?, content = ? WHERE id = ?",
+                    (f"{title} (failed)", poll_result[:2000], item_id),
+                )
+                conn.commit()
+                return
+
+        # Timeout
+        conn.execute(
+            "UPDATE saved_items SET title = ?, content = ? WHERE id = ?",
+            (f"{title} (timed out)", "PDF conversion timed out after 10 minutes.", item_id),
+        )
+        conn.commit()
+
+    except Exception as e:
+        log.exception("Background PDF processing failed for inbox item %d", item_id)
+        conn.execute(
+            "UPDATE saved_items SET title = ?, content = ? WHERE id = ?",
+            (f"{title} (failed)", f"Error: {e}", item_id),
+        )
+        conn.commit()

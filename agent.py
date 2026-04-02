@@ -74,9 +74,11 @@ async def stream_agent_turn(
             "messages": messages,
             "stream": True,
         }
-        all_tools = mcp.tools + local_tools.TOOLS
-        if all_tools:
-            payload["tools"] = all_tools
+        # On the last round, don't offer tools — force the LLM to respond with what it has
+        if round_num < MAX_TOOL_ROUNDS - 1:
+            all_tools = mcp.tools + local_tools.TOOLS
+            if all_tools:
+                payload["tools"] = all_tools
 
         # --- Streaming request ---
         try:
@@ -222,7 +224,7 @@ async def stream_agent_turn(
         conversation.add_assistant(clean)
         return
 
-    # Safety limit reached
-    fallback = "I've been going back and forth with my tools for a while. Let me just give you what I have so far."
+    # Safety limit reached (shouldn't happen since last round has no tools)
+    fallback = "I ran into a limit on how many tool calls I can make. Could you try rephrasing your request?"
     conversation.add_assistant(fallback)
     yield fallback

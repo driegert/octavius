@@ -663,22 +663,37 @@
   });
 
   // --- Transport controls
+  let playSeqId = 0; // incremented on each play/seek to ignore stale responses
+
   function sendPlay(chunkIdx, sentIdx) {
     if (!ws || ws.readyState !== WebSocket.OPEN || !currentDocId) return;
+
+    // Stop any current playback first
+    if (isPlaying) {
+      ws.send(JSON.stringify({ type: 'reader_pause' }));
+    }
     clearAudioQueue();
-    ws.send(JSON.stringify({
-      type: 'reader_play',
-      doc_id: currentDocId,
-      chunk_index: chunkIdx !== undefined ? chunkIdx : currentChunk,
-      sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
-      voice: voiceSelect.value,
-    }));
-    isPlaying = true;
-    playPauseBtn.innerHTML = '&#10074;&#10074;';
+
+    // Small delay to let server cancel the previous task
+    playSeqId++;
+    const mySeq = playSeqId;
+    setTimeout(() => {
+      if (mySeq !== playSeqId) return; // superseded by newer play/seek
+      ws.send(JSON.stringify({
+        type: 'reader_play',
+        doc_id: currentDocId,
+        chunk_index: chunkIdx !== undefined ? chunkIdx : currentChunk,
+        sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
+        voice: voiceSelect.value,
+      }));
+      isPlaying = true;
+      playPauseBtn.innerHTML = '&#10074;&#10074;';
+    }, 100);
   }
 
   function sendPause() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    playSeqId++; // cancel any pending sendPlay
     ws.send(JSON.stringify({ type: 'reader_pause' }));
     clearAudioQueue();
     isPlaying = false;
@@ -686,16 +701,17 @@
   }
 
   function seekTo(chunkIdx, sentIdx) {
-    clearAudioQueue();
+    currentChunk = chunkIdx;
+    currentSentence = sentIdx;
+
+    // Update section highlight
+    document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
+    const secEl = document.querySelector(`.section-item[data-chunk="${chunkIdx}"]`);
+    if (secEl) secEl.classList.add('active');
+
     if (isPlaying) {
+      // Restart playback from new position
       sendPlay(chunkIdx, sentIdx);
-    } else {
-      currentChunk = chunkIdx;
-      currentSentence = sentIdx;
-      // Update section highlight
-      document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
-      const secEl = document.querySelector(`.section-item[data-chunk="${chunkIdx}"]`);
-      if (secEl) secEl.classList.add('active');
     }
   }
 

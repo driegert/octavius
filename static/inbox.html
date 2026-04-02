@@ -7,6 +7,7 @@
 <link rel="icon" type="image/png" href="/static/octavius-dapper_cyber_punk.png">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
 <link rel="manifest" href="/static/manifest.json">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -247,6 +248,116 @@
   }
   .pagination button:hover { border-color: #555; color: #ccc; }
   .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* Chat panel */
+  .card-chat {
+    display: none;
+    margin-top: 0.8rem;
+    border-top: 1px solid #2a2a35;
+    padding-top: 0.6rem;
+  }
+  .card.expanded .card-chat { display: block; }
+
+  .chat-toggle-btn {
+    background: none;
+    border: 1px solid #2a2a35;
+    color: #60a0ff;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+    font-family: inherit;
+    width: 100%;
+  }
+  .chat-toggle-btn:hover { border-color: #60a0ff; color: #80c0ff; }
+
+  .chat-panel { display: none; margin-top: 0.6rem; }
+  .chat-panel.open { display: block; }
+
+  .chat-messages {
+    max-height: 40vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    padding: 0.4rem;
+  }
+
+  .chat-msg {
+    font-size: 0.8rem;
+    line-height: 1.45;
+    padding: 0.5rem 0.7rem;
+    border-radius: 6px;
+    max-width: 85%;
+    word-break: break-word;
+  }
+  .chat-msg.user {
+    background: #1a1a2a;
+    color: #b0b0d0;
+    align-self: flex-end;
+  }
+  .chat-msg.assistant {
+    background: #1a2a1a;
+    color: #c8c8d0;
+    align-self: flex-start;
+  }
+  .chat-msg.assistant p { margin-bottom: 0.4em; }
+  .chat-msg.assistant p:last-child { margin-bottom: 0; }
+  .chat-msg.assistant ul, .chat-msg.assistant ol { margin: 0.3em 0 0.4em 1.1em; }
+  .chat-msg.assistant li { margin-bottom: 0.15em; }
+  .chat-msg.assistant strong { color: #e0e0f0; }
+  .chat-msg.assistant code { background: #151520; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }
+
+  .chat-status {
+    font-size: 0.7rem;
+    color: #60a0ff;
+    padding: 0.2rem 0;
+    min-height: 1.2em;
+  }
+
+  .chat-input-row {
+    display: flex;
+    gap: 0.4rem;
+  }
+
+  .chat-input-row input {
+    flex: 1;
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #c8c8d0;
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 0.5rem 0.7rem;
+    outline: none;
+  }
+  .chat-input-row input:focus { border-color: #60a0ff; }
+  .chat-input-row input::placeholder { color: #444; }
+
+  .chat-input-row button {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #888;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .chat-input-row button:hover { border-color: #555; color: #ccc; }
+
+  .chat-reset-btn {
+    background: none;
+    border: none;
+    color: #555;
+    font-size: 0.65rem;
+    cursor: pointer;
+    padding: 0.3rem 0;
+    margin-top: 0.3rem;
+  }
+  .chat-reset-btn:hover { color: #888; }
 </style>
 </head>
 <body>
@@ -344,6 +455,18 @@
           ${item.item_type === 'article' ? `
             <button class="read-btn" onclick="event.stopPropagation(); window.location.href='/reader?inbox_id=${item.id}'">Read aloud</button>
           ` : ''}
+        </div>
+        <div class="card-chat">
+          <button class="chat-toggle-btn" onclick="event.stopPropagation(); toggleChat(${item.id}, this)">Chat with Octavius</button>
+          <div class="chat-panel" id="chat-panel-${item.id}" onclick="event.stopPropagation()">
+            <div class="chat-messages" id="chat-msgs-${item.id}"></div>
+            <div class="chat-status" id="chat-status-${item.id}"></div>
+            <div class="chat-input-row">
+              <input type="text" id="chat-input-${item.id}" placeholder="Ask about this item..." onclick="event.stopPropagation()" onkeydown="if(event.key==='Enter'){event.stopPropagation();sendItemChat(${item.id})}">
+              <button onclick="event.stopPropagation(); sendItemChat(${item.id})">Send</button>
+            </div>
+            <button class="chat-reset-btn" onclick="event.stopPropagation(); resetItemChat(${item.id})">Reset chat</button>
+          </div>
         </div>
       `;
 
@@ -460,6 +583,109 @@
   });
 
   loadItems();
+
+  // --- Markdown rendering
+  if (typeof marked !== 'undefined') {
+    marked.setOptions({ breaks: true, gfm: true });
+  }
+  function renderMd(text) {
+    if (typeof marked !== 'undefined' && text) return marked.parse(text);
+    const d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML.replace(/\n/g, '<br>');
+  }
+
+  // --- WebSocket for item chat
+  let ws = null;
+  const chatLoaded = {}; // item_id -> true if chat panel has been initialized
+
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+    ws.onmessage = (evt) => {
+      if (typeof evt.data !== 'string') return;
+      const msg = JSON.parse(evt.data);
+
+      if (msg.type === 'item_chat_loaded') {
+        const msgsEl = document.getElementById('chat-msgs-' + msg.item_id);
+        const statusEl = document.getElementById('chat-status-' + msg.item_id);
+        if (!msgsEl) return;
+        msgsEl.innerHTML = '';
+        for (const m of (msg.messages || [])) {
+          appendChatMsg(msg.item_id, m.role, m.content);
+        }
+        if (statusEl) statusEl.textContent = '';
+      }
+
+      if (msg.type === 'item_chat_status') {
+        const statusEl = document.getElementById('chat-status-' + msg.item_id);
+        if (statusEl) statusEl.textContent = msg.text;
+      }
+
+      if (msg.type === 'item_chat_response') {
+        const statusEl = document.getElementById('chat-status-' + msg.item_id);
+        if (statusEl) statusEl.textContent = '';
+        appendChatMsg(msg.item_id, 'assistant', msg.text);
+        // Re-enable input
+        const input = document.getElementById('chat-input-' + msg.item_id);
+        if (input) { input.disabled = false; input.focus(); }
+      }
+    };
+
+    ws.onclose = () => setTimeout(connectWS, 2000);
+    ws.onerror = () => ws.close();
+  }
+
+  function appendChatMsg(itemId, role, content) {
+    const msgsEl = document.getElementById('chat-msgs-' + itemId);
+    if (!msgsEl) return;
+    const div = document.createElement('div');
+    div.className = 'chat-msg ' + role;
+    if (role === 'assistant') {
+      div.innerHTML = renderMd(content);
+    } else {
+      div.textContent = content;
+    }
+    msgsEl.appendChild(div);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+
+  window.toggleChat = function(itemId, btn) {
+    const panel = document.getElementById('chat-panel-' + itemId);
+    if (!panel) return;
+    const isOpen = panel.classList.toggle('open');
+    btn.textContent = isOpen ? 'Hide chat' : 'Chat with Octavius';
+
+    // Load chat history on first open
+    if (isOpen && !chatLoaded[itemId]) {
+      chatLoaded[itemId] = true;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'item_chat_load', item_id: itemId }));
+      }
+    }
+  };
+
+  window.sendItemChat = function(itemId) {
+    const input = document.getElementById('chat-input-' + itemId);
+    if (!input) return;
+    const text = input.value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    appendChatMsg(itemId, 'user', text);
+    input.value = '';
+    input.disabled = true;
+
+    ws.send(JSON.stringify({ type: 'item_chat', item_id: itemId, text: text }));
+  };
+
+  window.resetItemChat = function(itemId) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'item_chat_reset', item_id: itemId }));
+    chatLoaded[itemId] = true; // Will receive item_chat_loaded with empty messages
+  };
+
+  connectWS();
 })();
 </script>
 </body>

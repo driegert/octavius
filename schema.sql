@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS saved_items (
     source_url        TEXT,
     metadata          TEXT,                     -- JSON for type-specific data (e.g. email recipients, subject)
     status            TEXT    NOT NULL DEFAULT 'pending',  -- 'pending', 'done', 'dismissed'
+    chat_conversation_id INTEGER REFERENCES conversations(id),
     created_at        TEXT    NOT NULL,
     updated_at        TEXT
 );

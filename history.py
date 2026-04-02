@@ -708,6 +708,25 @@ def update_saved_item_status(
     return cursor.rowcount > 0
 
 
+def set_item_chat_conversation(conn: sqlite3.Connection, item_id: int,
+                                conversation_id: int):
+    """Link a chat conversation to a saved item."""
+    conn.execute(
+        "UPDATE saved_items SET chat_conversation_id = ? WHERE id = ?",
+        (conversation_id, item_id),
+    )
+    conn.commit()
+
+
+def get_item_chat_conversation_id(conn: sqlite3.Connection, item_id: int) -> int | None:
+    """Get the chat conversation ID for a saved item, if any."""
+    row = conn.execute(
+        "SELECT chat_conversation_id FROM saved_items WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def get_stats(conn: sqlite3.Connection) -> dict:
     """Overview stats for the history database."""
     total_convs = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]

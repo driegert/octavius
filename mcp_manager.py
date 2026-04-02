@@ -123,6 +123,9 @@ class MCPManager:
                     "session terminated" in err_str
                     or "404" in err_str
                     or "connection" in err_str
+                    or "closedresource" in err_str
+                    or "broken pipe" in err_str
+                    or "eof" in err_str
                 )
                 if is_session_lost and attempt < MAX_RECONNECT_ATTEMPTS:
                     log.warning(
