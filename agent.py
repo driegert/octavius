@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 
-from config import LLM_CHAIN, MAX_TOOL_ROUNDS
+from config import LLM_CHAIN, MAX_TOOL_ROUNDS, TOOL_LABELS
 from conversation import Conversation
 from mcp_manager import MCPManager
 import tools as local_tools
@@ -69,16 +69,23 @@ async def stream_agent_turn(
 
     for round_num in range(MAX_TOOL_ROUNDS):
         messages = conversation.get_messages()
+
+        # On later rounds, nudge the LLM to wrap up instead of spiraling
+        if round_num >= MAX_TOOL_ROUNDS - 2:
+            messages = messages + [{
+                "role": "system",
+                "content": "You have used many tool calls. Summarize what you've found so far and respond to the user now. Do not make more tool calls.",
+            }]
+
         payload = {
             "model": LLM_CHAIN[0]["model"],
             "messages": messages,
             "stream": True,
         }
-        # On the last round, don't offer tools — force the LLM to respond with what it has
-        if round_num < MAX_TOOL_ROUNDS - 1:
-            all_tools = mcp.tools + local_tools.TOOLS
-            if all_tools:
-                payload["tools"] = all_tools
+        # Always offer tools (removing them causes Qwen to output raw tool-call text)
+        all_tools = mcp.tools + local_tools.TOOLS
+        if all_tools:
+            payload["tools"] = all_tools
 
         # --- Streaming request ---
         try:
@@ -90,6 +97,7 @@ async def stream_agent_turn(
                     tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
                     in_think = False
                     sentence_buffer = ""
+                    buffered_sentences: list[str] = []
 
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
@@ -142,14 +150,13 @@ async def stream_agent_turn(
 
                         sentence_buffer += token
 
-                        # Check for sentence boundaries and yield complete sentences
+                        # Check for sentence boundaries
                         parts = SENTENCE_END.split(sentence_buffer)
                         if len(parts) > 1:
-                            # Yield all complete sentences, keep the last partial
                             for sentence in parts[:-1]:
                                 sentence = sentence.strip()
                                 if sentence:
-                                    yield sentence + " "
+                                    buffered_sentences.append(sentence + " ")
                             sentence_buffer = parts[-1]
 
         except Exception as e:
@@ -159,6 +166,11 @@ async def stream_agent_turn(
 
         # --- Handle tool calls if any ---
         if tool_calls_acc:
+            # Discard any text generated alongside tool calls — the LLM will
+            # produce a proper response after seeing tool results.
+            buffered_sentences.clear()
+            sentence_buffer = ""
+
             for idx in sorted(tool_calls_acc.keys()):
                 tc = tool_calls_acc[idx]
                 call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
@@ -166,7 +178,8 @@ async def stream_agent_turn(
                 args_str = tc["arguments"]
 
                 if status_callback:
-                    await status_callback(f"Using tool: {name}...")
+                    label = TOOL_LABELS.get(name, name)
+                    await status_callback(f"{label}...")
 
                 try:
                     args = json.loads(args_str) if args_str else {}
@@ -210,6 +223,9 @@ async def stream_agent_turn(
             continue  # Loop back for LLM to process tool results
 
         # --- Final text response (no tool calls) ---
+        # Yield all buffered sentences
+        for sent in buffered_sentences:
+            yield sent
         # Flush remaining sentence buffer
         remaining = sentence_buffer.strip()
         if remaining:

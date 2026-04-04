@@ -99,6 +99,7 @@
     gap: 0.6rem;
   }
   .doc-card:hover { border-color: #60a0ff; }
+  .doc-card { user-select: none; -webkit-user-select: none; }
 
   .doc-card .dc-title { flex: 1; font-size: 0.85rem; color: #d0d0e0; }
   .doc-card .dc-status {
@@ -526,9 +527,9 @@
           <span class="dc-status ${doc.status}">${doc.status}</span>
           <button class="dc-delete" title="Delete">&times;</button>
         `;
-        card.querySelector('.dc-title').addEventListener('click', () => {
+        card.addEventListener('click', () => {
           if (doc.status === 'ready') openDocument(doc.id);
-          else if (doc.status === 'processing') loadDocList(); // refresh
+          else if (doc.status === 'processing') loadDocList();
         });
         card.querySelector('.dc-delete').addEventListener('click', async (e) => {
           e.stopPropagation();

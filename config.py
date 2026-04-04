@@ -41,8 +41,76 @@ TTS_FALLBACK_VOICE = "bm_lewis"
 AGENT_PORT = 8030
 DOWNLOADS_DIR = "/home/dave/octavius-downloads"
 READER_DIR = "/home/dave/octavius-reader"
-MAX_TOOL_ROUNDS = 10
+MAX_TOOL_ROUNDS = 7
 MAX_CONVERSATION_MESSAGES = 40
+
+# Friendly labels for tool names shown in the UI
+TOOL_LABELS = {
+    # SearXNG
+    "search": "Web Search",
+    # Email
+    "search_emails": "Email Search",
+    "semantic_search": "Email Search",
+    "get_email": "Reading Email",
+    "get_emails": "Reading Emails",
+    "get_conversation": "Reading Email Thread",
+    "list_conversations": "Listing Email Threads",
+    "email_stats": "Email Stats",
+    "find_similar_responses": "Finding Similar Emails",
+    "extract_from_emails": "Extracting from Emails",
+    # OpenAlex
+    "search_works": "Academic Search",
+    "get_work": "Reading Paper",
+    "get_related_works": "Finding Related Papers",
+    "search_by_topic": "Topic Search",
+    "autocomplete_search": "Academic Search",
+    "get_work_citations": "Finding Citations",
+    "get_work_references": "Finding References",
+    "get_citation_network": "Citation Network",
+    "get_top_cited_works": "Top Cited Papers",
+    "search_authors": "Author Search",
+    "get_author_works": "Author's Papers",
+    "get_author_collaborators": "Author Collaborators",
+    "search_institutions": "Institution Search",
+    "analyze_topic_trends": "Topic Trends",
+    "compare_research_areas": "Comparing Research Areas",
+    "get_trending_topics": "Trending Topics",
+    "analyze_geographic_distribution": "Geographic Analysis",
+    "get_entity": "OpenAlex Lookup",
+    "search_sources": "Journal Search",
+    "list_journal_presets": "Journal Presets",
+    "search_in_journal_list": "Journal Search",
+    "search_works_in_venue": "Venue Search",
+    "get_top_venues_for_field": "Top Venues",
+    "check_venue_quality": "Venue Quality Check",
+    "get_author_profile": "Author Profile",
+    "search_authors_by_expertise": "Expert Search",
+    "find_review_articles": "Finding Reviews",
+    "find_seminal_papers": "Finding Seminal Papers",
+    "batch_resolve_references": "Resolving References",
+    "find_open_access_version": "Finding Open Access",
+    "health_check": "Health Check",
+    # Vikunja
+    "search_tasks": "Searching Tasks",
+    "get_task": "Reading Task",
+    "create_task": "Creating Task",
+    "update_task": "Updating Task",
+    "list_projects": "Listing Projects",
+    "list_labels": "Listing Labels",
+    "add_label_to_task": "Adding Label",
+    "remove_label_from_task": "Removing Label",
+    "get_task_comments": "Reading Comments",
+    "add_task_comment": "Adding Comment",
+    # Document processing
+    "convert_pdf_to_md": "Converting PDF",
+    "get_conversion_result": "Checking PDF Conversion",
+    # Local tools
+    "download_file": "Downloading File",
+    "save_to_inbox": "Saving to Inbox",
+    "read_document": "Preparing Document",
+    "read_item_content": "Reading Item Content",
+    "process_pdf": "Processing PDF",
+}
 
 MCP_SERVERS = {
     "evangeline-email": {

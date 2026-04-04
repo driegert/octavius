@@ -455,6 +455,7 @@
           ${item.item_type === 'article' ? `
             <button class="read-btn" onclick="event.stopPropagation(); window.location.href='/reader?inbox_id=${item.id}'">Read aloud</button>
           ` : ''}
+          <button class="dismiss-btn" onclick="event.stopPropagation(); deleteItem(${item.id})">Delete</button>
         </div>
         <div class="card-chat">
           <button class="chat-toggle-btn" onclick="event.stopPropagation(); toggleChat(${item.id}, this)">Chat with Octavius</button>
@@ -523,6 +524,16 @@
       card.classList.add('expanded');
     }
   }
+
+  window.deleteItem = async function(itemId) {
+    if (!confirm('Permanently delete this item?')) return;
+    try {
+      const resp = await fetch(`/api/inbox/${itemId}`, { method: 'DELETE' });
+      if (resp.ok) loadItems();
+    } catch (e) {
+      console.error('Delete failed:', e);
+    }
+  };
 
   window.updateStatus = async function(itemId, status, btn) {
     try {

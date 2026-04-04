@@ -316,7 +316,27 @@ async def _read_document(args: dict, session: ConversationSession | None) -> str
             f"You can check the reader at /reader when it's ready."
         )
     else:
-        markdown = p.read_text()
+        raw = p.read_text()
+        # Detect HTML and extract article content
+        if raw.strip().startswith(('<!DOCTYPE', '<html', '<HTML')):
+            import trafilatura
+            extracted = trafilatura.extract(raw, include_links=False, include_comments=False,
+                                           include_tables=False, output_format="txt")
+            if not extracted:
+                extracted = trafilatura.extract(raw, include_links=False, favor_recall=True,
+                                               output_format="txt")
+            if extracted:
+                markdown = extracted
+                # Try to get a better title
+                meta = trafilatura.extract_metadata(raw)
+                if meta and meta.title:
+                    title = meta.title
+                    if meta.sitename:
+                        title = f"{title} ({meta.sitename})"
+            else:
+                return f"Error: could not extract article content from {path}"
+        else:
+            markdown = raw
         doc_id = reader.create_document(conn, title, "markdown", source_path=path)
         asyncio.create_task(reader.ingest_document(conn, doc_id, markdown, title, original_md_path=path))
         return (

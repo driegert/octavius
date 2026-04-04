@@ -107,6 +107,18 @@ async def inbox_update(item_id: int, request: Request):
     return JSONResponse({"ok": True})
 
 
+@app.delete("/api/inbox/{item_id}")
+async def inbox_delete(item_id: int):
+    conn = history.conn
+    # Delete embeddings first (FK-like cleanup)
+    conn.execute("DELETE FROM saved_item_embeddings WHERE saved_item_id = ?", (item_id,))
+    cursor = conn.execute("DELETE FROM saved_items WHERE id = ?", (item_id,))
+    conn.commit()
+    if cursor.rowcount == 0:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
 # -- Conversation History API --------------------------------------------------
 
 @app.get("/api/conversations")
@@ -194,7 +206,24 @@ async def reader_ingest(request: Request):
             asyncio.create_task(_ingest_pdf(conn, doc_id, path, title))
             return JSONResponse({"id": doc_id, "status": "processing"})
         else:
-            markdown = p.read_text()
+            raw = p.read_text()
+            if raw.strip().startswith(('<!DOCTYPE', '<html', '<HTML')):
+                import trafilatura
+                extracted = trafilatura.extract(raw, include_links=False, include_comments=False,
+                                               include_tables=False, output_format="txt")
+                if not extracted:
+                    extracted = trafilatura.extract(raw, include_links=False, favor_recall=True,
+                                                   output_format="txt")
+                if not extracted:
+                    return JSONResponse({"error": "Could not extract article content"}, status_code=400)
+                markdown = extracted
+                meta = trafilatura.extract_metadata(raw)
+                if meta and meta.title and title in ("Untitled", p.name):
+                    title = meta.title
+                    if meta.sitename:
+                        title = f"{title} ({meta.sitename})"
+            else:
+                markdown = raw
             doc_id = reader.create_document(conn, title, "markdown", source_path=path)
 
     else:
@@ -268,12 +297,55 @@ async def _ingest_url(conn, doc_id: int, url: str, title: str):
         dest.write_bytes(resp.content)
         log.info("Reader: downloaded %s (%d KB)", dest, len(resp.content) // 1024)
 
+        # Extract site name from URL
+        from urllib.parse import urlparse as _urlparse
+        site_name = _urlparse(url).netloc.replace('www.', '')
+
         if is_pdf:
             await _ingest_pdf(conn, doc_id, str(dest), title)
         else:
-            # Treat as markdown/text
-            markdown = resp.text
-            await reader.ingest_document(conn, doc_id, markdown, title, original_md_path=str(dest))
+            # Extract article content from HTML
+            import trafilatura
+            import re as _re
+            html = resp.text
+
+            # Extract title before processing content
+            meta = trafilatura.extract_metadata(html)
+            if meta and meta.title:
+                page_title = meta.title
+            else:
+                # Fallback to <title> tag
+                title_match = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.IGNORECASE)
+                page_title = title_match.group(1).strip() if title_match else None
+
+            if page_title and (title == "Untitled" or title == url.split('/')[-1] or title == url):
+                # Split title and site suffix — keep both
+                parts = _re.split(r'\s*[|\-–—]\s*', page_title)
+                if len(parts) >= 2:
+                    # Last part is likely the site name
+                    article_title = ' — '.join(parts[:-1]).strip()
+                    site_suffix = parts[-1].strip()
+                    title = f"{article_title} ({site_suffix})"
+                else:
+                    title = f"{page_title} ({site_name})"
+                reader.update_document(conn, doc_id, title=title)
+                log.info("Reader: extracted title: %s", title)
+
+            extracted = trafilatura.extract(html, include_links=False, include_comments=False,
+                                           include_tables=False, output_format="txt")
+            if not extracted:
+                extracted = trafilatura.extract(html, include_links=False, favor_recall=True,
+                                               output_format="txt")
+            if not extracted:
+                reader.update_document(conn, doc_id, status="failed",
+                                       error="Could not extract article content from page")
+                return
+
+            markdown = extracted
+            dest_txt = dl_dir / f"reader_{doc_id}.txt"
+            dest_txt.write_text(markdown)
+            log.info("Reader: extracted %d chars of article text from %s", len(markdown), url)
+            await reader.ingest_document(conn, doc_id, markdown, title, original_md_path=str(dest_txt))
 
     except Exception as e:
         log.exception("Reader: URL ingest failed for document %d", doc_id)
@@ -393,6 +465,12 @@ async def websocket_endpoint(ws: WebSocket):
     item_history_sessions: dict[int, object] = {}
     history_session = history.start_conversation(service="octavius", source="voice", model=LLM_CHAIN[0]["model"])
 
+    # Tell client our conversation ID so it can restore on reconnect
+    await ws.send_text(json.dumps({
+        "type": "session_id",
+        "conversation_id": history_session.conv_id,
+    }))
+
     try:
         while True:
             message = await ws.receive()
@@ -404,12 +482,29 @@ async def websocket_endpoint(ws: WebSocket):
                 except json.JSONDecodeError:
                     continue
 
+                if data.get("type") == "restore_session":
+                    old_conv_id = data.get("conversation_id")
+                    if old_conv_id:
+                        msgs = get_conversation_messages(history.conn, old_conv_id)
+                        if msgs:
+                            conversation.load_from_history(msgs)
+                            log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
+                            await ws.send_text(json.dumps({
+                                "type": "session_id",
+                                "conversation_id": history_session.conv_id,
+                            }))
+                    continue
+
                 if data.get("type") == "reset":
                     history_session.end()
                     conversation.reset()
                     history_session = history.start_conversation(
                         source="voice", model=LLM_CHAIN[0]["model"],
                     )
+                    await ws.send_text(json.dumps({
+                        "type": "session_id",
+                        "conversation_id": history_session.conv_id,
+                    }))
                     await send_json(ws, "status", "Conversation reset.")
                     log.info("Conversation reset by client")
                     continue

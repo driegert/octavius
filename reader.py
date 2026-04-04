@@ -325,6 +325,23 @@ async def ingest_document(
     try:
         log.info("Reader: ingesting document %d: %s", doc_id, title)
 
+        # Try to extract a better title from content only if current title is clearly generic
+        is_generic = title in ("Untitled", "") or title.startswith("reader_") or title.endswith((".pdf", ".md", ".txt"))
+        if is_generic:
+            heading_match = HEADING_RE.search(markdown)
+            if heading_match:
+                extracted = heading_match.group(2).strip()
+                if len(extracted) > 5 and len(extracted) < 200:
+                    title = extracted
+                    update_document(conn, doc_id, title=title)
+                    log.info("Reader: extracted title from content: %s", title)
+            elif markdown.strip():
+                # Use first non-empty line as title
+                first_line = markdown.strip().split("\n")[0].strip()[:120]
+                if first_line:
+                    title = first_line
+                    update_document(conn, doc_id, title=title)
+
         # 1. Split into chunks
         raw_chunks = _split_into_chunks(markdown)
         if not raw_chunks:
