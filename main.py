@@ -1,23 +1,20 @@
-import asyncio
-import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import AGENT_PORT, LLM_CHAIN, MCP_SERVERS, TTS_MODEL, TTS_VOICES, TTS_VOICE
-from conversation import Conversation
+from config import AGENT_PORT, MCP_SERVERS, TTS_VOICES, TTS_VOICE
 from history import (
     HistoryRecorder, init_db,
     list_saved_items, search_saved_items, get_saved_item, update_saved_item_status,
-    get_conversation_messages, set_item_chat_conversation, get_item_chat_conversation_id,
+    get_conversation_messages,
 )
 from mcp_manager import MCPManager
-from stt import transcribe
-from tts import synthesize
-from agent import run_agent_turn, stream_agent_turn
+from reader_ingest_service import ReaderIngestError, start_reader_ingest
+from runtime import set_mcp_manager
+from websocket_session import handle_websocket_session
 import reader
 
 logging.basicConfig(
@@ -26,16 +23,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-mcp_manager: MCPManager
-history: HistoryRecorder
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mcp_manager, history
-    mcp_manager = MCPManager(MCP_SERVERS)
-    history_conn = init_db()
+    mcp_manager = app.state.mcp_manager_factory(MCP_SERVERS)
+    history_conn = app.state.db_init()
     history = HistoryRecorder(history_conn)
+    stale_count = reader.fail_stale_processing_documents(history_conn)
+    app.state.mcp_manager = mcp_manager
+    app.state.history = history
+    app.state.history_conn = history_conn
+    set_mcp_manager(mcp_manager)
+    if stale_count:
+        log.warning("Marked %d stale reader document(s) as failed on startup", stale_count)
     log.info("Connecting MCP servers...")
     await mcp_manager.connect_all()
     log.info("MCP ready — %d tools available", len(mcp_manager.tools))
@@ -45,8 +44,15 @@ async def lifespan(app: FastAPI):
     history_conn.close()
 
 
-app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db) -> FastAPI:
+    app = FastAPI(lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+    app.state.mcp_manager_factory = mcp_manager_factory
+    app.state.db_init = db_init
+    return app
+
+
+app = create_app()
 
 
 @app.get("/")
@@ -55,8 +61,17 @@ async def index():
 
 
 @app.get("/health")
-async def health():
-    return JSONResponse({"status": "ok"})
+async def health(request: Request):
+    mcp_manager = getattr(request.app.state, "mcp_manager", None)
+    history = getattr(request.app.state, "history", None)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "database_ready": history is not None,
+            "mcp_connected": mcp_manager is not None,
+            "mcp_tool_count": len(mcp_manager.tools) if mcp_manager else 0,
+        }
+    )
 
 
 @app.get("/api/voices")
@@ -73,13 +88,14 @@ async def inbox_page():
 
 @app.get("/api/inbox")
 async def inbox_list(
+    request: Request,
     status: str | None = None,
     type: str | None = None,
     q: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ):
-    conn = history.conn
+    conn = request.app.state.history.conn
     if q:
         items = search_saved_items(conn, q, limit=limit)
     else:
@@ -88,8 +104,8 @@ async def inbox_list(
 
 
 @app.get("/api/inbox/{item_id}")
-async def inbox_get(item_id: int):
-    item = get_saved_item(history.conn, item_id)
+async def inbox_get(item_id: int, request: Request):
+    item = get_saved_item(request.app.state.history.conn, item_id)
     if not item:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"item": item})
@@ -97,6 +113,7 @@ async def inbox_get(item_id: int):
 
 @app.patch("/api/inbox/{item_id}")
 async def inbox_update(item_id: int, request: Request):
+    history = request.app.state.history
     body = await request.json()
     new_status = body.get("status")
     if new_status not in ("pending", "done", "dismissed"):
@@ -108,8 +125,8 @@ async def inbox_update(item_id: int, request: Request):
 
 
 @app.delete("/api/inbox/{item_id}")
-async def inbox_delete(item_id: int):
-    conn = history.conn
+async def inbox_delete(item_id: int, request: Request):
+    conn = request.app.state.history.conn
     # Delete embeddings first (FK-like cleanup)
     conn.execute("DELETE FROM saved_item_embeddings WHERE saved_item_id = ?", (item_id,))
     cursor = conn.execute("DELETE FROM saved_items WHERE id = ?", (item_id,))
@@ -122,9 +139,9 @@ async def inbox_delete(item_id: int):
 # -- Conversation History API --------------------------------------------------
 
 @app.get("/api/conversations")
-async def conversations_list(limit: int = 20, offset: int = 0):
+async def conversations_list(request: Request, limit: int = 20, offset: int = 0):
     """List recent Octavius conversations with summaries."""
-    conn = history.conn
+    conn = request.app.state.history.conn
     rows = conn.execute(
         """SELECT id, session_id, started_at, ended_at, summary, message_count
            FROM conversations
@@ -152,9 +169,9 @@ async def conversations_list(limit: int = 20, offset: int = 0):
 
 
 @app.get("/api/conversations/{conv_id}/messages")
-async def conversation_messages(conv_id: int):
+async def conversation_messages(conv_id: int, request: Request):
     """Get all messages for a conversation."""
-    msgs = get_conversation_messages(history.conn, conv_id)
+    msgs = get_conversation_messages(request.app.state.history.conn, conv_id)
     return JSONResponse({"messages": msgs})
 
 
@@ -169,198 +186,24 @@ async def reader_page():
 async def reader_ingest(request: Request):
     """Ingest a document for reading. Kicks off background processing."""
     body = await request.json()
-    source = body.get("source", "file")
-    title = body.get("title", "Untitled")
-    path = body.get("path")
-    saved_item_id = body.get("saved_item_id")
-    text = body.get("text")
-
-    conn = history.conn
-
-    # Determine source type and get markdown content
-    if source == "inbox" and saved_item_id:
-        item = get_saved_item(conn, saved_item_id)
-        if not item:
-            return JSONResponse({"error": "Inbox item not found"}, status_code=404)
-        markdown = item["content"]
-        title = title or item["title"]
-        doc_id = reader.create_document(conn, title, "inbox_item", saved_item_id=saved_item_id)
-
-    elif source == "text" and text:
-        markdown = text
-        doc_id = reader.create_document(conn, title, "markdown")
-
-    elif source == "url" and (body.get("url") or path):
-        url = body.get("url") or path
-        doc_id = reader.create_document(conn, title, "url", source_path=url)
-        asyncio.create_task(_ingest_url(conn, doc_id, url, title))
-        return JSONResponse({"id": doc_id, "status": "processing"})
-
-    elif source == "file" and path:
-        from pathlib import Path as P
-        p = P(path)
-        if not p.exists():
-            return JSONResponse({"error": f"File not found: {path}"}, status_code=404)
-        if p.suffix.lower() == ".pdf":
-            doc_id = reader.create_document(conn, title, "pdf", source_path=path)
-            asyncio.create_task(_ingest_pdf(conn, doc_id, path, title))
-            return JSONResponse({"id": doc_id, "status": "processing"})
-        else:
-            raw = p.read_text()
-            if raw.strip().startswith(('<!DOCTYPE', '<html', '<HTML')):
-                import trafilatura
-                extracted = trafilatura.extract(raw, include_links=False, include_comments=False,
-                                               include_tables=False, output_format="txt")
-                if not extracted:
-                    extracted = trafilatura.extract(raw, include_links=False, favor_recall=True,
-                                                   output_format="txt")
-                if not extracted:
-                    return JSONResponse({"error": "Could not extract article content"}, status_code=400)
-                markdown = extracted
-                meta = trafilatura.extract_metadata(raw)
-                if meta and meta.title and title in ("Untitled", p.name):
-                    title = meta.title
-                    if meta.sitename:
-                        title = f"{title} ({meta.sitename})"
-            else:
-                markdown = raw
-            doc_id = reader.create_document(conn, title, "markdown", source_path=path)
-
-    else:
-        return JSONResponse({"error": "Provide source + path/url, text, or saved_item_id"}, status_code=400)
-
-    # Start background ingest for non-PDF sources
-    asyncio.create_task(reader.ingest_document(conn, doc_id, markdown, title))
-    return JSONResponse({"id": doc_id, "status": "processing"})
-
-
-async def _ingest_pdf(conn, doc_id: int, pdf_path: str, title: str):
-    """Convert PDF to markdown via MCP, then run the reader ingest pipeline."""
+    conn = request.app.state.history.conn
+    mcp_manager = request.app.state.mcp_manager
     try:
-        # Start conversion
-        result = await mcp_manager.call_tool("convert_pdf_to_md", {"file_path": pdf_path})
-        import re
-        job_match = re.search(r'Job ID:\s*(\S+)', result)
-        if not job_match:
-            reader.update_document(conn, doc_id, status="failed", error=f"PDF conversion failed: {result}")
-            return
-
-        job_id = job_match.group(1)
-        log.info("Reader: PDF conversion job %s started for document %d", job_id, doc_id)
-
-        # Poll for completion
-        for _ in range(120):  # up to 10 minutes
-            await asyncio.sleep(5)
-            poll_result = await mcp_manager.call_tool("get_conversion_result", {"job_id": job_id})
-            if "still processing" in poll_result.lower() or "not yet" in poll_result.lower():
-                continue
-            # Check for markdown file path in result
-            md_match = re.search(r'(/\S+\.md)', poll_result)
-            if md_match:
-                md_path = md_match.group(1)
-                from pathlib import Path as P
-                markdown = P(md_path).read_text()
-                await reader.ingest_document(conn, doc_id, markdown, title, original_md_path=md_path)
-                return
-            if "error" in poll_result.lower() or "failed" in poll_result.lower():
-                reader.update_document(conn, doc_id, status="failed", error=poll_result[:500])
-                return
-
-        reader.update_document(conn, doc_id, status="failed", error="PDF conversion timed out")
-
-    except Exception as e:
-        log.exception("Reader: PDF ingest failed for document %d", doc_id)
-        reader.update_document(conn, doc_id, status="failed", error=str(e))
-
-
-async def _ingest_url(conn, doc_id: int, url: str, title: str):
-    """Download a URL, then route to PDF or markdown ingest."""
-    try:
-        import httpx as _httpx
-        from pathlib import Path as P
-
-        log.info("Reader: downloading URL for document %d: %s", doc_id, url)
-        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-
-        # Determine file type from content-type or URL
-        content_type = resp.headers.get("content-type", "")
-        is_pdf = "pdf" in content_type or url.lower().endswith(".pdf")
-
-        # Save to downloads dir
-        from config import DOWNLOADS_DIR
-        dl_dir = P(DOWNLOADS_DIR)
-        dl_dir.mkdir(parents=True, exist_ok=True)
-        ext = ".pdf" if is_pdf else ".md"
-        dest = dl_dir / f"reader_{doc_id}{ext}"
-        dest.write_bytes(resp.content)
-        log.info("Reader: downloaded %s (%d KB)", dest, len(resp.content) // 1024)
-
-        # Extract site name from URL
-        from urllib.parse import urlparse as _urlparse
-        site_name = _urlparse(url).netloc.replace('www.', '')
-
-        if is_pdf:
-            await _ingest_pdf(conn, doc_id, str(dest), title)
-        else:
-            # Extract article content from HTML
-            import trafilatura
-            import re as _re
-            html = resp.text
-
-            # Extract title before processing content
-            meta = trafilatura.extract_metadata(html)
-            if meta and meta.title:
-                page_title = meta.title
-            else:
-                # Fallback to <title> tag
-                title_match = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.IGNORECASE)
-                page_title = title_match.group(1).strip() if title_match else None
-
-            if page_title and (title == "Untitled" or title == url.split('/')[-1] or title == url):
-                # Split title and site suffix — keep both
-                parts = _re.split(r'\s*[|\-–—]\s*', page_title)
-                if len(parts) >= 2:
-                    # Last part is likely the site name
-                    article_title = ' — '.join(parts[:-1]).strip()
-                    site_suffix = parts[-1].strip()
-                    title = f"{article_title} ({site_suffix})"
-                else:
-                    title = f"{page_title} ({site_name})"
-                reader.update_document(conn, doc_id, title=title)
-                log.info("Reader: extracted title: %s", title)
-
-            extracted = trafilatura.extract(html, include_links=False, include_comments=False,
-                                           include_tables=False, output_format="txt")
-            if not extracted:
-                extracted = trafilatura.extract(html, include_links=False, favor_recall=True,
-                                               output_format="txt")
-            if not extracted:
-                reader.update_document(conn, doc_id, status="failed",
-                                       error="Could not extract article content from page")
-                return
-
-            markdown = extracted
-            dest_txt = dl_dir / f"reader_{doc_id}.txt"
-            dest_txt.write_text(markdown)
-            log.info("Reader: extracted %d chars of article text from %s", len(markdown), url)
-            await reader.ingest_document(conn, doc_id, markdown, title, original_md_path=str(dest_txt))
-
-    except Exception as e:
-        log.exception("Reader: URL ingest failed for document %d", doc_id)
-        reader.update_document(conn, doc_id, status="failed", error=str(e))
+        result = await start_reader_ingest(conn, mcp_manager, body)
+        return JSONResponse(result)
+    except ReaderIngestError as exc:
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code)
 
 
 @app.get("/api/reader/documents")
-async def reader_list():
-    docs = reader.list_documents(history.conn)
+async def reader_list(request: Request):
+    docs = reader.list_documents(request.app.state.history.conn)
     return JSONResponse({"documents": docs})
 
 
 @app.get("/api/reader/documents/{doc_id}")
-async def reader_get(doc_id: int):
-    doc = reader.get_document(history.conn, doc_id)
+async def reader_get(doc_id: int, request: Request):
+    doc = reader.get_document(request.app.state.history.conn, doc_id)
     if not doc:
         return JSONResponse({"error": "not found"}, status_code=404)
     # Include chunk headings if ready
@@ -377,415 +220,16 @@ async def reader_get(doc_id: int):
 
 
 @app.delete("/api/reader/documents/{doc_id}")
-async def reader_delete(doc_id: int):
-    ok = reader.delete_document(history.conn, doc_id)
+async def reader_delete(doc_id: int, request: Request):
+    ok = reader.delete_document(request.app.state.history.conn, doc_id)
     if not ok:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"ok": True})
 
 
-async def send_json(ws: WebSocket, msg_type: str, text: str):
-    await ws.send_text(json.dumps({"type": msg_type, "text": text}))
-
-
-async def _run_turn(ws, conversation, mcp_manager, user_text, voice, tts_enabled,
-                    history_session=None, source="voice"):
-    """Run agent loop with streaming TTS: synthesize each sentence as it arrives."""
-    import time
-    turn_start = time.monotonic()
-
-    await send_json(ws, "status", "Thinking...")
-
-    # Record user message
-    if history_session:
-        user_kwargs = {}
-        if source == "voice":
-            user_kwargs["stt_model"] = "whisper"
-        history_session.add_message(role="user", content=user_text, **user_kwargs)
-
-    async def status_cb(text: str):
-        await send_json(ws, "status", text)
-
-    full_reply_parts = []
-    first_sentence = True
-
-    try:
-        async for sentence in stream_agent_turn(
-            conversation, mcp_manager, user_text,
-            status_callback=status_cb, history_session=history_session,
-        ):
-            full_reply_parts.append(sentence)
-
-            if tts_enabled:
-                if first_sentence:
-                    await send_json(ws, "status", "Speaking...")
-                    first_sentence = False
-                try:
-                    wav_bytes = await synthesize(sentence, voice=voice)
-                    await ws.send_bytes(wav_bytes)
-                except Exception as e:
-                    log.exception("TTS failed for chunk")
-                    # Continue with remaining sentences
-
-    except Exception as e:
-        log.exception("Agent failed")
-        await send_json(ws, "status", f"Agent error: {e}")
-        if history_session:
-            history_session.add_message(
-                role="assistant", content=f"Error: {e}", error=str(e),
-            )
-        return
-
-    full_reply = "".join(full_reply_parts).strip()
-    if full_reply:
-        await send_json(ws, "response", full_reply)
-
-    # Record assistant message
-    if history_session and full_reply:
-        latency_ms = int((time.monotonic() - turn_start) * 1000)
-        history_session.add_message(
-            role="assistant", content=full_reply,
-            model=LLM_CHAIN[0]["model"], latency_ms=latency_ms,
-            tts_model=TTS_MODEL if tts_enabled else None,
-        )
-
-    # Signal end of audio stream
-    await send_json(ws, "status", "audio_done")
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    log.info("WebSocket connected")
-    conversation = Conversation()
-    voice = TTS_VOICE
-    tts_enabled = True
-    reader_task: asyncio.Task | None = None
-    item_conversations: dict[int, Conversation] = {}
-    item_history_sessions: dict[int, object] = {}
-    history_session = history.start_conversation(service="octavius", source="voice", model=LLM_CHAIN[0]["model"])
-
-    # Tell client our conversation ID so it can restore on reconnect
-    await ws.send_text(json.dumps({
-        "type": "session_id",
-        "conversation_id": history_session.conv_id,
-    }))
-
-    try:
-        while True:
-            message = await ws.receive()
-
-            # Text message — control commands or typed input
-            if "text" in message:
-                try:
-                    data = json.loads(message["text"])
-                except json.JSONDecodeError:
-                    continue
-
-                if data.get("type") == "restore_session":
-                    old_conv_id = data.get("conversation_id")
-                    if old_conv_id:
-                        msgs = get_conversation_messages(history.conn, old_conv_id)
-                        if msgs:
-                            conversation.load_from_history(msgs)
-                            log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
-                            await ws.send_text(json.dumps({
-                                "type": "session_id",
-                                "conversation_id": history_session.conv_id,
-                            }))
-                    continue
-
-                if data.get("type") == "reset":
-                    history_session.end()
-                    conversation.reset()
-                    history_session = history.start_conversation(
-                        source="voice", model=LLM_CHAIN[0]["model"],
-                    )
-                    await ws.send_text(json.dumps({
-                        "type": "session_id",
-                        "conversation_id": history_session.conv_id,
-                    }))
-                    await send_json(ws, "status", "Conversation reset.")
-                    log.info("Conversation reset by client")
-                    continue
-
-                if data.get("type") == "load_conversation":
-                    conv_id = data.get("conversation_id")
-                    if conv_id:
-                        msgs = get_conversation_messages(history.conn, conv_id)
-                        if msgs:
-                            history_session.end()
-                            conversation.load_from_history(msgs)
-                            history_session = history.start_conversation(
-                                source="voice", model=LLM_CHAIN[0]["model"],
-                            )
-                            # Send conversation history to client for display
-                            history_pairs = []
-                            for m in msgs:
-                                if m["role"] in ("user", "assistant") and m.get("content"):
-                                    history_pairs.append({"role": m["role"], "content": m["content"]})
-                            await ws.send_text(json.dumps({
-                                "type": "conversation_loaded",
-                                "conversation_id": conv_id,
-                                "messages": history_pairs,
-                            }))
-                            log.info("Loaded conversation %d (%d messages)", conv_id, len(msgs))
-                        else:
-                            await send_json(ws, "status", "Conversation not found.")
-                    continue
-
-                if data.get("type") == "settings":
-                    if "voice" in data:
-                        voice = data["voice"]
-                        log.info("Voice set to %s", voice)
-                    if "tts" in data:
-                        tts_enabled = data["tts"]
-                        log.info("TTS %s", "enabled" if tts_enabled else "disabled")
-                    continue
-
-                if data.get("type") == "text_input":
-                    user_text = data.get("text", "").strip()
-                    if not user_text:
-                        continue
-                    await send_json(ws, "transcript", user_text)
-                    await _run_turn(
-                        ws, conversation, mcp_manager, user_text, voice,
-                        tts_enabled, history_session=history_session, source="text",
-                    )
-                    continue
-
-                # -- Reader controls --
-                if data.get("type") == "reader_play":
-                    if reader_task and not reader_task.done():
-                        reader_task.cancel()
-                        try:
-                            await reader_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    reader_task = asyncio.create_task(
-                        reader.stream_reader_audio(
-                            ws, data["doc_id"], history.conn,
-                            chunk_index=data.get("chunk_index", 0),
-                            sentence_index=data.get("sentence_index", 0),
-                            voice=data.get("voice", voice),
-                        )
-                    )
-                    continue
-
-                if data.get("type") == "reader_pause":
-                    if reader_task and not reader_task.done():
-                        reader_task.cancel()
-                        try:
-                            await reader_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    continue
-
-                if data.get("type") == "reader_stop":
-                    if reader_task and not reader_task.done():
-                        reader_task.cancel()
-                        try:
-                            await reader_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    continue
-
-                # -- Item chat controls --
-                if data.get("type") == "item_chat_load":
-                    item_id = data.get("item_id")
-                    item = get_saved_item(history.conn, item_id)
-                    if not item:
-                        await ws.send_text(json.dumps({
-                            "type": "item_chat_status", "item_id": item_id,
-                            "text": "Item not found.",
-                        }))
-                        continue
-
-                    chat_conv_id = get_item_chat_conversation_id(history.conn, item_id)
-                    if chat_conv_id:
-                        # Load existing conversation
-                        msgs = get_conversation_messages(history.conn, chat_conv_id)
-                        conv = Conversation()
-                        # Inject item context into system prompt
-                        preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
-                        conv._messages[0]["content"] += (
-                            f"\n\nYou are discussing a saved inbox item with Dave.\n"
-                            f"Title: {item['title']}\nType: {item['item_type']}\n"
-                            f"Preview: {preview}\n\n"
-                            f"Use the read_item_content tool to fetch the full content "
-                            f"or specific sections when you need more detail. The item ID is {item_id}."
-                        )
-                        # Restore conversation history
-                        for m in msgs:
-                            if m["role"] in ("user", "assistant") and m.get("content"):
-                                conv._messages.append({"role": m["role"], "content": m["content"]})
-                        conv.trim()
-                        item_conversations[item_id] = conv
-
-                        # Restore history session
-                        item_history_sessions[item_id] = history.start_conversation(
-                            service="octavius", source="inbox_chat",
-                            model=LLM_CHAIN[0]["model"],
-                        )
-
-                        # Send existing messages to client
-                        history_pairs = [
-                            {"role": m["role"], "content": m["content"]}
-                            for m in msgs
-                            if m["role"] in ("user", "assistant") and m.get("content")
-                        ]
-                        await ws.send_text(json.dumps({
-                            "type": "item_chat_loaded", "item_id": item_id,
-                            "messages": history_pairs,
-                        }))
-                    else:
-                        # Create new conversation with item context
-                        conv = Conversation()
-                        preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
-                        conv._messages[0]["content"] += (
-                            f"\n\nYou are discussing a saved inbox item with Dave.\n"
-                            f"Title: {item['title']}\nType: {item['item_type']}\n"
-                            f"Preview: {preview}\n\n"
-                            f"Use the read_item_content tool to fetch the full content "
-                            f"or specific sections when you need more detail. The item ID is {item_id}."
-                        )
-                        item_conversations[item_id] = conv
-
-                        hsess = history.start_conversation(
-                            service="octavius", source="inbox_chat",
-                            model=LLM_CHAIN[0]["model"],
-                        )
-                        item_history_sessions[item_id] = hsess
-                        set_item_chat_conversation(history.conn, item_id, hsess.conv_id)
-
-                        await ws.send_text(json.dumps({
-                            "type": "item_chat_loaded", "item_id": item_id,
-                            "messages": [],
-                        }))
-                    continue
-
-                if data.get("type") == "item_chat":
-                    item_id = data.get("item_id")
-                    user_text = data.get("text", "").strip()
-                    if not user_text or item_id not in item_conversations:
-                        continue
-
-                    conv = item_conversations[item_id]
-                    hsess = item_history_sessions.get(item_id)
-
-                    await ws.send_text(json.dumps({
-                        "type": "item_chat_status", "item_id": item_id,
-                        "text": "Thinking...",
-                    }))
-
-                    # Record user message
-                    if hsess:
-                        hsess.add_message(role="user", content=user_text)
-
-                    # Run agent turn (text-only, no TTS)
-                    import time as _time
-                    turn_start = _time.monotonic()
-
-                    async def item_status_cb(text):
-                        await ws.send_text(json.dumps({
-                            "type": "item_chat_status", "item_id": item_id,
-                            "text": text,
-                        }))
-
-                    full_parts = []
-                    try:
-                        async for sentence in stream_agent_turn(
-                            conv, mcp_manager, user_text,
-                            status_callback=item_status_cb,
-                            history_session=hsess,
-                        ):
-                            full_parts.append(sentence)
-                    except Exception as e:
-                        log.exception("Item chat agent failed")
-                        await ws.send_text(json.dumps({
-                            "type": "item_chat_response", "item_id": item_id,
-                            "text": f"Error: {e}",
-                        }))
-                        continue
-
-                    full_reply = "".join(full_parts).strip()
-                    if hsess and full_reply:
-                        latency_ms = int((_time.monotonic() - turn_start) * 1000)
-                        hsess.add_message(
-                            role="assistant", content=full_reply,
-                            model=LLM_CHAIN[0]["model"], latency_ms=latency_ms,
-                        )
-
-                    await ws.send_text(json.dumps({
-                        "type": "item_chat_response", "item_id": item_id,
-                        "text": full_reply or "I'm not sure how to respond to that.",
-                    }))
-                    continue
-
-                if data.get("type") == "item_chat_reset":
-                    item_id = data.get("item_id")
-                    # End old session if exists
-                    old_hsess = item_history_sessions.pop(item_id, None)
-                    if old_hsess:
-                        old_hsess.end()
-                    item_conversations.pop(item_id, None)
-
-                    # Create fresh conversation
-                    item = get_saved_item(history.conn, item_id)
-                    if item:
-                        conv = Conversation()
-                        preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
-                        conv._messages[0]["content"] += (
-                            f"\n\nYou are discussing a saved inbox item with Dave.\n"
-                            f"Title: {item['title']}\nType: {item['item_type']}\n"
-                            f"Preview: {preview}\n\n"
-                            f"Use the read_item_content tool to fetch the full content "
-                            f"or specific sections when you need more detail. The item ID is {item_id}."
-                        )
-                        item_conversations[item_id] = conv
-
-                        hsess = history.start_conversation(
-                            service="octavius", source="inbox_chat",
-                            model=LLM_CHAIN[0]["model"],
-                        )
-                        item_history_sessions[item_id] = hsess
-                        set_item_chat_conversation(history.conn, item_id, hsess.conv_id)
-
-                    await ws.send_text(json.dumps({
-                        "type": "item_chat_loaded", "item_id": item_id,
-                        "messages": [],
-                    }))
-                    continue
-
-            # Binary message — audio blob
-            if "bytes" in message:
-                audio_bytes = message["bytes"]
-
-                await send_json(ws, "status", "Transcribing...")
-                try:
-                    user_text = await transcribe(audio_bytes)
-                except Exception as e:
-                    log.exception("STT failed")
-                    await send_json(ws, "status", f"Transcription failed: {e}")
-                    continue
-
-                if not user_text:
-                    await send_json(ws, "status", "Couldn't hear anything. Try again.")
-                    continue
-
-                await send_json(ws, "transcript", user_text)
-                await _run_turn(
-                    ws, conversation, mcp_manager, user_text, voice,
-                    tts_enabled, history_session=history_session, source="voice",
-                )
-
-    except (WebSocketDisconnect, RuntimeError):
-        log.info("WebSocket disconnected")
-        if reader_task and not reader_task.done():
-            reader_task.cancel()
-        for hsess in item_history_sessions.values():
-            hsess.end()
-        history_session.end()
+    await handle_websocket_session(ws)
 
 
 if __name__ == "__main__":

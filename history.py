@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import sqlite_vec
+from settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -18,19 +19,19 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 DEFAULT_DB_PATH = Path(__file__).parent / "octavius_history.db"
 
 # Embedding config — same as Evangeline (Ollama bge-m3 on workhorse)
-OLLAMA_BASE_URL = "http://workhorse:11434"
-OLLAMA_MODEL = "bge-m3"
-EMBEDDING_TIMEOUT = 5  # seconds
+OLLAMA_BASE_URL = settings.ollama_base_url
+OLLAMA_MODEL = settings.ollama_model
+EMBEDDING_TIMEOUT = settings.embedding_timeout
 
 # Summary generation config
-SUMMARY_URL = "http://127.0.0.1:8001/v1/chat/completions"
-SUMMARY_MODEL = "qwen3.5-35b-a3b"
-SUMMARY_FALLBACK_URL = "http://triplestuffed:8010/v1/chat/completions"
-SUMMARY_TIMEOUT = 60  # seconds
+SUMMARY_URL = settings.summary_url
+SUMMARY_MODEL = settings.summary_model
+SUMMARY_FALLBACK_URL = settings.summary_fallback_url
+SUMMARY_TIMEOUT = settings.summary_timeout
 
 # Truncation limits
-RESULT_SUMMARY_MAX_CHARS = 500
-TAG_GENERATION_MIN_MESSAGES = 4
+RESULT_SUMMARY_MAX_CHARS = settings.result_summary_max_chars
+TAG_GENERATION_MIN_MESSAGES = settings.tag_generation_min_messages
 
 
 def _now() -> str:

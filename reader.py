@@ -11,12 +11,10 @@ from pathlib import Path
 
 import httpx
 
-from config import LLM_CHAIN, READER_DIR
+from config import READER_DIR
+from service_clients import llm_client
+from settings import settings
 from tts import synthesize
-
-# Dedicated LLM for reader math conversion (separate from Octavius chat)
-READER_LLM_URL = "http://lilripper:8010/v1/chat/completions"
-READER_LLM_MODEL = "qwen3.5-9b"
 
 log = logging.getLogger(__name__)
 
@@ -126,6 +124,25 @@ def delete_document(conn: sqlite3.Connection, doc_id: int) -> bool:
     conn.execute("DELETE FROM reader_documents WHERE id = ?", (doc_id,))
     conn.commit()
     return True
+
+
+def fail_stale_processing_documents(
+    conn: sqlite3.Connection,
+    error_message: str = "Document processing was interrupted before completion.",
+) -> int:
+    """Mark orphaned processing rows as failed on startup.
+
+    Reader ingest tasks are in-memory background tasks, so anything still marked
+    processing after a restart cannot complete without being requeued.
+    """
+    cursor = conn.execute(
+        """UPDATE reader_documents
+           SET status = 'failed', error = ?, updated_at = ?
+           WHERE status = 'processing'""",
+        (error_message, _now()),
+    )
+    conn.commit()
+    return cursor.rowcount
 
 
 # -- Markdown chunking -------------------------------------------------------
@@ -238,7 +255,7 @@ def _has_math(text: str) -> bool:
 async def _llm_convert_math(client: httpx.AsyncClient, text: str) -> str:
     """Send a short piece of text to the LLM to convert math to speech."""
     payload = {
-        "model": READER_LLM_MODEL,
+        "model": settings.reader.llm_model,
         "messages": [
             {"role": "system", "content": MATH_TO_SPEECH_PROMPT},
             {"role": "user", "content": text},
@@ -249,10 +266,8 @@ async def _llm_convert_math(client: httpx.AsyncClient, text: str) -> str:
     }
 
     try:
-        resp = await client.post(READER_LLM_URL, json=payload)
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"]
-        result = THINK_RE.sub("", raw).strip()
+        raw = await llm_client.complete(payload, urls=[settings.reader.llm_url])
+        result = THINK_RE.sub("", raw or "").strip()
         if result:
             return result
     except Exception as e:

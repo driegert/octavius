@@ -12,8 +12,11 @@ from urllib.parse import urlparse, unquote
 import httpx
 
 from config import DOWNLOADS_DIR
+from document_sources import ensure_pdf_suffix, is_likely_html, is_pdf_file, read_text_file
 from history import save_item
 import reader
+from reader_ingest_service import ingest_pdf_document
+from runtime import get_mcp_manager
 
 if TYPE_CHECKING:
     from history import ConversationSession
@@ -183,6 +186,8 @@ def _safe_filename(url: str, filename: str | None) -> str:
         name = "download"
     # Remove query strings from filename
     name = re.sub(r'[?#].*', '', name)
+    if "/pdf/" in parsed.path and not name.lower().endswith(".pdf"):
+        name = f"{name}.pdf"
     return name
 
 
@@ -308,17 +313,33 @@ async def _read_document(args: dict, session: ConversationSession | None) -> str
 
     if p.suffix.lower() == ".pdf":
         doc_id = reader.create_document(conn, title, "pdf", source_path=path)
-        # PDF ingest is handled by main.py's _ingest_pdf — just create the record
-        # and let the user know to check /reader
+        mcp_manager = get_mcp_manager()
+        if mcp_manager is None:
+            return "Error: MCP manager unavailable."
+        asyncio.create_task(ingest_pdf_document(conn, mcp_manager, doc_id, path, title))
+        return (
+            f"Document '{title}' has been queued for processing (document #{doc_id}). "
+            f"Since it's a PDF, it needs to be converted to text first, which takes a few minutes. "
+            f"You can check the reader at /reader when it's ready."
+        )
+    if is_pdf_file(p):
+        pdf_path = ensure_pdf_suffix(p)
+        if not pdf_path.exists():
+            p.rename(pdf_path)
+        doc_id = reader.create_document(conn, title, "pdf", source_path=str(pdf_path))
+        mcp_manager = get_mcp_manager()
+        if mcp_manager is None:
+            return "Error: MCP manager unavailable."
+        asyncio.create_task(ingest_pdf_document(conn, mcp_manager, doc_id, str(pdf_path), title))
         return (
             f"Document '{title}' has been queued for processing (document #{doc_id}). "
             f"Since it's a PDF, it needs to be converted to text first, which takes a few minutes. "
             f"You can check the reader at /reader when it's ready."
         )
     else:
-        raw = p.read_text()
+        raw = read_text_file(p)
         # Detect HTML and extract article content
-        if raw.strip().startswith(('<!DOCTYPE', '<html', '<HTML')):
+        if is_likely_html(raw):
             import trafilatura
             extracted = trafilatura.extract(raw, include_links=False, include_comments=False,
                                            include_tables=False, output_format="txt")
@@ -390,11 +411,10 @@ async def _process_pdf_background(args: dict, session: ConversationSession | Non
 async def _run_pdf_processing(conn, item_id: int, file_path: str, title: str):
     """Background task: call MCP tools to convert PDF, then update inbox item."""
     import asyncio
-    from history import update_saved_item_status
-
     try:
-        # Import mcp_manager at runtime to avoid circular import
-        from main import mcp_manager
+        mcp_manager = get_mcp_manager()
+        if mcp_manager is None:
+            raise RuntimeError("MCP manager unavailable")
 
         # Start conversion
         result = await mcp_manager.call_tool("convert_pdf_to_md", {"file_path": file_path})
@@ -423,7 +443,7 @@ async def _run_pdf_processing(conn, item_id: int, file_path: str, title: str):
             md_match = _re.search(r'(/\S+\.md)', poll_result)
             if md_match:
                 md_path = md_match.group(1)
-                markdown = Path(md_path).read_text()
+                markdown = read_text_file(md_path)
                 # Update inbox item with the converted content
                 conn.execute(
                     "UPDATE saved_items SET title = ?, content = ? WHERE id = ?",

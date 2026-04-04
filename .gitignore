@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# Local tool state
+.codex
+.env
+
 # SQLite databases (runtime data)
 *.db
 *.db-shm

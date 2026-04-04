@@ -4,13 +4,11 @@ import time
 import uuid
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
-
-import httpx
 
 from config import LLM_CHAIN, MAX_TOOL_ROUNDS, TOOL_LABELS
 from conversation import Conversation
 from mcp_manager import MCPManager
+from service_clients import llm_client
 import tools as local_tools
 
 log = logging.getLogger(__name__)
@@ -19,23 +17,6 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 # Sentence-ending punctuation followed by space or end-of-string
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
-
-
-@asynccontextmanager
-async def _llm_stream(client: httpx.AsyncClient, payload: dict):
-    """Try each LLM in the chain until one succeeds."""
-    for i, entry in enumerate(LLM_CHAIN):
-        try:
-            payload["model"] = entry["model"]
-            async with client.stream("POST", entry["url"], json=payload) as resp:
-                resp.raise_for_status()
-                yield resp
-                return
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-            if i < len(LLM_CHAIN) - 1:
-                log.warning("LLM %s failed (%s), trying next", entry["url"], e)
-            else:
-                raise
 
 
 async def run_agent_turn(
@@ -89,75 +70,68 @@ async def stream_agent_turn(
 
         # --- Streaming request ---
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with _llm_stream(client, payload) as resp:
+            async with llm_client.stream_chat(payload) as resp:
+                full_content = ""
+                tool_calls_acc: dict[int, dict] = {}
+                in_think = False
+                sentence_buffer = ""
+                buffered_sentences: list[str] = []
 
-                    # Accumulators
-                    full_content = ""
-                    tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
-                    in_think = False
-                    sentence_buffer = ""
-                    buffered_sentences: list[str] = []
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
 
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
+                    delta = data["choices"][0].get("delta", {})
 
-                        delta = data["choices"][0].get("delta", {})
+                    if "tool_calls" in delta:
+                        for tc_delta in delta["tool_calls"]:
+                            idx = tc_delta["index"]
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.get("id", ""),
+                                    "name": tc_delta.get("function", {}).get("name", ""),
+                                    "arguments": "",
+                                }
+                            else:
+                                if tc_delta.get("id"):
+                                    tool_calls_acc[idx]["id"] = tc_delta["id"]
+                                if tc_delta.get("function", {}).get("name"):
+                                    tool_calls_acc[idx]["name"] = tc_delta["function"]["name"]
+                            args_chunk = tc_delta.get("function", {}).get("arguments", "")
+                            if args_chunk:
+                                tool_calls_acc[idx]["arguments"] += args_chunk
+                        continue
 
-                        # --- Tool call deltas ---
-                        if "tool_calls" in delta:
-                            for tc_delta in delta["tool_calls"]:
-                                idx = tc_delta["index"]
-                                if idx not in tool_calls_acc:
-                                    tool_calls_acc[idx] = {
-                                        "id": tc_delta.get("id", ""),
-                                        "name": tc_delta.get("function", {}).get("name", ""),
-                                        "arguments": "",
-                                    }
-                                else:
-                                    if tc_delta.get("id"):
-                                        tool_calls_acc[idx]["id"] = tc_delta["id"]
-                                    if tc_delta.get("function", {}).get("name"):
-                                        tool_calls_acc[idx]["name"] = tc_delta["function"]["name"]
-                                args_chunk = tc_delta.get("function", {}).get("arguments", "")
-                                if args_chunk:
-                                    tool_calls_acc[idx]["arguments"] += args_chunk
-                            continue
+                    token = delta.get("content", "")
+                    if not token:
+                        continue
 
-                        # --- Content deltas ---
-                        token = delta.get("content", "")
-                        if not token:
-                            continue
+                    full_content += token
 
-                        full_content += token
+                    if "<think>" in token:
+                        in_think = True
+                    if in_think:
+                        if "</think>" in token:
+                            in_think = False
+                        continue
 
-                        # Strip <think> blocks on the fly
-                        if "<think>" in token:
-                            in_think = True
-                        if in_think:
-                            if "</think>" in token:
-                                in_think = False
-                            continue
+                    sentence_buffer += token
 
-                        sentence_buffer += token
-
-                        # Check for sentence boundaries
-                        parts = SENTENCE_END.split(sentence_buffer)
-                        if len(parts) > 1:
-                            for sentence in parts[:-1]:
-                                sentence = sentence.strip()
-                                if sentence:
-                                    buffered_sentences.append(sentence + " ")
-                            sentence_buffer = parts[-1]
+                    parts = SENTENCE_END.split(sentence_buffer)
+                    if len(parts) > 1:
+                        for sentence in parts[:-1]:
+                            sentence = sentence.strip()
+                            if sentence:
+                                buffered_sentences.append(sentence + " ")
+                        sentence_buffer = parts[-1]
 
         except Exception as e:
             log.exception("LLM request failed")
