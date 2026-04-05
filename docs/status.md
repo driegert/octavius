@@ -79,6 +79,10 @@ Likely refactor targets, in rough priority order:
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
 
+## Migration Note
+
+- `reader_documents.saved_item_id` is still enforced as a plain foreign key. If inbox deletion should eventually null out that reference automatically, that will require a real SQLite migration to add `ON DELETE SET NULL`, not just a schema-file edit.
+
 ## Related Design Work
 
 The Android companion app remains exploratory rather than committed implementation work. See `octavius-android-design.md` for that design thread.

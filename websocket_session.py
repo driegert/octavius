@@ -89,9 +89,9 @@ class WebSocketSessionHandler:
         if self.state.reader_task and not self.state.reader_task.done():
             self.state.reader_task.cancel()
         for history_session in self.state.item_history_sessions.values():
-            history_session.end()
+            await history_session.end_async()
         if self.state.history_session:
-            self.state.history_session.end()
+            await self.state.history_session.end_async()
 
     async def run(self):
         await self.start()
@@ -149,11 +149,11 @@ class WebSocketSessionHandler:
             )
 
     async def handle_reset(self, _data: dict):
-        self.state.history_session.end()
+        await self.state.history_session.end_async()
         self.state.conversation.reset()
         self.state.history_session = self.state.history.start_conversation(
             source="voice",
-            model=LLM_CHAIN[0]["model"],
+            model=settings.llm_chain[0]["model"],
         )
         await self.send_payload(
             {
@@ -174,11 +174,11 @@ class WebSocketSessionHandler:
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
-        self.state.history_session.end()
+        await self.state.history_session.end_async()
         self.state.conversation.load_from_history(msgs)
         self.state.history_session = self.state.history.start_conversation(
             source="voice",
-            model=LLM_CHAIN[0]["model"],
+            model=settings.llm_chain[0]["model"],
         )
         history_pairs = [
             {"role": message["role"], "content": message["content"]}
@@ -238,6 +238,9 @@ class WebSocketSessionHandler:
         item_id = data.get("item_id")
         with self.state.history.connect() as conn:
             item = get_saved_item(conn, item_id)
+            chat_conv_id = get_item_chat_conversation_id(conn, item_id)
+            msgs = get_conversation_messages(conn, chat_conv_id) if chat_conv_id else []
+
         if not item:
             await self.send_payload(
                 {
@@ -248,22 +251,21 @@ class WebSocketSessionHandler:
             )
             return
 
-        with self.state.history.connect() as conn:
-            chat_conv_id = get_item_chat_conversation_id(conn, item_id)
         if chat_conv_id:
-            with self.state.history.connect() as conn:
-                msgs = get_conversation_messages(conn, chat_conv_id)
             conversation = create_item_conversation(item, item_id)
             for message in msgs:
                 if message["role"] in ("user", "assistant") and message.get("content"):
                     conversation._messages.append({"role": message["role"], "content": message["content"]})
             conversation.trim()
             self.state.item_conversations[item_id] = conversation
-            self.state.item_history_sessions[item_id] = self.state.history.start_conversation(
+            history_session = self.state.history.start_conversation(
                 service="octavius",
                 source="inbox_chat",
                 model=settings.llm_chain[0]["model"],
             )
+            self.state.item_history_sessions[item_id] = history_session
+            with self.state.history.connect() as conn:
+                set_item_chat_conversation(conn, item_id, history_session.conv_id)
             history_pairs = [
                 {"role": message["role"], "content": message["content"]}
                 for message in msgs
@@ -300,7 +302,7 @@ class WebSocketSessionHandler:
         history_session = self.state.item_history_sessions.get(item_id)
         await self.send_payload({"type": "item_chat_status", "item_id": item_id, "text": "Thinking..."})
         if history_session:
-            history_session.add_message(role="user", content=user_text)
+            await history_session.add_message_async(role="user", content=user_text)
 
         turn_start = time.monotonic()
 
@@ -331,7 +333,7 @@ class WebSocketSessionHandler:
         full_reply = "".join(full_parts).strip()
         if history_session and full_reply:
             latency_ms = int((time.monotonic() - turn_start) * 1000)
-            history_session.add_message(
+            await history_session.add_message_async(
                 role="assistant",
                 content=full_reply,
                 model=settings.llm_chain[0]["model"],
@@ -351,7 +353,7 @@ class WebSocketSessionHandler:
         item_id = data.get("item_id")
         old_session = self.state.item_history_sessions.pop(item_id, None)
         if old_session:
-            old_session.end()
+            await old_session.end_async()
         self.state.item_conversations.pop(item_id, None)
 
         with self.state.history.connect() as conn:
@@ -397,7 +399,7 @@ class WebSocketSessionHandler:
             user_kwargs = {}
             if source == "voice":
                 user_kwargs["stt_model"] = "whisper"
-            self.state.history_session.add_message(role="user", content=user_text, **user_kwargs)
+            await self.state.history_session.add_message_async(role="user", content=user_text, **user_kwargs)
 
         async def status_cb(text: str):
             await self.send_json("status", text)
@@ -426,7 +428,7 @@ class WebSocketSessionHandler:
             log.exception("Agent failed")
             await self.send_json("status", f"Agent error: {exc}")
             if self.state.history_session:
-                self.state.history_session.add_message(
+                await self.state.history_session.add_message_async(
                     role="assistant",
                     content=f"Error: {exc}",
                     error=str(exc),
@@ -439,7 +441,7 @@ class WebSocketSessionHandler:
 
         if self.state.history_session and full_reply:
             latency_ms = int((time.monotonic() - turn_start) * 1000)
-            self.state.history_session.add_message(
+            await self.state.history_session.add_message_async(
                 role="assistant",
                 content=full_reply,
                 model=settings.llm_chain[0]["model"],

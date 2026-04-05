@@ -165,7 +165,12 @@ async def stream_agent_turn(
                 local_tool_names = {t["function"]["name"] for t in local_tools.TOOLS}
                 tc_start = time.monotonic()
                 if name in local_tool_names:
-                    result = await local_tools.call_tool(name, args, history_session=history_session)
+                    result = await local_tools.call_tool(
+                        name,
+                        args,
+                        history_session=history_session,
+                        mcp_manager=mcp,
+                    )
                     server_name = "local"
                 else:
                     result = await mcp.call_tool(name, args)
@@ -178,7 +183,7 @@ async def stream_agent_turn(
                     tc_status = "error" if result.startswith("Error") else "success"
                     # Use the last recorded assistant message as parent,
                     # or record a synthetic tool-role message
-                    history_msg_id = history_session.add_message(
+                    history_msg_id = await history_session.add_message_async(
                         role="tool", content=result[:500],
                         model=None, latency_ms=tc_duration_ms,
                     )

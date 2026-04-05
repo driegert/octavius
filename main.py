@@ -13,7 +13,6 @@ from routes.conversations import router as conversations_router
 from routes.inbox import router as inbox_router
 from routes.reader_api import router as reader_router
 from reader_store import fail_stale_processing_documents
-from runtime import set_mcp_manager
 from service_clients import llm_client
 from websocket_session import handle_websocket_session
 
@@ -34,7 +33,6 @@ async def lifespan(app: FastAPI):
     app.state.mcp_manager = mcp_manager
     app.state.history = history
     app.state.db_path = db_path
-    set_mcp_manager(mcp_manager)
     if stale_count:
         log.warning("Marked %d stale reader document(s) as failed on startup", stale_count)
     log.info("Connecting MCP servers...")

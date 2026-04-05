@@ -294,6 +294,34 @@ class SummaryClient:
                 continue
         return None
 
+    async def acomplete(self, payload: dict, *, timeout: int) -> str | None:
+        failed_urls: list[str] = []
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for i, url in enumerate(self.urls):
+                try:
+                    if i > 0:
+                        log.warning(
+                            "Summary fallback attempt %d/%d via %s",
+                            i + 1,
+                            len(self.urls),
+                            url,
+                        )
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    text = resp.json()["choices"][0]["message"]["content"].strip()
+                    if failed_urls:
+                        log.warning(
+                            "Summary request succeeded via fallback %s after failures on %s",
+                            url,
+                            ", ".join(failed_urls),
+                        )
+                    return text
+                except Exception:
+                    failed_urls.append(url)
+                    log.debug("Async summary completion failed via %s", url, exc_info=True)
+                    continue
+        return None
+
 
 class EmbeddingClient:
     def __init__(self, base_url: str, model: str):
@@ -312,6 +340,20 @@ class EmbeddingClient:
             return vec.tobytes()
         except Exception:
             log.debug("Embedding request failed", exc_info=True)
+            return None
+
+    async def aembed_text(self, text: str, *, timeout: int) -> bytes | None:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/embeddings",
+                    json={"model": self.model, "prompt": text},
+                )
+                resp.raise_for_status()
+                vec = np.array(resp.json()["embedding"], dtype=np.float32)
+                return vec.tobytes()
+        except Exception:
+            log.debug("Async embedding request failed", exc_info=True)
             return None
 
 

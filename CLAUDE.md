@@ -121,7 +121,6 @@ Core runtime:
 - `main.py` - FastAPI app creation, startup wiring, shared top-level routes, WebSocket entrypoint
 - `db.py` - SQLite connection helpers and short-lived connection context manager
 - `settings.py` - env-backed runtime settings and defaults
-- `runtime.py` - shared runtime handle for MCP manager access
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
 - `stt.py` - thin STT wrapper
 - `tts.py` - thin TTS wrapper
@@ -138,9 +137,9 @@ Conversation and tool loop:
 - `agent.py` - LLM loop, tool calling, output cleanup, tool-spiral prevention
 - `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
 - `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
-- `tools.py` - public local-tool entrypoint used by the agent loop
+- `tools.py` - local tool schemas and dispatch entrypoint used by the agent loop
 - `local_tool_specs.py` - local tool schemas
-- `local_tool_registry.py` - local tool handler registry and dispatch
+- `local_tool_registry.py` - compatibility wrapper for older local-tool imports
 - `local_tool_downloads.py` - local download filename logic and download tool execution
 - `local_tool_inbox.py` - local inbox save/read helpers used by tool handlers
 - `local_tool_reader.py` - local reader handoff and background PDF-processing helpers
@@ -229,7 +228,7 @@ Prefer these refactor directions:
 
 - keep core STT/TTS/LLM chat boundary code in `service_clients.py` and related wrappers
 - keep `main.py` focused on routing and startup, not orchestration
-- keep local tool schemas, registry/dispatch, and handlers separate
+- keep local tool schemas in `local_tool_specs.py`, with dispatch centered in `tools.py`
 - keep inbox/history query logic out of route handlers
 
 When adding a feature:
@@ -248,13 +247,13 @@ Use these placement rules:
 - new HTTP routes belong in the relevant `routes/*.py` module, with orchestration pushed down into subsystem modules
 - reader ingest and playback changes belong in the `reader_ingest_*`, `reader_store.py`, `reader_text.py`, or `reader_playback.py` modules
 - inbox/history query and persistence changes belong in `history_store.py` or `history_enrichment.py`, not in route handlers
-- local tool additions belong in `local_tool_specs.py` plus the appropriate `local_tool_*` execution module, then get registered in `local_tool_registry.py`
+- local tool additions belong in `local_tool_specs.py` plus the appropriate `local_tool_*` execution module, then get wired through `tools.py`
 - new outbound service integrations should go behind `service_clients.py` or a closely related wrapper, not inline in feature code
 
 Common extension patterns:
 
 1. Add a new local tool.
-   Update `local_tool_specs.py`, implement the behavior in the right `local_tool_*` module, register it in `local_tool_registry.py`, and add tests for both the handler behavior and dispatch path.
+   Update `local_tool_specs.py`, implement the behavior in the right `local_tool_*` module, wire it through `tools.py`, and add tests for both the handler behavior and dispatch path.
 
 2. Add a new reader source or ingest mode.
    Start in `reader_ingest_service.py` for the entrypoint shape, put source-specific logic in `reader_ingest_handlers.py`, keep document metadata in `reader_store.py`, and keep markdown-to-speech logic in `reader_text.py`.

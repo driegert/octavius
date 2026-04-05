@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-def save_to_inbox(args: dict, session=None) -> str:
+def save_to_inbox(args: dict, session=None, _mcp_manager=None) -> str:
     from history import save_item
 
     title = args.get("title", "")
@@ -27,7 +27,7 @@ def save_to_inbox(args: dict, session=None) -> str:
     return f"Saved to inbox (item #{item_id}): {title}"
 
 
-def read_item_content(args: dict, session=None) -> str:
+def read_item_content(args: dict, session=None, _mcp_manager=None) -> str:
     from history import get_saved_item
 
     item_id = args.get("item_id")

@@ -2,8 +2,9 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+import numpy as np
 
-from service_clients import LLMChainClient
+from service_clients import EmbeddingClient, LLMChainClient, SummaryClient
 
 
 class _FakeAsyncClient:
@@ -88,6 +89,29 @@ class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(health["endpoints"][0]["failures"], 1)
         self.assertEqual(health["endpoints"][1]["failures"], 1)
+
+    async def test_summary_client_acomplete_uses_fallback(self):
+        client = SummaryClient("http://primary", "http://fallback")
+        outcomes = [
+            httpx.ConnectError("boom"),
+            _FakeResponse("summary"),
+        ]
+
+        with patch("service_clients.httpx.AsyncClient", return_value=_FakeAsyncClient(outcomes)):
+            result = await client.acomplete({"messages": []}, timeout=5)
+
+        self.assertEqual(result, "summary")
+
+    async def test_embedding_client_aembed_text_returns_bytes(self):
+        client = EmbeddingClient("http://embed", "bge")
+        response = _FakeResponse("ignored")
+        response.json = lambda: {"embedding": [1.0, 2.0]}
+        expected = np.array([1.0, 2.0], dtype=np.float32).tobytes()
+
+        with patch("service_clients.httpx.AsyncClient", return_value=_FakeAsyncClient([response])):
+            result = await client.aembed_text("hello", timeout=5)
+
+        self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":

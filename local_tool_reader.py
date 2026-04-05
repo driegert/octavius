@@ -10,7 +10,7 @@ from db import connect_db
 from document_sources import ensure_pdf_suffix, is_likely_html, is_pdf_file, read_text_file
 from reader_store import create_document
 from reader_text import ingest_document
-from reader_ingest_service import ingest_pdf_document
+from reader_ingest_handlers import ingest_pdf_document
 
 log = logging.getLogger(__name__)
 
@@ -39,9 +39,7 @@ def _update_saved_item_content(db_path: str | Path, item_id: int, title: str, co
         conn.commit()
 
 
-async def read_document(args: dict, session=None) -> str:
-    from runtime import get_mcp_manager
-
+async def read_document(args: dict, session=None, mcp_manager=None) -> str:
     path = args.get("path", "")
     if not path:
         return "Error: path is required."
@@ -60,7 +58,6 @@ async def read_document(args: dict, session=None) -> str:
         if pdf_path != source_path and not pdf_path.exists():
             source_path.rename(pdf_path)
         doc_id = create_document(conn, title, "pdf", source_path=str(pdf_path))
-        mcp_manager = get_mcp_manager()
         if mcp_manager is None:
             return "Error: MCP manager unavailable."
         asyncio.create_task(ingest_pdf_document(session.db_path, mcp_manager, doc_id, str(pdf_path), title))
@@ -104,7 +101,7 @@ async def read_document(args: dict, session=None) -> str:
     )
 
 
-async def process_pdf_background(args: dict, session=None) -> str:
+async def process_pdf_background(args: dict, session=None, mcp_manager=None) -> str:
     from history import save_item
 
     file_path = args.get("file_path", "")
@@ -114,8 +111,13 @@ async def process_pdf_background(args: dict, session=None) -> str:
     source_path = Path(file_path)
     if not source_path.exists():
         return f"Error: file not found: {file_path}"
-    if source_path.suffix.lower() != ".pdf":
+    if source_path.suffix.lower() != ".pdf" and not is_pdf_file(source_path):
         return f"Error: {file_path} is not a PDF file."
+    if source_path.suffix.lower() != ".pdf":
+        pdf_path = ensure_pdf_suffix(source_path)
+        if not pdf_path.exists():
+            source_path.rename(pdf_path)
+        source_path = pdf_path
 
     title = args.get("title", source_path.stem)
     conn = session.conn if session else None
@@ -127,21 +129,18 @@ async def process_pdf_background(args: dict, session=None) -> str:
         conn=conn,
         item_type="article",
         title=f"{title} (processing...)",
-        content=f"PDF is being converted to text. Source: {file_path}",
+        content=f"PDF is being converted to text. Source: {source_path}",
         conversation_id=conv_id,
     )
-    asyncio.create_task(run_pdf_processing(session.db_path, item_id, file_path, title))
+    asyncio.create_task(run_pdf_processing(session.db_path, item_id, str(source_path), title, mcp_manager))
     return (
         f"PDF '{title}' is being processed in the background (inbox item #{item_id}). "
         f"It will appear in the knowledge inbox when ready. You can keep talking to me in the meantime."
     )
 
 
-async def run_pdf_processing(db_path: str | Path, item_id: int, file_path: str, title: str):
-    from runtime import get_mcp_manager
-
+async def run_pdf_processing(db_path: str | Path, item_id: int, file_path: str, title: str, mcp_manager=None):
     try:
-        mcp_manager = get_mcp_manager()
         if mcp_manager is None:
             raise RuntimeError("MCP manager unavailable")
 

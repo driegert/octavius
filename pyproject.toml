@@ -1,7 +1,7 @@
 [project]
-name = "voice-assistant"
+name = "octavius"
 version = "0.1.0"
-description = "Add your description here"
+description = "Self-hosted voice assistant with a FastAPI backend, MCP tools, a knowledge inbox, and a document reader."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

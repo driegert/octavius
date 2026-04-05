@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import reader_ingest_handlers as handlers
 import reader_ingest_service as service
 
 
@@ -95,7 +96,7 @@ class ReaderIngestServiceTests(unittest.TestCase):
                 coro.close()
                 return None
 
-            with patch.object(service.asyncio, "create_task", side_effect=fake_create_task):
+            with patch.object(handlers.asyncio, "create_task", side_effect=fake_create_task):
                 result = asyncio.run(service.retry_reader_document(db_path, _FakeMCP(), 1))
 
             self.assertEqual(result, {"id": 1, "status": "processing"})
@@ -110,13 +111,18 @@ class ReaderIngestServiceTests(unittest.TestCase):
 
     def test_extract_article_text_returns_none_when_both_attempts_fail(self):
         fake = _FakeTrafilatura()
-        with patch.object(service, "_get_trafilatura", return_value=fake):
-            self.assertIsNone(service._extract_article_text("<html></html>"))
+        with patch.object(handlers, "get_trafilatura", return_value=fake):
+            self.assertIsNone(handlers.extract_article_text("<html></html>", service.ReaderIngestError))
 
     def test_refine_title_from_web_page_keeps_explicit_title(self):
         fake = _FakeTrafilatura(metadata=None)
-        with patch.object(service, "_get_trafilatura", return_value=fake):
-            title = service._refine_title_from_web_page("<title>Paper - arXiv</title>", "Chosen title", "https://arxiv.org/abs/1")
+        with patch.object(handlers, "get_trafilatura", return_value=fake):
+            title = handlers.refine_title_from_web_page(
+                "<title>Paper - arXiv</title>",
+                "Chosen title",
+                "https://arxiv.org/abs/1",
+                service.ReaderIngestError,
+            )
         self.assertEqual(title, "Chosen title")
 
     def test_start_reader_ingest_rejects_missing_file(self):
@@ -144,7 +150,6 @@ class ReaderIngestServiceTests(unittest.TestCase):
 
             with (
                 patch.object(service, "start_file_ingest", return_value={"id": 12, "status": "processing"}) as start_file_ingest,
-                patch.object(service.asyncio, "create_task", side_effect=fake_create_task),
             ):
                 result = asyncio.run(
                     service.start_reader_ingest(
@@ -173,7 +178,6 @@ class ReaderIngestServiceTests(unittest.TestCase):
 
             with (
                 patch.object(service, "start_file_ingest", return_value={"id": 21, "status": "processing"}) as start_file_ingest,
-                patch.object(service.asyncio, "create_task", side_effect=fake_create_task),
             ):
                 result = asyncio.run(
                     service.start_reader_ingest(
@@ -192,7 +196,7 @@ class ReaderIngestServiceTests(unittest.TestCase):
             out_dir = Path(tmpdir)
             actual = out_dir / "2604.md"
             actual.write_text("content")
-            resolved = service._resolve_markdown_output(out_dir / "2604.02238_1.md")
+            resolved = handlers.resolve_markdown_output(out_dir / "2604.02238_1.md")
             self.assertEqual(resolved, actual)
 
 

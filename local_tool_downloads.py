@@ -27,7 +27,7 @@ def safe_filename(url: str, filename: str | None) -> str:
     return name
 
 
-async def download_file(args: dict, _session=None) -> str:
+async def download_file(args: dict, _session=None, _mcp_manager=None) -> str:
     url = args.get("url", "")
     if not url:
         return "Error: url is required."

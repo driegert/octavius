@@ -1,3 +1,5 @@
+import sqlite3
+
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -53,10 +55,16 @@ async def inbox_update(item_id: int, request: Request):
 
 @router.delete("/api/inbox/{item_id}")
 async def inbox_delete(item_id: int, request: Request):
-    with connect_db(request.app.state.db_path) as conn:
-        conn.execute("DELETE FROM saved_item_embeddings WHERE saved_item_id = ?", (item_id,))
-        cursor = conn.execute("DELETE FROM saved_items WHERE id = ?", (item_id,))
-        conn.commit()
+    try:
+        with connect_db(request.app.state.db_path) as conn:
+            conn.execute("DELETE FROM saved_item_embeddings WHERE saved_item_id = ?", (item_id,))
+            cursor = conn.execute("DELETE FROM saved_items WHERE id = ?", (item_id,))
+            conn.commit()
+    except sqlite3.IntegrityError:
+        return JSONResponse(
+            {"error": "item is referenced by a reader document; delete the reader document first"},
+            status_code=409,
+        )
     if cursor.rowcount == 0:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"ok": True})

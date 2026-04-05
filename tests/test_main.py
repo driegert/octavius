@@ -1,4 +1,7 @@
 import unittest
+import sqlite3
+import tempfile
+from pathlib import Path
 
 try:
     from fastapi.testclient import TestClient
@@ -72,6 +75,40 @@ class _StartingMCPManager(_FakeMCPManager):
         }
 
 
+def _init_inbox_delete_db(db_path: Path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE saved_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT
+        );
+        CREATE TABLE saved_item_embeddings (
+            saved_item_id INTEGER PRIMARY KEY,
+            embedding BLOB
+        );
+        CREATE TABLE reader_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_path TEXT,
+            saved_item_id INTEGER REFERENCES saved_items(id),
+            speech_file TEXT,
+            original_md_file TEXT,
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'ready',
+            error TEXT,
+            last_chunk INTEGER NOT NULL DEFAULT 0,
+            last_sentence INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT 'now',
+            updated_at TEXT
+        );
+        """
+    )
+    conn.commit()
+    return conn
+
+
 @unittest.skipIf(TestClient is None or main is None, "fastapi dependency not installed")
 class MainTests(unittest.TestCase):
     def test_health_reports_runtime_state(self):
@@ -139,6 +176,35 @@ class MainTests(unittest.TestCase):
         self.assertFalse(body["ready"])
         self.assertTrue(body["degraded"])
         self.assertEqual(body["mcp"]["connected_servers"], 0)
+
+    def test_inbox_delete_returns_conflict_when_reader_document_references_item(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "history.db"
+            app = main.create_app(
+                mcp_manager_factory=_FakeMCPManager,
+                db_init=lambda: _init_inbox_delete_db(db_path),
+                db_path=db_path,
+            )
+
+            with TestClient(app) as client:
+                with sqlite3.connect(str(db_path)) as conn:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    conn.execute("INSERT INTO saved_items (id) VALUES (1)")
+                    conn.execute(
+                        """
+                        INSERT INTO reader_documents (title, source_type, saved_item_id)
+                        VALUES ('Paper', 'inbox_item', 1)
+                        """
+                    )
+                    conn.commit()
+
+                response = client.delete("/api/inbox/1")
+
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(
+                response.json(),
+                {"error": "item is referenced by a reader document; delete the reader document first"},
+            )
 
 
 if __name__ == "__main__":

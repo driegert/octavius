@@ -2,7 +2,6 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,20 +9,13 @@ import local_tool_reader
 
 
 class LocalToolReaderTests(unittest.TestCase):
-    def _runtime_module(self, get_mcp_manager):
-        module = ModuleType("runtime")
-        module.get_mcp_manager = get_mcp_manager
-        return module
-
     def test_read_document_requires_database_connection(self):
-        with patch.dict("sys.modules", {"runtime": self._runtime_module(lambda: None)}):
-            result = asyncio.run(local_tool_reader.read_document({"path": "/tmp/missing.pdf"}, session=None))
+        result = asyncio.run(local_tool_reader.read_document({"path": "/tmp/missing.pdf"}, session=None))
         self.assertEqual(result, "Error: file not found: /tmp/missing.pdf")
 
     def test_read_document_rejects_missing_path_arg(self):
         session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
-        with patch.dict("sys.modules", {"runtime": self._runtime_module(lambda: None)}):
-            result = asyncio.run(local_tool_reader.read_document({}, session=session))
+        result = asyncio.run(local_tool_reader.read_document({}, session=session))
         self.assertEqual(result, "Error: path is required.")
 
     def test_read_document_schedules_markdown_ingest(self):
@@ -43,7 +35,6 @@ class LocalToolReaderTests(unittest.TestCase):
                 patch.object(local_tool_reader, "read_text_file", return_value="hello world"),
                 patch.object(local_tool_reader, "is_likely_html", return_value=False),
                 patch.object(local_tool_reader.asyncio, "create_task", side_effect=fake_create_task),
-                patch.dict("sys.modules", {"runtime": self._runtime_module(lambda: None)}),
             ):
                 result = asyncio.run(local_tool_reader.read_document({"path": str(path), "title": "Note"}, session=session))
 
@@ -56,10 +47,7 @@ class LocalToolReaderTests(unittest.TestCase):
             path.write_bytes(b"%PDF-1.3\nbinary")
             session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
 
-            with (
-                patch.object(local_tool_reader, "create_document", return_value=77),
-                patch.dict("sys.modules", {"runtime": self._runtime_module(lambda: None)}),
-            ):
+            with patch.object(local_tool_reader, "create_document", return_value=77):
                 result = asyncio.run(local_tool_reader.read_document({"path": str(path), "title": "Paper"}, session=session))
 
             self.assertEqual(result, "Error: MCP manager unavailable.")
@@ -88,10 +76,45 @@ class LocalToolReaderTests(unittest.TestCase):
                 patch("history.save_item", return_value=321),
                 patch.object(local_tool_reader.asyncio, "create_task", side_effect=fake_create_task),
             ):
-                result = asyncio.run(local_tool_reader.process_pdf_background({"file_path": str(path), "title": "Paper"}, session=session))
+                result = asyncio.run(
+                    local_tool_reader.process_pdf_background(
+                        {"file_path": str(path), "title": "Paper"},
+                        session=session,
+                        mcp_manager=object(),
+                    )
+                )
 
             self.assertIn("inbox item #321", result)
             self.assertEqual(len(created_tasks), 1)
+
+    def test_process_pdf_background_accepts_pdf_without_suffix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "paper"
+            path.write_bytes(b"%PDF-1.3\nbinary")
+            session = SimpleNamespace(conn=object(), conv_id=99, db_path="/tmp/test.db")
+            created_tasks = []
+
+            def fake_create_task(coro):
+                created_tasks.append(coro)
+                coro.close()
+                return None
+
+            with (
+                patch("history.save_item", return_value=321),
+                patch.object(local_tool_reader.asyncio, "create_task", side_effect=fake_create_task),
+            ):
+                result = asyncio.run(
+                    local_tool_reader.process_pdf_background(
+                        {"file_path": str(path), "title": "Paper"},
+                        session=session,
+                        mcp_manager=object(),
+                    )
+                )
+
+            self.assertIn("inbox item #321", result)
+            self.assertEqual(len(created_tasks), 1)
+            self.assertFalse(path.exists())
+            self.assertTrue(Path(f"{path}.pdf").exists())
 
     def test_run_pdf_processing_marks_item_failed_when_no_job_id(self):
         updates = []
@@ -102,10 +125,9 @@ class LocalToolReaderTests(unittest.TestCase):
 
         async def run():
             with (
-                patch.dict("sys.modules", {"runtime": self._runtime_module(lambda: _MCP())}),
                 patch.object(local_tool_reader, "_update_saved_item_content", side_effect=lambda *args: updates.append(args)),
             ):
-                await local_tool_reader.run_pdf_processing("/tmp/test.db", 7, "/tmp/paper.pdf", "Paper")
+                await local_tool_reader.run_pdf_processing("/tmp/test.db", 7, "/tmp/paper.pdf", "Paper", _MCP())
 
         asyncio.run(run())
 

@@ -11,8 +11,11 @@ from pathlib import Path
 from db import DEFAULT_DB_PATH, connect as _connect, connect_db
 from history_enrichment import (
     RESULT_SUMMARY_MAX_CHARS,
+    generate_summary_async,
     generate_summary,
+    generate_tags_async,
     generate_tags,
+    store_embedding_async,
     store_embedding,
 )
 from history_store import (
@@ -75,7 +78,7 @@ class HistoryRecorder:
             result_summary="Found 15 works...", result_size=4200, duration_ms=340,
         )
 
-        session.end()  # generates summary, tags, and embeddings
+        await session.end_async()  # generates summary, tags, and embeddings
     """
 
     def __init__(self, db_path: Path = DEFAULT_DB_PATH):
@@ -133,6 +136,82 @@ class ConversationSession:
         tts_model: str | None = None,
     ) -> int:
         """Record a message and return its ID."""
+        msg_id = self._insert_message(
+            role=role,
+            content=content,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            parent_message_id=parent_message_id,
+            is_retry=is_retry,
+            error=error,
+            stt_model=stt_model,
+            stt_confidence=stt_confidence,
+            audio_duration_ms=audio_duration_ms,
+            tts_model=tts_model,
+        )
+
+        # Embed user and assistant messages (best-effort, non-blocking)
+        if role in ("user", "assistant") and content:
+            store_embedding(self.conn, "message_embeddings", "message_id", msg_id, content)
+
+        return msg_id
+
+    async def add_message_async(
+        self,
+        role: str,
+        content: str,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+        parent_message_id: int | None = None,
+        is_retry: bool = False,
+        error: str | None = None,
+        stt_model: str | None = None,
+        stt_confidence: float | None = None,
+        audio_duration_ms: int | None = None,
+        tts_model: str | None = None,
+    ) -> int:
+        msg_id = self._insert_message(
+            role=role,
+            content=content,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            parent_message_id=parent_message_id,
+            is_retry=is_retry,
+            error=error,
+            stt_model=stt_model,
+            stt_confidence=stt_confidence,
+            audio_duration_ms=audio_duration_ms,
+            tts_model=tts_model,
+        )
+
+        if role in ("user", "assistant") and content:
+            await store_embedding_async(self.conn, "message_embeddings", "message_id", msg_id, content)
+
+        return msg_id
+
+    def _insert_message(
+        self,
+        *,
+        role: str,
+        content: str,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+        parent_message_id: int | None = None,
+        is_retry: bool = False,
+        error: str | None = None,
+        stt_model: str | None = None,
+        stt_confidence: float | None = None,
+        audio_duration_ms: int | None = None,
+        tts_model: str | None = None,
+    ) -> int:
         now = _now()
         cursor = self.conn.execute(
             """INSERT INTO messages (
@@ -170,11 +249,6 @@ class ConversationSession:
 
         # Track for summary generation
         self._messages_for_summary.append({"role": role, "content": content})
-
-        # Embed user and assistant messages (best-effort, non-blocking)
-        if role in ("user", "assistant") and content:
-            store_embedding(self.conn, "message_embeddings", "message_id", msg_id, content)
-
         return msg_id
 
     def add_tool_call(
@@ -227,14 +301,7 @@ class ConversationSession:
         """Finalize the conversation: set ended_at, generate summary and tags."""
         if self._closed:
             return
-        elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
-        now = _now()
-
-        self.conn.execute(
-            "UPDATE conversations SET ended_at = ?, total_duration_ms = ? WHERE id = ?",
-            (now, elapsed_ms, self.conv_id),
-        )
-        self.conn.commit()
+        self._finalize_conversation_row()
 
         # Generate summary
         summary = generate_summary(self._messages_for_summary)
@@ -249,6 +316,44 @@ class ConversationSession:
 
         # Generate tags
         tags = generate_tags(self._messages_for_summary)
+        self._store_tags(tags)
+        self.conn.close()
+        self._closed = True
+
+    async def end_async(self):
+        """Finalize the conversation without blocking the event loop on remote calls."""
+        if self._closed:
+            return
+        self._finalize_conversation_row()
+
+        summary = await generate_summary_async(self._messages_for_summary)
+        if summary:
+            self.conn.execute(
+                "UPDATE conversations SET summary = ? WHERE id = ?",
+                (summary, self.conv_id),
+            )
+            self.conn.commit()
+            await store_embedding_async(self.conn, "summary_embeddings", "conversation_id", self.conv_id, summary)
+            log.info("Conversation %d summary: %s", self.conv_id, summary[:80])
+
+        tags = await generate_tags_async(self._messages_for_summary)
+        self._store_tags(tags)
+        self.conn.close()
+        self._closed = True
+
+    def _finalize_conversation_row(self):
+        if self._closed:
+            return
+        elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
+        now = _now()
+
+        self.conn.execute(
+            "UPDATE conversations SET ended_at = ?, total_duration_ms = ? WHERE id = ?",
+            (now, elapsed_ms, self.conv_id),
+        )
+        self.conn.commit()
+
+    def _store_tags(self, tags: list[str]):
         for tag_name in tags:
             self.conn.execute(
                 "INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag_name,)
@@ -265,5 +370,3 @@ class ConversationSession:
         self.conn.commit()
         if tags:
             log.info("Conversation %d tags: %s", self.conv_id, tags)
-        self.conn.close()
-        self._closed = True
