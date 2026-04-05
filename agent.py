@@ -5,10 +5,10 @@ import uuid
 import logging
 from collections.abc import AsyncGenerator
 
-from config import LLM_CHAIN, MAX_TOOL_ROUNDS, TOOL_LABELS
 from conversation import Conversation
 from mcp_manager import MCPManager
 from service_clients import llm_client
+from settings import settings
 import tools as local_tools
 
 log = logging.getLogger(__name__)
@@ -48,18 +48,18 @@ async def stream_agent_turn(
     conversation.add_user(user_text)
     conversation.trim()
 
-    for round_num in range(MAX_TOOL_ROUNDS):
+    for round_num in range(settings.max_tool_rounds):
         messages = conversation.get_messages()
 
         # On later rounds, nudge the LLM to wrap up instead of spiraling
-        if round_num >= MAX_TOOL_ROUNDS - 2:
+        if round_num >= settings.max_tool_rounds - 2:
             messages = messages + [{
                 "role": "system",
                 "content": "You have used many tool calls. Summarize what you've found so far and respond to the user now. Do not make more tool calls.",
             }]
 
         payload = {
-            "model": LLM_CHAIN[0]["model"],
+            "model": settings.llm_chain[0]["model"],
             "messages": messages,
             "stream": True,
         }
@@ -152,7 +152,7 @@ async def stream_agent_turn(
                 args_str = tc["arguments"]
 
                 if status_callback:
-                    label = TOOL_LABELS.get(name, name)
+                    label = settings.tool_labels.get(name, name)
                     await status_callback(f"{label}...")
 
                 try:

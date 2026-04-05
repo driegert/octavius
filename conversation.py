@@ -1,11 +1,11 @@
 from datetime import datetime
 
-from config import SYSTEM_PROMPT, MAX_CONVERSATION_MESSAGES
+from settings import settings
 
 
 def _build_system_prompt() -> str:
     now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-    return f"{SYSTEM_PROMPT}\n\nCurrent date and time: {now}"
+    return f"{settings.system_prompt}\n\nCurrent date and time: {now}"
 
 
 class Conversation:
@@ -48,8 +48,8 @@ class Conversation:
     def trim(self):
         """Keep system prompt + last N messages to stay within context."""
         non_system = self._messages[1:]
-        if len(non_system) > MAX_CONVERSATION_MESSAGES:
-            self._messages = [self._messages[0]] + non_system[-MAX_CONVERSATION_MESSAGES:]
+        if len(non_system) > settings.max_conversation_messages:
+            self._messages = [self._messages[0]] + non_system[-settings.max_conversation_messages:]
 
     def reset(self):
         self._messages = [{"role": "system", "content": _build_system_prompt()}]

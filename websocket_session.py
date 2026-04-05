@@ -14,8 +14,9 @@ except ModuleNotFoundError:
 
     class WebSocketDisconnect(RuntimeError):
         pass
-from config import LLM_CHAIN, TTS_MODEL, TTS_VOICE
 from conversation import Conversation
+from reader_playback import stream_reader_audio
+from settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class WebSocketSessionState:
     history: object
     mcp_manager: object
     conversation: Conversation = field(default_factory=Conversation)
-    voice: str = TTS_VOICE
+    voice: str = settings.tts.voice
     tts_enabled: bool = True
     reader_task: asyncio.Task | None = None
     item_conversations: dict[int, Conversation] = field(default_factory=dict)
@@ -75,7 +76,7 @@ class WebSocketSessionHandler:
         self.state.history_session = self.state.history.start_conversation(
             service="octavius",
             source="voice",
-            model=LLM_CHAIN[0]["model"],
+            model=settings.llm_chain[0]["model"],
         )
         await self.send_payload(
             {
@@ -135,7 +136,8 @@ class WebSocketSessionHandler:
         old_conv_id = data.get("conversation_id")
         if not old_conv_id:
             return
-        msgs = get_conversation_messages(self.state.history.conn, old_conv_id)
+        with self.state.history.connect() as conn:
+            msgs = get_conversation_messages(conn, old_conv_id)
         if msgs:
             self.state.conversation.load_from_history(msgs)
             log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
@@ -167,7 +169,8 @@ class WebSocketSessionHandler:
         conv_id = data.get("conversation_id")
         if not conv_id:
             return
-        msgs = get_conversation_messages(self.state.history.conn, conv_id)
+        with self.state.history.connect() as conn:
+            msgs = get_conversation_messages(conn, conv_id)
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
@@ -207,13 +210,12 @@ class WebSocketSessionHandler:
         await self.run_turn(user_text, source="text")
 
     async def handle_reader_play(self, data: dict):
-        import reader
         await self.cancel_reader_task()
         self.state.reader_task = asyncio.create_task(
-            reader.stream_reader_audio(
+            stream_reader_audio(
                 self.ws,
                 data["doc_id"],
-                self.state.history.conn,
+                self.state.history.db_path,
                 chunk_index=data.get("chunk_index", 0),
                 sentence_index=data.get("sentence_index", 0),
                 voice=data.get("voice", self.state.voice),
@@ -234,7 +236,8 @@ class WebSocketSessionHandler:
             set_item_chat_conversation,
         )
         item_id = data.get("item_id")
-        item = get_saved_item(self.state.history.conn, item_id)
+        with self.state.history.connect() as conn:
+            item = get_saved_item(conn, item_id)
         if not item:
             await self.send_payload(
                 {
@@ -245,9 +248,11 @@ class WebSocketSessionHandler:
             )
             return
 
-        chat_conv_id = get_item_chat_conversation_id(self.state.history.conn, item_id)
+        with self.state.history.connect() as conn:
+            chat_conv_id = get_item_chat_conversation_id(conn, item_id)
         if chat_conv_id:
-            msgs = get_conversation_messages(self.state.history.conn, chat_conv_id)
+            with self.state.history.connect() as conn:
+                msgs = get_conversation_messages(conn, chat_conv_id)
             conversation = create_item_conversation(item, item_id)
             for message in msgs:
                 if message["role"] in ("user", "assistant") and message.get("content"):
@@ -257,7 +262,7 @@ class WebSocketSessionHandler:
             self.state.item_history_sessions[item_id] = self.state.history.start_conversation(
                 service="octavius",
                 source="inbox_chat",
-                model=LLM_CHAIN[0]["model"],
+                model=settings.llm_chain[0]["model"],
             )
             history_pairs = [
                 {"role": message["role"], "content": message["content"]}
@@ -277,10 +282,11 @@ class WebSocketSessionHandler:
         history_session = self.state.history.start_conversation(
             service="octavius",
             source="inbox_chat",
-            model=LLM_CHAIN[0]["model"],
+            model=settings.llm_chain[0]["model"],
         )
         self.state.item_history_sessions[item_id] = history_session
-        set_item_chat_conversation(self.state.history.conn, item_id, history_session.conv_id)
+        with self.state.history.connect() as conn:
+            set_item_chat_conversation(conn, item_id, history_session.conv_id)
         await self.send_payload({"type": "item_chat_loaded", "item_id": item_id, "messages": []})
 
     async def handle_item_chat(self, data: dict):
@@ -328,7 +334,7 @@ class WebSocketSessionHandler:
             history_session.add_message(
                 role="assistant",
                 content=full_reply,
-                model=LLM_CHAIN[0]["model"],
+                model=settings.llm_chain[0]["model"],
                 latency_ms=latency_ms,
             )
 
@@ -348,17 +354,19 @@ class WebSocketSessionHandler:
             old_session.end()
         self.state.item_conversations.pop(item_id, None)
 
-        item = get_saved_item(self.state.history.conn, item_id)
+        with self.state.history.connect() as conn:
+            item = get_saved_item(conn, item_id)
         if item:
             conversation = create_item_conversation(item, item_id)
             self.state.item_conversations[item_id] = conversation
             history_session = self.state.history.start_conversation(
                 service="octavius",
                 source="inbox_chat",
-                model=LLM_CHAIN[0]["model"],
+                model=settings.llm_chain[0]["model"],
             )
             self.state.item_history_sessions[item_id] = history_session
-            set_item_chat_conversation(self.state.history.conn, item_id, history_session.conv_id)
+            with self.state.history.connect() as conn:
+                set_item_chat_conversation(conn, item_id, history_session.conv_id)
 
         await self.send_payload({"type": "item_chat_loaded", "item_id": item_id, "messages": []})
 
@@ -434,9 +442,9 @@ class WebSocketSessionHandler:
             self.state.history_session.add_message(
                 role="assistant",
                 content=full_reply,
-                model=LLM_CHAIN[0]["model"],
+                model=settings.llm_chain[0]["model"],
                 latency_ms=latency_ms,
-                tts_model=TTS_MODEL if self.state.tts_enabled else None,
+                tts_model=settings.tts.model if self.state.tts_enabled else None,
             )
 
         await self.send_json("status", "audio_done")

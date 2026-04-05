@@ -1,13 +1,33 @@
 import json
 import logging
+import threading
+from dataclasses import dataclass, field
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+import numpy as np
+import requests
 
 from settings import settings
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class EndpointStats:
+    attempts: int = 0
+    successes: int = 0
+    failures: int = 0
+
+
+@dataclass
+class RequestOutcome:
+    url: str | None
+    model: str | None
+    attempts: int
+    failed_urls: list[str] = field(default_factory=list)
+    error: str | None = None
 
 
 class STTClient:
@@ -64,22 +84,132 @@ class TTSClient:
 class LLMChainClient:
     def __init__(self, chain: list[dict]):
         self.chain = chain
+        self._lock = threading.Lock()
+        self._total_requests = 0
+        self._failover_requests = 0
+        self._terminal_failures = 0
+        self._last_success_url: str | None = None
+        self._last_success_model: str | None = None
+        self._last_failure_error: str | None = None
+        self._last_request_attempts = 0
+        self._last_request_failed_urls: list[str] = []
+        self._last_request_used_fallback = False
+        self._endpoint_stats = {
+            entry["url"]: EndpointStats()
+            for entry in self.chain
+        }
+
+    def _record_success(self, outcome: RequestOutcome):
+        if not outcome.url:
+            return
+        with self._lock:
+            self._total_requests += 1
+            if outcome.attempts > 1:
+                self._failover_requests += 1
+            stats = self._endpoint_stats.setdefault(outcome.url, EndpointStats())
+            stats.successes += 1
+            self._last_success_url = outcome.url
+            self._last_success_model = outcome.model
+            self._last_failure_error = None
+            self._last_request_attempts = outcome.attempts
+            self._last_request_failed_urls = list(outcome.failed_urls)
+            self._last_request_used_fallback = outcome.attempts > 1
+
+            for failed_url in outcome.failed_urls:
+                failed_stats = self._endpoint_stats.setdefault(failed_url, EndpointStats())
+                failed_stats.failures += 1
+
+    def _record_failure(self, outcome: RequestOutcome):
+        with self._lock:
+            self._total_requests += 1
+            self._terminal_failures += 1
+            self._last_failure_error = outcome.error
+            self._last_request_attempts = outcome.attempts
+            self._last_request_failed_urls = list(outcome.failed_urls)
+            self._last_request_used_fallback = outcome.attempts > 1
+            for failed_url in outcome.failed_urls:
+                failed_stats = self._endpoint_stats.setdefault(failed_url, EndpointStats())
+                failed_stats.failures += 1
+
+    def _mark_attempt(self, url: str):
+        with self._lock:
+            stats = self._endpoint_stats.setdefault(url, EndpointStats())
+            stats.attempts += 1
+
+    def get_health(self) -> dict:
+        with self._lock:
+            endpoints = [
+                {
+                    "url": entry["url"],
+                    "model": entry["model"],
+                    "attempts": self._endpoint_stats.get(entry["url"], EndpointStats()).attempts,
+                    "successes": self._endpoint_stats.get(entry["url"], EndpointStats()).successes,
+                    "failures": self._endpoint_stats.get(entry["url"], EndpointStats()).failures,
+                }
+                for entry in self.chain
+            ]
+            return {
+                "configured_endpoints": len(self.chain),
+                "total_requests": self._total_requests,
+                "failover_requests": self._failover_requests,
+                "terminal_failures": self._terminal_failures,
+                "last_success_url": self._last_success_url,
+                "last_success_model": self._last_success_model,
+                "last_failure_error": self._last_failure_error,
+                "last_request_attempts": self._last_request_attempts,
+                "last_request_failed_urls": list(self._last_request_failed_urls),
+                "last_request_used_fallback": self._last_request_used_fallback,
+                "endpoints": endpoints,
+            }
 
     @asynccontextmanager
     async def stream_chat(self, payload: dict) -> AsyncIterator[httpx.Response]:
+        failed_urls: list[str] = []
         async with httpx.AsyncClient(timeout=120.0) as client:
             for i, entry in enumerate(self.chain):
+                self._mark_attempt(entry["url"])
                 try:
                     request_payload = dict(payload)
                     request_payload["model"] = entry["model"]
+                    if i > 0:
+                        log.warning(
+                            "LLM failover attempt %d/%d via %s",
+                            i + 1,
+                            len(self.chain),
+                            entry["url"],
+                        )
                     async with client.stream("POST", entry["url"], json=request_payload) as resp:
                         resp.raise_for_status()
+                        self._record_success(
+                            RequestOutcome(
+                                url=entry["url"],
+                                model=entry["model"],
+                                attempts=i + 1,
+                                failed_urls=failed_urls,
+                            )
+                        )
+                        if failed_urls:
+                            log.warning(
+                                "LLM request succeeded via fallback %s after failures on %s",
+                                entry["url"],
+                                ", ".join(failed_urls),
+                            )
                         yield resp
                         return
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    failed_urls.append(entry["url"])
                     if i < len(self.chain) - 1:
                         log.warning("LLM %s failed (%s), trying next", entry["url"], exc)
                     else:
+                        self._record_failure(
+                            RequestOutcome(
+                                url=None,
+                                model=None,
+                                attempts=i + 1,
+                                failed_urls=failed_urls,
+                                error=str(exc),
+                            )
+                        )
                         raise
 
     async def complete(self, payload: dict, *, urls: list[str] | None = None) -> str | None:
@@ -87,16 +217,102 @@ class LLMChainClient:
         model = payload.get("model") or self.chain[0]["model"]
         request_payload = dict(payload)
         request_payload["model"] = model
+        failed_urls: list[str] = []
         async with httpx.AsyncClient(timeout=120.0) as client:
-            for url in target_urls:
+            for i, url in enumerate(target_urls):
+                self._mark_attempt(url)
                 try:
+                    if i > 0:
+                        log.warning(
+                            "LLM failover attempt %d/%d via %s",
+                            i + 1,
+                            len(target_urls),
+                            url,
+                        )
                     resp = await client.post(url, json=request_payload)
                     resp.raise_for_status()
-                    return resp.json()["choices"][0]["message"]["content"].strip()
-                except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, KeyError, IndexError, json.JSONDecodeError):
+                    text = resp.json()["choices"][0]["message"]["content"].strip()
+                    self._record_success(
+                        RequestOutcome(
+                            url=url,
+                            model=model,
+                            attempts=i + 1,
+                            failed_urls=failed_urls,
+                        )
+                    )
+                    if failed_urls:
+                        log.warning(
+                            "LLM request succeeded via fallback %s after failures on %s",
+                            url,
+                            ", ".join(failed_urls),
+                        )
+                    return text
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, KeyError, IndexError, json.JSONDecodeError) as exc:
+                    failed_urls.append(url)
                     log.debug("Completion failed via %s", url, exc_info=True)
                     continue
+        self._record_failure(
+            RequestOutcome(
+                url=None,
+                model=model,
+                attempts=len(target_urls),
+                failed_urls=failed_urls,
+                error="All LLM endpoints failed",
+            )
+        )
         return None
+
+
+class SummaryClient:
+    def __init__(self, primary_url: str, fallback_url: str):
+        self.urls = [primary_url, fallback_url]
+
+    def complete(self, payload: dict, *, timeout: int) -> str | None:
+        failed_urls: list[str] = []
+        for i, url in enumerate(self.urls):
+            try:
+                if i > 0:
+                    log.warning(
+                        "Summary fallback attempt %d/%d via %s",
+                        i + 1,
+                        len(self.urls),
+                        url,
+                    )
+                resp = requests.post(url, json=payload, timeout=timeout)
+                resp.raise_for_status()
+                text = resp.json()["choices"][0]["message"]["content"].strip()
+                if failed_urls:
+                    log.warning(
+                        "Summary request succeeded via fallback %s after failures on %s",
+                        url,
+                        ", ".join(failed_urls),
+                    )
+                return text
+            except Exception:
+                failed_urls.append(url)
+                log.debug("Summary completion failed via %s", url, exc_info=True)
+                continue
+        return None
+
+
+class EmbeddingClient:
+    def __init__(self, base_url: str, model: str):
+        self.base_url = base_url
+        self.model = model
+
+    def embed_text(self, text: str, *, timeout: int) -> bytes | None:
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": self.model, "prompt": text},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            vec = np.array(resp.json()["embedding"], dtype=np.float32)
+            return vec.tobytes()
+        except Exception:
+            log.debug("Embedding request failed", exc_info=True)
+            return None
 
 
 stt_client = STTClient(settings.stt_url)
@@ -114,3 +330,5 @@ tts_client = TTSClient(
     response_format=settings.tts.format,
 )
 llm_client = LLMChainClient(settings.llm_chain)
+summary_client = SummaryClient(settings.summary_url, settings.summary_fallback_url)
+embedding_client = EmbeddingClient(settings.ollama_base_url, settings.ollama_model)

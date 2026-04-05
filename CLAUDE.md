@@ -1,145 +1,311 @@
-# Octavius — Voice Assistant
+# Octavius
 
-Self-hosted voice assistant running on Dave's homelab. No cloud APIs, everything stays on the Tailnet.
+Self-hosted voice assistant running on Dave's homelab. No cloud APIs; runtime traffic stays on the Tailnet.
 
-## Quick Start
+## Purpose
+
+This file is the high-signal working context for contributors and coding agents:
+
+- what Octavius is
+- how to run and validate it
+- where the main responsibilities live
+- which areas are still risky or incomplete
+
+It is not intended to be a release log. Keep transient change notes brief and move longer design or roadmap material into separate docs.
+
+## Runbook
+
+Install dependencies:
 
 ```bash
 uv sync
-systemctl --user start octavius
 ```
 
-Runs as a systemd user service on `127.0.0.1:8030`, accessed via Caddy reverse proxy at `https://octavius.riegert.xyz`. Restart with `systemctl --user restart octavius`.
+Run locally in the foreground:
+
+```bash
+uv run python main.py
+```
+
+Run via the normal user service:
+
+```bash
+systemctl --user start octavius
+systemctl --user restart octavius
+```
+
+Service endpoint:
+
+- FastAPI binds to `127.0.0.1:8030`
+- Caddy exposes it at `https://octavius.riegert.xyz`
+
+Primary UI routes:
+
+- `/` main voice UI
+- `/inbox` knowledge inbox
+- `/reader` document reader
+
+## Validation Workflow
+
+Before or after backend changes:
+
+```bash
+python -m unittest discover -s tests
+```
+
+After changes to request routing, WebSocket behavior, reader flows, or inbox flows:
+
+1. Start the app.
+2. Open `/`, `/inbox`, and `/reader`.
+3. Confirm the WebSocket connects from the browser.
+4. Confirm inbox list/load/update still works.
+5. Confirm reader document listing and ingest path still work.
+6. Check `/health` and confirm `alive`, `ready`, and `degraded` match expectations.
+7. Confirm the `llm_chain` section matches the expected endpoint order and current failover state.
+8. If startup is degraded, inspect the `mcp.servers` section to see which MCP backends failed to connect.
+
+When touching external-service boundaries, verify the configured endpoints are reachable before assuming an application bug.
 
 ## Architecture
 
-Browser (WebSocket) -> FastAPI agent -> STT/LLM/TTS + MCP tools
+High-level path:
 
-- **STT**: Whisper at `127.0.0.1:8502/api/transcribe` (local on lilbuddy)
-- **LLM**: Qwen3.5-35B-A3B at `lilripper:8020/v1/chat/completions` (llama.cpp, 2 slots)
-- **TTS**: Voxtral 4B at `triplestuffed:8020/v1/audio/speech` (vLLM-Omni), fallback Kokoro at `lilbuddy:8880`
-- **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions` (math-to-speech conversion)
-- **MCP Servers**:
-  - `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
-  - `searxng`: stdio subprocess via `uv` (local)
-  - `openalex`: stdio subprocess via npm (local)
-  - `vikunja-tasks`: streamable HTTP at `triplestuffed:8252/mcp`
-  - `document-processing`: stdio subprocess (local wrapper, processes on lilripper:8251/mcp)
+```text
+Browser (WebSocket) -> FastAPI app -> agent/session logic -> local tools + MCP tools + STT/TTS/LLM services
+```
 
-## Project Structure
+External services currently expected:
 
-- `config.py` — All endpoints, model config, MCP server definitions, system prompt, tool labels
-- `stt.py` — Whisper HTTP client
-- `tts.py` — Voxtral HTTP client (with Kokoro fallback)
-- `mcp_manager.py` — MCP client lifecycle (stdio + HTTP), tool routing, result truncation (4000 chars), auto-reconnect on `ClosedResourceError`/broken pipe/EOF
-- `conversation.py` — Chat history with trim/reset/load-from-history
-- `agent.py` — Agentic loop (LLM <-> tool calls, `<think>` tag stripping, sentence buffering, tool-spiral prevention)
-- `tools.py` — Local tools: `download_file`, `save_to_inbox`, `read_document`, `process_pdf` (background), `read_item_content`
-- `reader.py` — Document reader: ingest pipeline, markdown chunking, LLM math-to-speech, HTML extraction via trafilatura, audio streaming
-- `history.py` — Conversation recording, summary/tag generation (max_tokens >= 1024 for `<think>` tags), knowledge inbox CRUD, embeddings
-- `schema.sql` — SQLite+vec schema (conversations, messages, tool_calls, saved_items, reader_documents, embeddings)
-- `main.py` — FastAPI app, WebSocket endpoint, REST APIs for inbox/conversations/reader, session restore
-- `static/index.html` — Main voice UI (push-to-talk, toggle-to-talk, markdown rendering, collapsible text, conversation history picker, full conversation viewer)
-- `static/inbox.html` — Knowledge inbox review page with inline item chat, hard delete, marked.js
-- `static/reader.html` — Document reader with playback controls, section nav, progress bar, auto-poll for processing status
-- `static/manifest.json` — PWA manifest for Android homescreen icon (192px + 512px icons)
+- **STT**: Whisper at `127.0.0.1:8502/api/transcribe`
+- **LLM chain**: Qwen3.5-35B-A3B via `OCTAVIUS_LLM_CHAIN`, defaulting to:
+  - primary: `lilripper:8020/v1/chat/completions`
+  - first fallback: `127.0.0.1:8001/v1/chat/completions` on lilbuddy
+  - second fallback: `triplestuffed:8010/v1/chat/completions`
+- **TTS**: Voxtral 4B at `triplestuffed:8020/v1/audio/speech`
+- **TTS fallback**: Kokoro at `lilbuddy:8880`
+- **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions`
+- **Summary/tag generation**: summary chain defaults to `127.0.0.1:8001/v1/chat/completions` with fallback `triplestuffed:8010/v1/chat/completions`
+- **Embeddings**: Ollama at `workhorse:11434/api/embeddings`
 
-## Key Design Details
+Configured MCP servers:
 
-- Per-connection conversations (each WebSocket gets its own Conversation instance)
-- Session persistence: conversation ID stored in localStorage, restored on reconnect/page navigation via `restore_session` WebSocket message
-- WebSocket carries binary (audio) and JSON text messages for multiple features:
-  - Voice: status, transcript, response, reset, restore_session, session_id, load_conversation, conversation_loaded
-  - Reader: reader_play, reader_pause, reader_stop, reader_position, reader_audio_done
-  - Item chat: item_chat, item_chat_load, item_chat_reset, item_chat_response, item_chat_loaded, item_chat_status
-- Agent buffers sentences during tool-call rounds; discards them if tools fire (prevents duplicate speech). Only yields sentences when the LLM produces a final text response.
-- Tool-spiral prevention: on rounds 5-6 of 7, a system message nudges the LLM to summarize and stop calling tools
-- Tool status shows friendly labels (e.g. "Web Search...", "Creating Task...") via `TOOL_LABELS` map in config.py
-- MCP reconnection detects `ClosedResourceError`, broken pipe, EOF (not just "session terminated")
-- Agent strips `<think>...</think>` tags from Qwen3.5 before sending to TTS
-- Tool call IDs are generated as fallback UUIDs when llama.cpp omits them
-- Tool results truncated to 4000 chars to protect 65K context window
-- Conversation trims to 40 messages automatically
-- Browser audio playback uses `preservesPitch` for speed control without chipmunk effect
-- Silence trimming done client-side via Web Audio API
-- Assistant text renders as markdown via marked.js (CDN)
-- Mobile-optimized layout (max-width 448px) with collapsible user/assistant text areas
-- `process_pdf` tool runs PDF conversion in the background (non-blocking) and saves result to inbox
-- Full conversation viewer: overlay panel showing all prior turns in the session
+- `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
+- `searxng`: stdio subprocess via `uv`
+- `openalex`: stdio subprocess via `npm`
+- `vikunja-tasks`: streamable HTTP at `triplestuffed:8252/mcp`
+- `document-processing`: local stdio wrapper around remote processing on `lilripper:8251/mcp`
 
-## Knowledge Inbox
+## Key Runtime Behavior
 
-Saved items table in `octavius_history.db` for content that should be reviewed later.
-Items have types: `note`, `search_summary`, `article`, `email_draft`. Status flow:
-`pending` -> `done` or `dismissed`. Hard delete available via `DELETE /api/inbox/{id}`.
+- Each WebSocket connection gets its own `Conversation` instance.
+- Conversation IDs are persisted in browser `localStorage` and restored with `restore_session`.
+- The WebSocket carries both binary audio and JSON messages.
+- The agent buffers sentences during tool-call rounds and only emits final spoken text when tool use is complete.
+- Tool-call rounds are capped and nudged to stop around rounds 5-6 of 7.
+- Tool results are truncated to 4000 characters to protect context budget.
+- Qwen `<think>...</think>` output is stripped before user-visible text or TTS.
+- Conversation history trims automatically to 40 messages.
+- `/health` distinguishes `alive`, `ready`, and `degraded` states.
+- `/health` exposes per-server MCP connection status plus `llm_chain` observability including configured endpoints, failover count, terminal failures, and the last successful endpoint.
 
-- **Octavius saves via**: `save_to_inbox` local tool in `tools.py`
-- **Claude Code saves via**: `save_to_inbox` MCP tool in `mcp-tools/server_history.py`
-- **Review UI**: `static/inbox.html` served at `/inbox`, with search, filters, action buttons, and delete
-- **REST API**: `GET /api/inbox`, `GET /api/inbox/{id}`, `PATCH /api/inbox/{id}`, `DELETE /api/inbox/{id}`
-- **Semantic search**: Embeddings via bge-m3 on workhorse (Ollama)
-- **Inline chat**: Each item has a persistent chat conversation with Octavius. The LLM
-  sees a preview of the item content (first 500 chars) and can use `read_item_content`
-  to fetch chunks of long content on demand (avoids blowing context window). Conversations
-  are linked via `chat_conversation_id` on the saved item. Reset clears and starts fresh.
+WebSocket message families:
 
-## Document Reader
+- Voice: `status`, `transcript`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`
+- Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
+- Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
 
-Converts documents (PDF, markdown, HTML articles) to speech with math-to-speech conversion.
-Accessible at `/reader`.
+## Code Map
 
-- **Ingest**: File path, URL, or from inbox items. PDFs converted via document-processing MCP.
-  HTML pages extracted via trafilatura (strips boilerplate, ads, navigation).
-- **Titles**: Extracted from HTML `<title>` tag / trafilatura metadata with site name appended
-  in parentheses. Falls back to first heading or first line for plain text.
-- **Math conversion**: Only paragraphs containing `$...$` are sent to Qwen3.5-9B at
-  `lilripper:8010`. Non-math paragraphs just get markdown stripped. Citations (author-year
-  and numeric), HTML artifacts, and LaTeX remnants are cleaned by `_clean_for_speech()`.
-- **Storage**: Speech-ready JSON files in `/home/dave/octavius-reader/`. Metadata in
-  `reader_documents` table. Position (last_chunk, last_sentence) persisted to DB.
-- **Playback**: Server streams TTS sentence-by-sentence over WebSocket. Client queues audio
-  with paired position data so read-along text syncs with actual playback (not receipt).
-- **Controls**: Play/pause (with 100ms debounce for clean state transitions), section
-  navigation, progress bar seeking, speed control, voice selection.
-- **Auto-poll**: Document list refreshes every 5s while any document is "processing".
+Core runtime:
 
-## Conversation History
+- `main.py` - FastAPI app creation, startup wiring, shared top-level routes, WebSocket entrypoint
+- `db.py` - SQLite connection helpers and short-lived connection context manager
+- `settings.py` - env-backed runtime settings and defaults
+- `runtime.py` - shared runtime handle for MCP manager access
+- `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
+- `stt.py` - thin STT wrapper
+- `tts.py` - thin TTS wrapper
 
-All conversations are recorded to `octavius_history.db` (SQLite+vec). See `history.py`
-for the recording API and `schema.sql` for the database schema. Summaries and topic tags
-are auto-generated via Qwen 3.5 when a conversation ends (requires max_tokens >= 1024
-to accommodate `<think>` tags, timeout 60s). The database is shared across all AI services
-(Octavius, Claude Code, etc.) and queryable via the conversation-history MCP server at
-`mcp-tools/server_history.py`.
+Route modules:
 
-Previous conversations can be resumed from the browser UI via the history picker,
-which sends a `load_conversation` WebSocket message to restore the LLM context.
-Conversations persist across page navigations via localStorage + `restore_session`.
+- `routes/inbox.py` - inbox page and inbox REST API routes
+- `routes/conversations.py` - conversation history API routes
+- `routes/reader_api.py` - reader page and reader REST API routes
 
-## UI Layout
+Conversation and tool loop:
 
-- **Top left**: Settings (gear icon), Conversation History (chat bubbles icon)
-- **Top right**: Knowledge Inbox (brain/inbox icon), Document Reader (book/speaker icon)
-- All icons are 32x32px images with 44x44px tap targets for mobile usability
-- Custom icons in `static/icon-*.png`
-- Favicon and PWA icon: `octavius-dapper_cyber_punk.png`
+- `conversation.py` - chat history state with trim/reset/load support
+- `agent.py` - LLM loop, tool calling, output cleanup, tool-spiral prevention
+- `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
+- `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
+- `tools.py` - public local-tool entrypoint used by the agent loop
+- `local_tool_specs.py` - local tool schemas
+- `local_tool_registry.py` - local tool handler registry and dispatch
+- `local_tool_downloads.py` - local download filename logic and download tool execution
+- `local_tool_inbox.py` - local inbox save/read helpers used by tool handlers
+- `local_tool_reader.py` - local reader handoff and background PDF-processing helpers
 
-## MCP Server Access from Claude Code
+Reader pipeline:
 
-Configured in `~/.claude.json`:
+- `document_sources.py` - file/source sniffing, decoding, PDF detection
+- `reader_ingest_service.py` - narrow entrypoints for starting and retrying reader ingest jobs
+- `reader_ingest_handlers.py` - source-specific ingest handlers for files, URLs, PDFs, retry scheduling, and conversion polling
+- `reader_store.py` - reader document CRUD, speech-file lookup, and stale-job cleanup
+- `reader_text.py` - markdown chunking, math-to-speech conversion, and speech JSON generation
+- `reader_playback.py` - sentence-by-sentence playback streaming over WebSocket
+
+History and inbox:
+
+- `history.py` - DB bootstrap, conversation/session recording, and compatibility re-exports for history/inbox helpers
+- `history_enrichment.py` - embeddings, summaries, topic tags
+- `history_store.py` - conversation queries, inbox CRUD/search, stats
+- `schema.sql` - SQLite+vec schema
+
+Frontend:
+
+- `static/app-common.js` - shared browser helpers for WebSocket setup, HTML escaping, and voice-list loading
+- `static/index-audio.js` - streamed TTS queue, silence trimming, and browser audio playback helper for the main voice UI
+- `static/index-app.js` - main voice UI controller, settings/history overlays, transcript rendering, and WebSocket client logic
+- `static/inbox-app.js` - inbox page behavior, filtering, expansion, and item-chat client logic
+- `static/reader-app.js` - reader page behavior, document list, retry flow, and playback client logic
+- `static/index.html` - main voice UI shell
+- `static/inbox.html` - inbox review UI with inline item chat
+- `static/reader.html` - reader UI with playback controls and polling
+- `static/manifest.json` - PWA manifest
+
+Tests:
+
+- `tests/test_main.py`
+- `tests/test_conversation.py`
+- `tests/test_mcp_manager.py`
+- `tests/test_reader.py`
+- `tests/test_reader_ingest_handlers.py`
+- `tests/test_reader_ingest_service.py`
+- `tests/test_document_sources.py`
+- `tests/test_websocket_session.py`
+- `tests/test_history_enrichment.py`
+- `tests/test_history_store.py`
+- `tests/test_local_tool_handlers.py`
+- `tests/test_local_tool_reader.py`
+- `tests/test_local_tool_registry.py`
+
+## Feature Notes
+
+### Knowledge Inbox
+
+- Stored in `octavius_history.db` as saved items for later review.
+- Item types: `note`, `search_summary`, `article`, `email_draft`
+- Status flow: `pending` -> `done` or `dismissed`
+- Hard delete is supported through `DELETE /api/inbox/{id}`
+- Inbox semantic search uses bge-m3 embeddings on workhorse via Ollama
+- Each inbox item can have a persistent item-chat conversation
+
+### Document Reader
+
+- Accepts local files, URLs, and inbox items.
+- Converts PDF, markdown, and extracted HTML content into speech-oriented JSON.
+- HTML extraction uses trafilatura.
+- Math-heavy paragraphs are sent to the reader LLM; non-math paragraphs are cleaned locally.
+- Playback is streamed sentence-by-sentence over WebSocket with position sync.
+- Document list auto-polls while any document is still `processing`.
+- Failed reader documents can be retried from the stored source metadata via `POST /api/reader/documents/{id}/retry`.
+
+Reader storage:
+
+- speech-ready JSON files: `/home/dave/octavius-reader/`
+- metadata: `reader_documents` table
+
+### Conversation History
+
+- Conversations are recorded in `octavius_history.db`.
+- Summaries and topic tags are generated when a conversation ends.
+- History can be resumed from the browser UI through `load_conversation`.
+- The same DB is shared with other AI services and exposed through the conversation-history MCP server.
+- Request handlers and background reader jobs use short-lived SQLite connections; live conversation history sessions keep their own dedicated connection until the session ends.
+
+## Contributor Guidance
+
+Prefer these refactor directions:
+
+- keep core STT/TTS/LLM chat boundary code in `service_clients.py` and related wrappers
+- keep `main.py` focused on routing and startup, not orchestration
+- keep local tool schemas, registry/dispatch, and handlers separate
+- keep inbox/history query logic out of route handlers
+
+When adding a feature:
+
+1. Decide whether it belongs in core voice flow, reader flow, inbox/history, or a tool/MCP boundary.
+2. Add or update tests near the affected subsystem.
+3. Update this file only if the change affects stable architecture, operational workflow, or contributor expectations.
+
+## Extending Octavius
+
+Adding functionality is straightforward now, but most changes still touch a few boundaries at once. The main design question is where the new behavior should live, not how to wire it into a monolith.
+
+Use these placement rules:
+
+- voice/session behavior belongs in `conversation.py`, `agent.py`, or `websocket_session.py`
+- new HTTP routes belong in the relevant `routes/*.py` module, with orchestration pushed down into subsystem modules
+- reader ingest and playback changes belong in the `reader_ingest_*`, `reader_store.py`, `reader_text.py`, or `reader_playback.py` modules
+- inbox/history query and persistence changes belong in `history_store.py` or `history_enrichment.py`, not in route handlers
+- local tool additions belong in `local_tool_specs.py` plus the appropriate `local_tool_*` execution module, then get registered in `local_tool_registry.py`
+- new outbound service integrations should go behind `service_clients.py` or a closely related wrapper, not inline in feature code
+
+Common extension patterns:
+
+1. Add a new local tool.
+   Update `local_tool_specs.py`, implement the behavior in the right `local_tool_*` module, register it in `local_tool_registry.py`, and add tests for both the handler behavior and dispatch path.
+
+2. Add a new reader source or ingest mode.
+   Start in `reader_ingest_service.py` for the entrypoint shape, put source-specific logic in `reader_ingest_handlers.py`, keep document metadata in `reader_store.py`, and keep markdown-to-speech logic in `reader_text.py`.
+
+3. Add a new UI action or page.
+   Put the route in the relevant router module, keep browser logic in the page-specific `static/*-app.js` file, and extend `static/app-common.js` only for behavior that is genuinely shared.
+
+4. Add a new external dependency or backend call.
+   Put timeouts, retries, fallback behavior, and health/observability hooks near the client boundary. If the dependency can fail independently, make sure `/health` or logs surface the degraded state clearly.
+
+Keep these considerations in mind:
+
+- avoid putting business logic back into `main.py`; use it for composition and top-level routes only
+- preserve short-lived SQLite connection usage for request/background work; do not reintroduce a shared app-wide connection
+- if a feature creates background tasks, decide explicitly what happens on restart and whether retry/requeue is needed
+- if a feature depends on MCP or LLM availability, think through degraded behavior and user-visible failure messages
+- if a feature changes a persisted shape or workflow, update both docs and tests in the same change
+- prefer extending existing subsystem seams over adding another thin facade layer
+
+Minimum completion bar for a new feature:
+
+1. the code is placed in the correct subsystem boundary
+2. the happy path works
+3. at least one failure or degraded-path test exists where it matters
+4. `/health`, logs, or user-visible status remain understandable if the feature depends on outside services
+5. `CLAUDE.md` is updated if the stable architecture or contributor workflow changed
+
+## Current Hotspots
+
+These are still the main places where complexity is concentrated:
+
+- `main.py` still owns a broad REST and startup surface
+- frontend behavior is now split into dedicated JS assets, but the UI still uses large static HTML shells rather than smaller components/templates
+- reader responsibilities are split more cleanly now, but ingest flow still spans several modules and background-task boundaries
+
+For current refactor notes, recent fixes, and change-oriented status, see `docs/status.md`.
+
+## Related Docs
+
+- `README.md` - short setup and development commands
+- `docs/status.md` - current refactor notes, recent fixes, and active hotspots
+- `octavius-prd.md` - broader product/design document
+- `octavius-android-design.md` - Android companion app design exploration
+
+## Claude Code Access
+
+Claude Code MCP access is configured in `~/.claude.json`.
+
+Expected entries:
+
 - `vikunja-tasks`: `http://triplestuffed:8252/mcp`
-- `conversation-history`: `http://127.0.0.1:8203/mcp` (includes inbox tools: save_to_inbox, search_inbox, list_inbox, get_inbox_item, update_inbox_item)
+- `conversation-history`: `http://127.0.0.1:8203/mcp`
 
-## Vikunja Integration
-
-System prompt includes project name/ID mapping to avoid extra tool calls. Key projects:
-Inbox (1), Teaching and Trent (9), math1052 (10), amod5240 (2), math3560 (3),
-Email Tasks (14), Personal and Professional (13), PhD (4), AI Projects (6).
-Tasks are searched with `done=false` by default.
-
-## Planned: Android App
-
-An Android companion app is under consideration. The app would wrap Octavius as a
-native Kotlin client (WebSocket audio + JSON) and run a phone-side MCP server over
-Tailscale, allowing Octavius to trigger phone actions (calls, SMS, etc.) using the
-same MCP tool pattern as other servers. Design doc: `octavius-android-design.md`
+The conversation-history server includes inbox-related tools such as `save_to_inbox`, `search_inbox`, `list_inbox`, `get_inbox_item`, and `update_inbox_item`.
