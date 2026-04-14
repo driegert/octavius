@@ -58,13 +58,20 @@ def get_document(conn: sqlite3.Connection, doc_id: int) -> dict | None:
     }
 
 
-def list_documents(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
-    rows = conn.execute(
-        """SELECT id, title, source_type, chunk_count, status, error, created_at
-           FROM reader_documents
-           ORDER BY created_at DESC LIMIT ?""",
-        (limit,),
-    ).fetchall()
+def list_documents(
+    conn: sqlite3.Connection,
+    limit: int = 50,
+    status: str | None = None,
+) -> list[dict]:
+    sql = """SELECT id, title, source_type, chunk_count, status, error, created_at
+             FROM reader_documents"""
+    params: list = []
+    if status:
+        sql += " WHERE status = ?"
+        params.append(status)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
     return [
         {"id": r[0], "title": r[1], "source_type": r[2],
          "chunk_count": r[3], "status": r[4], "error": r[5], "created_at": r[6]}

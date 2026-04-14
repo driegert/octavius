@@ -8,7 +8,8 @@ from pathlib import Path
 
 from db import connect_db
 from document_sources import ensure_pdf_suffix, is_likely_html, is_pdf_file, read_text_file
-from reader_store import create_document
+from local_tool_inbox import _format_age
+from reader_store import create_document, list_documents
 from reader_text import ingest_document
 from reader_ingest_handlers import ingest_pdf_document
 
@@ -134,9 +135,38 @@ async def process_pdf_background(args: dict, session=None, mcp_manager=None) -> 
     )
     asyncio.create_task(run_pdf_processing(session.db_path, item_id, str(source_path), title, mcp_manager))
     return (
-        f"PDF '{title}' is being processed in the background (inbox item #{item_id}). "
-        f"It will appear in the knowledge inbox when ready. You can keep talking to me in the meantime."
+        f"PDF '{title}' is being processed in the background (stash item #{item_id}). "
+        f"It will appear in the stash when ready. You can keep talking to me in the meantime."
     )
+
+
+def list_reader_documents(args: dict, session=None, _mcp_manager=None) -> str:
+    conn = session.conn if session else None
+    if conn is None:
+        return "Error: no database connection available."
+
+    status = args.get("status")
+    if status == "all":
+        status = None
+    limit = max(1, min(int(args.get("limit", 20)), 50))
+
+    docs = list_documents(conn, limit=limit, status=status)
+    if not docs:
+        suffix = f" (status={status})" if status else ""
+        return f"No reader documents found{suffix}."
+
+    header = f"Reader documents{' (status=' + status + ')' if status else ''}, showing {len(docs)}:"
+    lines = [header]
+    for doc in docs:
+        age = _format_age(doc.get("created_at"))
+        title = doc.get("title") or "(untitled)"
+        lines.append(
+            f"#{doc['id']} [{doc['status']}/{doc['source_type']}] ({age}) {title}"
+        )
+        if doc.get("status") == "failed" and doc.get("error"):
+            err = doc["error"].splitlines()[0][:200]
+            lines.append(f"    error: {err}")
+    return "\n".join(lines)
 
 
 async def run_pdf_processing(db_path: str | Path, item_id: int, file_path: str, title: str, mcp_manager=None):

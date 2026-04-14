@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -46,27 +47,65 @@ class STTClient:
 
 
 class TTSClient:
+    """
+    Primary → fallback TTS with a circuit breaker on the primary.
+
+    After PRIMARY_FAILURE_THRESHOLD consecutive failures the primary is
+    "tripped": subsequent synth calls skip it entirely and go straight to the
+    fallback for PRIMARY_COOLDOWN_SECONDS. When the cooldown elapses the next
+    call probes the primary again ("half-open"); a success closes the breaker
+    and resets the counter, a failure re-trips it.
+    """
+
+    PRIMARY_FAILURE_THRESHOLD = 3
+    PRIMARY_COOLDOWN_SECONDS = 300.0
+
     def __init__(self, primary: dict, fallback: dict, response_format: str):
         self.primary = primary
         self.fallback = fallback
         self.response_format = response_format
+        self._primary_consecutive_failures = 0
+        self._primary_skip_until = 0.0  # monotonic; 0 means breaker closed
+
+    def _primary_is_tripped(self) -> bool:
+        return time.monotonic() < self._primary_skip_until
+
+    def _record_primary_success(self) -> None:
+        if self._primary_consecutive_failures or self._primary_skip_until:
+            log.info("TTS primary recovered, closing breaker")
+        self._primary_consecutive_failures = 0
+        self._primary_skip_until = 0.0
+
+    def _record_primary_failure(self) -> None:
+        self._primary_consecutive_failures += 1
+        if self._primary_consecutive_failures >= self.PRIMARY_FAILURE_THRESHOLD:
+            self._primary_skip_until = time.monotonic() + self.PRIMARY_COOLDOWN_SECONDS
+            log.warning(
+                "TTS primary tripped breaker after %d consecutive failures; "
+                "skipping primary for %.0fs",
+                self._primary_consecutive_failures,
+                self.PRIMARY_COOLDOWN_SECONDS,
+            )
 
     async def synthesize(self, text: str, voice: str | None = None) -> bytes:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            try:
-                resp = await client.post(
-                    self.primary["url"],
-                    json={
-                        "input": text,
-                        "voice": voice or self.primary["voice"],
-                        "model": self.primary["model"],
-                        "response_format": self.response_format,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.content
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                log.warning("Primary TTS failed (%s), falling back", exc)
+            if not self._primary_is_tripped():
+                try:
+                    resp = await client.post(
+                        self.primary["url"],
+                        json={
+                            "input": text,
+                            "voice": voice or self.primary["voice"],
+                            "model": self.primary["model"],
+                            "response_format": self.response_format,
+                        },
+                    )
+                    resp.raise_for_status()
+                    self._record_primary_success()
+                    return resp.content
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    self._record_primary_failure()
+                    log.warning("Primary TTS failed (%s), falling back", exc)
 
             resp = await client.post(
                 self.fallback["url"],
@@ -179,6 +218,8 @@ class LLMChainClient:
                             entry["url"],
                         )
                     async with client.stream("POST", entry["url"], json=request_payload) as resp:
+                        if resp.status_code >= 400:
+                            await resp.aread()
                         resp.raise_for_status()
                         self._record_success(
                             RequestOutcome(
@@ -198,6 +239,15 @@ class LLMChainClient:
                         return
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                     failed_urls.append(entry["url"])
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                        try:
+                            body = exc.response.text[:1000]
+                        except Exception:
+                            body = "(unreadable)"
+                        log.warning(
+                            "LLM %s returned %d; body: %s",
+                            entry["url"], exc.response.status_code, body,
+                        )
                     if i < len(self.chain) - 1:
                         log.warning("LLM %s failed (%s), trying next", entry["url"], exc)
                     else:

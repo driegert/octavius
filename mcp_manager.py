@@ -66,7 +66,12 @@ class MCPManager:
 
     def _register_tools(self, server_name: str, result):
         tool_count = 0
+        cfg = self._configs.get(server_name, {})
+        allowlist = cfg.get("tool_allowlist")
         for t in result.tools:
+            if allowlist and t.name not in allowlist:
+                log.debug("Skipping tool %s from %s (not in allowlist)", t.name, server_name)
+                continue
             tool_count += 1
             openai_tool = {
                 "type": "function",

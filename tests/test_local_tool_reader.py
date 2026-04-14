@@ -84,7 +84,7 @@ class LocalToolReaderTests(unittest.TestCase):
                     )
                 )
 
-            self.assertIn("inbox item #321", result)
+            self.assertIn("stash item #321", result)
             self.assertEqual(len(created_tasks), 1)
 
     def test_process_pdf_background_accepts_pdf_without_suffix(self):
@@ -111,10 +111,43 @@ class LocalToolReaderTests(unittest.TestCase):
                     )
                 )
 
-            self.assertIn("inbox item #321", result)
+            self.assertIn("stash item #321", result)
             self.assertEqual(len(created_tasks), 1)
             self.assertFalse(path.exists())
             self.assertTrue(Path(f"{path}.pdf").exists())
+
+    def test_list_reader_documents_formats_rows(self):
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        older = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        fake_conn = object()
+        session = SimpleNamespace(conn=fake_conn, db_path="/tmp/test.db")
+        fake_rows = [
+            {"id": 22, "title": "Creative Data Literacy", "source_type": "pdf",
+             "chunk_count": None, "status": "failed",
+             "error": "Conversion failed: unhandled errors in a TaskGroup",
+             "created_at": recent},
+            {"id": 20, "title": "Nano Claude Code README", "source_type": "markdown",
+             "chunk_count": 5, "status": "ready", "error": None, "created_at": older},
+        ]
+        with patch.object(local_tool_reader, "list_documents", return_value=fake_rows) as mock_list:
+            result = local_tool_reader.list_reader_documents({"limit": 10}, session=session)
+        mock_list.assert_called_once_with(fake_conn, limit=10, status=None)
+        self.assertIn("Reader documents", result)
+        self.assertIn("#22 [failed/pdf]", result)
+        self.assertIn("Creative Data Literacy", result)
+        self.assertIn("error: Conversion failed", result)
+        self.assertIn("#20 [ready/markdown]", result)
+
+    def test_list_reader_documents_requires_session(self):
+        result = local_tool_reader.list_reader_documents({}, session=None)
+        self.assertEqual(result, "Error: no database connection available.")
+
+    def test_list_reader_documents_reports_empty(self):
+        session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
+        with patch.object(local_tool_reader, "list_documents", return_value=[]):
+            result = local_tool_reader.list_reader_documents({"status": "processing"}, session=session)
+        self.assertEqual(result, "No reader documents found (status=processing).")
 
     def test_run_pdf_processing_marks_item_failed_when_no_job_id(self):
         updates = []

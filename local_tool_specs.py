@@ -28,11 +28,12 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "save_to_inbox",
+            "name": "save_to_stash",
             "description": (
-                "Save content to Dave's knowledge inbox for later review. "
+                "Save content to Dave's stash for later review. "
                 "Use for: saving search summaries, article content, freeform notes, "
-                "or email drafts that Dave wants to review or act on later."
+                "or email drafts that Dave wants to review or act on later. "
+                "(The stash is Dave's personal capture area — distinct from his email inbox.)"
             ),
             "parameters": {
                 "type": "object",
@@ -93,7 +94,7 @@ TOOLS = [
         "function": {
             "name": "read_item_content",
             "description": (
-                "Read a chunk of content from a saved inbox item. Use this to access "
+                "Read a chunk of content from a saved stash item. Use this to access "
                 "the full content of an item you're discussing with Dave. Returns the "
                 "content from the given offset with the specified character limit."
             ),
@@ -102,7 +103,7 @@ TOOLS = [
                 "properties": {
                     "item_id": {
                         "type": "integer",
-                        "description": "The inbox item ID to read from.",
+                        "description": "The stash item ID to read from.",
                     },
                     "offset": {
                         "type": "integer",
@@ -123,7 +124,7 @@ TOOLS = [
             "name": "process_pdf",
             "description": (
                 "Convert a PDF to markdown in the background. Returns immediately — "
-                "the result will be saved to Dave's knowledge inbox when processing "
+                "the result will be saved to Dave's stash when processing "
                 "completes. Use this instead of convert_pdf_to_md for a non-blocking "
                 "experience."
             ),
@@ -140,6 +141,64 @@ TOOLS = [
                     },
                 },
                 "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_stash_items",
+            "description": (
+                "List items in Dave's stash (the personal capture area for notes, "
+                "search summaries, articles, and email drafts). Defaults to pending "
+                "items only. Use when Dave asks things like 'what's in my stash', "
+                "'what did I save', or 'what's still pending to review'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "done", "dismissed", "all"],
+                        "description": "Filter by status. Defaults to 'pending'. Use 'all' for no filter.",
+                    },
+                    "item_type": {
+                        "type": "string",
+                        "enum": ["note", "search_summary", "article", "email_draft"],
+                        "description": "Optional filter by item type.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max items to return (1-50, default 20).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reader_documents",
+            "description": (
+                "List documents in the reader (PDFs, markdown files, and articles "
+                "prepared for audio playback). Use when Dave asks 'what's in the reader', "
+                "'is that PDF ready yet', or 'did the conversion finish'. Documents "
+                "with status='processing' are still being converted; 'ready' means "
+                "playable; 'failed' means conversion hit an error."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["processing", "ready", "failed", "all"],
+                        "description": "Filter by status. Defaults to all statuses.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max documents to return (1-50, default 20).",
+                    },
+                },
             },
         },
     },

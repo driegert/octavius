@@ -42,7 +42,7 @@ Service endpoint:
 Primary UI routes:
 
 - `/` main voice UI
-- `/inbox` knowledge inbox
+- `/inbox` stash (route still named `/inbox` — see "Stash rename" TODO below)
 - `/reader` document reader
 
 ## Validation Workflow
@@ -190,14 +190,27 @@ Tests:
 
 ## Feature Notes
 
-### Knowledge Inbox
+### Stash (formerly "Knowledge Inbox")
+
+Dave's personal capture area. Renamed from "Knowledge Inbox" to avoid collision
+with his email inbox. User-facing strings, voice-agent tool names (`save_to_stash`,
+`list_stash_items`), and the system prompt have been updated. Filenames, route
+paths (`/inbox`, `/api/inbox/*`), DB tables (`saved_items` — already neutral),
+and the static page files still use the old name — see the "Stash rename" TODO.
 
 - Stored in `octavius_history.db` as saved items for later review.
 - Item types: `note`, `search_summary`, `article`, `email_draft`
 - Status flow: `pending` -> `done` or `dismissed`
 - Hard delete is supported through `DELETE /api/inbox/{id}`
-- Inbox semantic search uses bge-m3 embeddings on workhorse via Ollama
-- Each inbox item can have a persistent item-chat conversation
+- Semantic search uses bge-m3 embeddings on workhorse via Ollama
+- Each stash item can have a persistent item-chat conversation
+
+**TODO — Stash rename (deferred):** finish the rename by updating route paths
+(`/inbox` → `/stash`, `/api/inbox` → `/api/stash`), filenames (`routes/inbox.py`,
+`local_tool_inbox.py`, `static/inbox.html`, `static/inbox-app.js`,
+`tests/test_local_tool_inbox.py` if created), and UI strings in the static
+HTML/JS. Leave the `saved_items` table alone (name is already neutral).
+Bookmarks and persisted browser state will break — coordinate accordingly.
 
 ### Document Reader
 

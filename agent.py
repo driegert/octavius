@@ -68,6 +68,15 @@ async def stream_agent_turn(
         if all_tools:
             payload["tools"] = all_tools
 
+        payload_chars = sum(len(json.dumps(m)) for m in messages)
+        tool_chars = sum(len(json.dumps(t)) for t in all_tools) if all_tools else 0
+        log.info(
+            "LLM request: round %d/%d, %d messages (%d chars), %d tools (%d chars)",
+            round_num + 1, settings.max_tool_rounds,
+            len(messages), payload_chars,
+            len(all_tools) if all_tools else 0, tool_chars,
+        )
+
         # --- Streaming request ---
         try:
             async with llm_client.stream_chat(payload) as resp:

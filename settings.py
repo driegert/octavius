@@ -139,8 +139,10 @@ DEFAULT_TOOL_LABELS = {
     "convert_pdf_to_md": "Converting PDF",
     "get_conversion_result": "Checking PDF Conversion",
     "download_file": "Downloading File",
-    "save_to_inbox": "Saving to Inbox",
+    "save_to_stash": "Saving to Stash",
+    "list_stash_items": "Listing Stash",
     "read_document": "Preparing Document",
+    "list_reader_documents": "Listing Reader Docs",
     "read_item_content": "Reading Item Content",
     "process_pdf": "Processing PDF",
 }
@@ -173,6 +175,26 @@ DEFAULT_MCP_SERVERS = {
         "env": {
             "OPENALEX_EMAIL": "davidriegert@trentu.ca",
         },
+        "tool_allowlist": [
+            # Core search
+            "search_works",
+            "get_work",
+            "find_open_access_version",
+            "search_by_topic",
+            "find_review_articles",
+            "find_seminal_papers",
+            "get_related_works",
+            "get_top_cited_works",
+            # Citations
+            "get_citation_network",
+            # Authors
+            "search_authors",
+            "get_author_profile",
+            "search_authors_by_expertise",
+            # Utility
+            "batch_resolve_references",
+            "get_entity",
+        ],
     },
     "vikunja-tasks": {
         "transport": "http",
@@ -210,13 +232,16 @@ You have access to tools:
     SSC 2026 Workshop (id=11), Exploration (id=8).
   * Default to Inbox (id=1) if Dave doesn't specify a project.
 - PDF processing via process_pdf for converting PDFs to markdown. This runs in the
-  background and saves the result to the knowledge inbox — use this instead of
+  background and saves the result to Dave's stash — use this instead of
   calling convert_pdf_to_md directly so Dave can keep talking while it processes.
 - File download for fetching files from URLs to local storage
 - Document reader via read_document for reading papers and documents aloud.
   When Dave says "read this document", "read this paper", or provides a file
   path to read aloud, use read_document. Math expressions are automatically
   converted to natural speech. The document will be available at /reader.
+- list_reader_documents to check what's in the reader and whether in-flight
+  PDF conversions have finished. Use when Dave asks "what's in the reader",
+  "is that PDF ready yet", or "did the conversion finish".
 
 Important guidelines for your responses:
 - Keep responses concise and conversational — they will be spoken aloud via TTS.
@@ -226,11 +251,16 @@ Important guidelines for your responses:
   in silence (e.g., "Let me look that up." or "Checking your email now.").
 - If a search returns results, summarize the key findings conversationally.
   Don't read out URLs.
-- Knowledge inbox via save_to_inbox for saving content Dave wants to review later.
-  When Dave says "save this", "remember that", "draft a reply", or similar, use
-  save_to_inbox. For search results, save your summary (not raw results). For notes,
-  save his words verbatim. For email drafts, set item_type to "email_draft" and
-  include recipient and subject in metadata. Always give a clear, descriptive title.
+- Stash via save_to_stash for saving content Dave wants to review later. The
+  stash is Dave's personal capture area — it is NOT his email inbox. When Dave
+  says "save this", "remember that", "draft a reply", "add this to my stash",
+  or similar, use save_to_stash. For search results, save your summary (not raw
+  results). For notes, save his words verbatim. For email drafts, set item_type
+  to "email_draft" and include recipient and subject in metadata. Always give a
+  clear, descriptive title.
+- list_stash_items to browse the stash (defaults to pending items). Use when
+  Dave asks "what's in my stash", "what did I save", or "what's still pending
+  to review". Do NOT use this for email — email lives in Evangeline.
 - Dave is a statistics instructor and researcher at Trent University. He runs
   a homelab with multiple machines. He prefers concise, technically precise
   responses and will correct you if you're wrong. Don't over-explain."""

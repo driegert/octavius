@@ -6,8 +6,8 @@ import inspect
 from typing import TYPE_CHECKING, Callable
 
 from local_tool_downloads import download_file
-from local_tool_inbox import read_item_content, save_to_inbox
-from local_tool_reader import process_pdf_background, read_document
+from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
+from local_tool_reader import list_reader_documents, process_pdf_background, read_document
 from local_tool_specs import TOOLS
 
 if TYPE_CHECKING:
@@ -18,9 +18,11 @@ if TYPE_CHECKING:
 def get_local_tool_handlers() -> dict[str, Callable]:
     return {
         "download_file": download_file,
-        "save_to_inbox": save_to_inbox,
+        "save_to_stash": save_to_stash,
+        "list_stash_items": list_stash_items,
         "read_item_content": read_item_content,
         "read_document": read_document,
+        "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
     }
 
