@@ -202,4 +202,36 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                "Delegate a task to a specialist assistant. Use for: "
+                "email (searching, reading, summarizing emails), "
+                "research (finding papers, authors, citations via OpenAlex), "
+                "or tasks (searching, creating, updating Vikunja tasks). "
+                "The specialist has its own tools and returns a summary. "
+                "Include all relevant context in the task description."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "enum": ["email", "research", "tasks"],
+                        "description": "The specialist domain.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "Clear description of what to do. Include dates, names, "
+                            "project names, or other details from the conversation."
+                        ),
+                    },
+                },
+                "required": ["domain", "task"],
+            },
+        },
+    },
 ]

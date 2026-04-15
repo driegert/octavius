@@ -14,6 +14,22 @@ if TYPE_CHECKING:
     from history import ConversationSession
     from mcp_manager import MCPManager
 
+# Status callback is stashed here by websocket_session before the agent turn
+# so that delegate_task can forward it to the subagent.
+_status_callback = None
+
+
+async def _delegate_task(args: dict, session=None, mcp_manager=None) -> str:
+    from subagent import run_subagent
+
+    domain = args.get("domain", "")
+    task = args.get("task", "")
+    if not domain or not task:
+        return "Error: domain and task are required."
+    if mcp_manager is None:
+        return "Error: MCP manager unavailable."
+    return await run_subagent(task, domain, mcp_manager, status_callback=_status_callback)
+
 
 def get_local_tool_handlers() -> dict[str, Callable]:
     return {
@@ -24,6 +40,7 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "read_document": read_document,
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
+        "delegate_task": _delegate_task,
     }
 
 

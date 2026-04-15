@@ -71,8 +71,21 @@ When touching external-service boundaries, verify the configured endpoints are r
 High-level path:
 
 ```text
-Browser (WebSocket) -> FastAPI app -> agent/session logic -> local tools + MCP tools + STT/TTS/LLM services
+Browser (WebSocket) -> FastAPI app -> main agent (streaming, ~11 core tools)
+                                        │
+                                        ├─ direct: web search, stash, reader, PDF, download
+                                        │
+                                        └─ delegate_task → subagent (non-streaming, scoped tools)
+                                             ├─ email domain (~9 tools, evangeline-email)
+                                             ├─ research domain (~14 tools, openalex)
+                                             └─ tasks domain (~10 tools, vikunja-tasks)
 ```
+
+The main agent never sees email/research/task tool schemas. It calls
+`delegate_task(domain, task)` which runs a separate non-streaming LLM loop
+with only the tools for that domain, using the same MCP sessions. This keeps
+the main agent's context lean (~11 tools instead of ~44) and prevents
+tool-schema-heavy payloads from causing LLM 500 errors.
 
 External services currently expected:
 
@@ -138,6 +151,7 @@ Conversation and tool loop:
 - `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
 - `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
 - `tools.py` - local tool schemas and dispatch entrypoint used by the agent loop
+- `subagent.py` - internal subagent for delegated domains (email, research, tasks)
 - `local_tool_specs.py` - local tool schemas
 - `local_tool_registry.py` - compatibility wrapper for older local-tool imports
 - `local_tool_downloads.py` - local download filename logic and download tool execution
@@ -187,6 +201,8 @@ Tests:
 - `tests/test_local_tool_handlers.py`
 - `tests/test_local_tool_reader.py`
 - `tests/test_local_tool_registry.py`
+- `tests/test_local_tool_inbox.py`
+- `tests/test_subagent.py`
 
 ## Feature Notes
 

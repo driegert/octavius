@@ -73,6 +73,23 @@ class MCPManagerTests(unittest.TestCase):
         result = asyncio.run(manager.call_tool("search", {"q": "test"}))
         self.assertEqual(result, "ok")
 
+    def test_get_tools_for_servers_filters_by_server_name(self):
+        manager = MCPManager({
+            "alpha": {"transport": "http"},
+            "beta": {"transport": "http"},
+        })
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("search"), _FakeTool("get")]))
+        manager._register_tools("beta", _FakeListTools([_FakeTool("list_emails")]))
+        alpha_tools = manager.get_tools_for_servers(["alpha"])
+        self.assertEqual(len(alpha_tools), 2)
+        names = {t["function"]["name"] for t in alpha_tools}
+        self.assertEqual(names, {"search", "get"})
+
+    def test_get_tools_for_servers_returns_empty_for_unknown(self):
+        manager = MCPManager({"alpha": {"transport": "http"}})
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
+        self.assertEqual(manager.get_tools_for_servers(["nonexistent"]), [])
+
     def test_get_health_reports_degraded_when_some_servers_disconnected(self):
         manager = MCPManager(
             {

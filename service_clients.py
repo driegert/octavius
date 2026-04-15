@@ -312,6 +312,63 @@ class LLMChainClient:
         )
         return None
 
+    async def complete_with_tools(self, payload: dict) -> dict | None:
+        """Non-streaming completion returning the full message dict (content + tool_calls).
+
+        Used by the subagent loop which needs to inspect tool_calls in the response.
+        """
+        model = payload.get("model") or self.chain[0]["model"]
+        request_payload = dict(payload)
+        request_payload["model"] = model
+        request_payload["stream"] = False
+        failed_urls: list[str] = []
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for i, entry in enumerate(self.chain):
+                self._mark_attempt(entry["url"])
+                try:
+                    if i > 0:
+                        log.warning(
+                            "LLM failover attempt %d/%d via %s",
+                            i + 1, len(self.chain), entry["url"],
+                        )
+                    resp = await client.post(entry["url"], json=request_payload)
+                    resp.raise_for_status()
+                    message = resp.json()["choices"][0]["message"]
+                    self._record_success(
+                        RequestOutcome(
+                            url=entry["url"],
+                            model=model,
+                            attempts=i + 1,
+                            failed_urls=failed_urls,
+                        )
+                    )
+                    if failed_urls:
+                        log.warning(
+                            "LLM request succeeded via fallback %s after failures on %s",
+                            entry["url"], ", ".join(failed_urls),
+                        )
+                    return message
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
+                        KeyError, IndexError, json.JSONDecodeError) as exc:
+                    failed_urls.append(entry["url"])
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                        try:
+                            body = exc.response.text[:1000]
+                        except Exception:
+                            body = "(unreadable)"
+                        log.warning("LLM %s returned %d; body: %s", entry["url"], exc.response.status_code, body)
+                    log.debug("Completion with tools failed via %s", entry["url"], exc_info=True)
+                    continue
+        self._record_failure(
+            RequestOutcome(
+                url=None, model=model,
+                attempts=len(self.chain),
+                failed_urls=failed_urls,
+                error="All LLM endpoints failed",
+            )
+        )
+        return None
+
 
 class SummaryClient:
     def __init__(self, primary_url: str, fallback_url: str):

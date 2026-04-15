@@ -125,6 +125,14 @@ class MCPManager:
         """Return the server name that hosts a given tool."""
         return self._tool_route.get(name)
 
+    def get_tools_for_servers(self, server_names: list[str]) -> list[dict]:
+        """Return only tools belonging to the named servers."""
+        names = set(server_names)
+        return [
+            t for t in self.tools
+            if self._tool_route.get(t["function"]["name"]) in names
+        ]
+
     async def call_tool(self, name: str, arguments: dict) -> str:
         server_name = self._tool_route.get(name)
         if not server_name:

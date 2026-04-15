@@ -45,17 +45,22 @@ async def stream_agent_turn(
     Tool call rounds are handled internally (non-streaming). Only the final
     text response is streamed sentence-by-sentence.
     """
+    # Make status_callback available to delegate_task → subagent
+    local_tools._status_callback = status_callback
+
     conversation.add_user(user_text)
     conversation.trim()
 
     for round_num in range(settings.max_tool_rounds):
         messages = conversation.get_messages()
 
-        # On later rounds, nudge the LLM to wrap up instead of spiraling
+        # On later rounds, nudge the LLM to wrap up instead of spiraling.
+        # Must NOT use role=system here — Qwen's chat template requires
+        # system messages only at the beginning.
         if round_num >= settings.max_tool_rounds - 2:
             messages = messages + [{
-                "role": "system",
-                "content": "You have used many tool calls. Summarize what you've found so far and respond to the user now. Do not make more tool calls.",
+                "role": "user",
+                "content": "[System note: You have used many tool calls. Summarize what you've found so far and respond to the user now. Do not make more tool calls.]",
             }]
 
         payload = {
@@ -63,8 +68,9 @@ async def stream_agent_turn(
             "messages": messages,
             "stream": True,
         }
-        # Always offer tools (removing them causes Qwen to output raw tool-call text)
-        all_tools = mcp.tools + local_tools.TOOLS
+        # Only offer core MCP tools + local tools. Delegated domains (email,
+        # research, tasks) are handled by the subagent via delegate_task.
+        all_tools = mcp.get_tools_for_servers(["searxng", "document-processing"]) + local_tools.TOOLS
         if all_tools:
             payload["tools"] = all_tools
 
