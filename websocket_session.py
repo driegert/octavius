@@ -417,19 +417,30 @@ class WebSocketSessionHandler:
         log.debug("Streaming STT started")
 
     async def handle_stt_chunk(self, pcm_bytes: bytes):
-        """Accumulate PCM audio and transcribe periodically."""
-        from stt import transcribe_pcm
-
+        """Accumulate PCM audio and kick off a background transcription."""
         stream = self.state.stt_stream
         stream.pcm_buffer += pcm_bytes
 
-        # Transcribe the full buffer (skip if a transcription is already running)
+        # Skip if a transcription is already running or buffer too short
         if stream._transcribe_lock.locked():
             return
+        if len(stream.pcm_buffer) < 16000 * 4:  # need at least ~1s
+            return
+
+        # Run transcription in background so the message loop isn't blocked
+        asyncio.create_task(self._transcribe_streaming_buffer())
+
+    async def _transcribe_streaming_buffer(self):
+        """Background task: transcribe the current PCM buffer and send a partial."""
+        from stt import transcribe_pcm
+
+        stream = self.state.stt_stream
+        if not stream.active:
+            return
         async with stream._transcribe_lock:
-            buf = stream.pcm_buffer
-            if len(buf) < 16000 * 4:  # need at least ~1s of float32 audio
+            if not stream.active:
                 return
+            buf = stream.pcm_buffer
             try:
                 text = await transcribe_pcm(buf)
                 if text and text != stream.last_text:
@@ -441,34 +452,34 @@ class WebSocketSessionHandler:
     async def handle_stt_stop(self, _data: dict):
         """Finalize streaming transcription and start agent turn.
 
-        Waits for any in-flight partial transcription, then uses that result.
-        Only re-transcribes the full buffer if no partial was captured yet
-        (e.g., recording was too short for any chunk to fire).
+        If we already have a partial transcription, use it immediately without
+        waiting for any in-flight Whisper call (which is likely just processing
+        silence). Only waits/re-transcribes if no partial was captured yet.
         """
         from stt import transcribe_pcm
 
         stream = self.state.stt_stream
         stream.active = False
-        buf = stream.pcm_buffer
         last_text = stream.last_text
 
-        # Wait for any in-flight transcription to complete
-        async with stream._transcribe_lock:
-            # Check again — the in-flight transcription may have updated last_text
-            last_text = stream.last_text or last_text
-
-            if not last_text and len(buf) >= 1600 * 4:
-                # No partials captured yet (very short recording) — do a full transcription
-                await self.send_json("status", "Transcribing...")
-                try:
-                    last_text = await transcribe_pcm(buf)
-                except Exception as exc:
-                    log.exception("Streaming STT final transcription failed")
-                    await self.send_json("status", f"Transcription failed: {exc}")
-                    stream.reset()
-                    return
-
-        stream.reset()
+        if last_text:
+            # Already have good text from partials — use it immediately
+            stream.reset()
+        else:
+            # No partials yet (very short recording) — wait and transcribe
+            buf = stream.pcm_buffer
+            async with stream._transcribe_lock:
+                last_text = stream.last_text
+                if not last_text and len(buf) >= 1600 * 4:
+                    await self.send_json("status", "Transcribing...")
+                    try:
+                        last_text = await transcribe_pcm(buf)
+                    except Exception as exc:
+                        log.exception("Streaming STT final transcription failed")
+                        await self.send_json("status", f"Transcription failed: {exc}")
+                        stream.reset()
+                        return
+            stream.reset()
 
         if not last_text:
             await self.send_json("status", "Couldn't hear anything. Try again.")

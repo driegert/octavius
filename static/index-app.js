@@ -44,6 +44,13 @@
   let sttChunks = [];
   let sttSendTimer = null;
   let sttStreaming = false;
+
+  // Silence detection (toggle-to-talk only)
+  const SILENCE_THRESHOLD = 0.015;     // RMS below this = silence (float32 PCM)
+  const SILENCE_DURATION_MS = 2500;    // auto-stop after this much continuous silence
+  const MIN_RECORDING_MS = 1500;       // don't auto-stop within the first 1.5s
+  let silenceStartTime = null;
+  let recordingStartTime = null;
   let currentVoice = 'de_male';
   let sttEnabled = true;
   let ttsEnabled = true;
@@ -383,13 +390,36 @@
       const src = sttAudioCtx.createMediaStreamSource(sttStream);
       sttProcessor = sttAudioCtx.createScriptProcessor(4096, 1, 1);
       sttProcessor.onaudioprocess = (e) => {
-        if (sttStreaming) sttChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+        if (!sttStreaming) return;
+        const samples = new Float32Array(e.inputBuffer.getChannelData(0));
+        sttChunks.push(samples);
+
+        // Silence detection (toggle-to-talk only)
+        if (toggleToTalk && recordingStartTime) {
+          let sum = 0;
+          for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+          const rms = Math.sqrt(sum / samples.length);
+          const now = Date.now();
+
+          if (rms < SILENCE_THRESHOLD) {
+            if (!silenceStartTime) silenceStartTime = now;
+            const elapsed = now - recordingStartTime;
+            const silenceMs = now - silenceStartTime;
+            if (elapsed > MIN_RECORDING_MS && silenceMs >= SILENCE_DURATION_MS) {
+              stopRecording();
+            }
+          } else {
+            silenceStartTime = null;
+          }
+        }
       };
       src.connect(sttProcessor);
       sttProcessor.connect(sttAudioCtx.destination);
 
       sttStreaming = true;
       sttChunks = [];
+      recordingStartTime = Date.now();
+      silenceStartTime = null;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'stt_start' }));
       }
@@ -404,12 +434,15 @@
 
   function stopRecording() {
     if (!sttStreaming) return;
+    const autoStopped = silenceStartTime !== null;
     sttStreaming = false;
+    silenceStartTime = null;
+    recordingStartTime = null;
 
     if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
 
-    // Send any remaining audio
-    sendPCMChunks();
+    // Send remaining audio — skip if silence-triggered (it's just silence)
+    if (!autoStopped) sendPCMChunks();
 
     // Signal stop to server
     if (ws && ws.readyState === WebSocket.OPEN) {
