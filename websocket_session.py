@@ -39,6 +39,20 @@ def create_item_conversation(item: dict, item_id: int) -> Conversation:
 
 
 @dataclass
+class StreamingSTTState:
+    """Per-session state for streaming speech-to-text."""
+    active: bool = False
+    pcm_buffer: bytes = b""
+    last_text: str = ""
+    _transcribe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def reset(self):
+        self.active = False
+        self.pcm_buffer = b""
+        self.last_text = ""
+
+
+@dataclass
 class WebSocketSessionState:
     ws: Any
     history: object
@@ -50,6 +64,7 @@ class WebSocketSessionState:
     item_conversations: dict[int, Conversation] = field(default_factory=dict)
     item_history_sessions: dict[int, object] = field(default_factory=dict)
     history_session: object | None = None
+    stt_stream: StreamingSTTState = field(default_factory=StreamingSTTState)
 
 
 class WebSocketSessionHandler:
@@ -102,7 +117,10 @@ class WebSocketSessionHandler:
                     await self.handle_text_message(message["text"])
                     continue
                 if "bytes" in message:
-                    await self.handle_audio_message(message["bytes"])
+                    if self.state.stt_stream.active:
+                        await self.handle_stt_chunk(message["bytes"])
+                    else:
+                        await self.handle_audio_message(message["bytes"])
         except (WebSocketDisconnect, RuntimeError):
             log.info("WebSocket disconnected")
             await self.cleanup()
@@ -126,6 +144,8 @@ class WebSocketSessionHandler:
             "item_chat_load": self.handle_item_chat_load,
             "item_chat": self.handle_item_chat,
             "item_chat_reset": self.handle_item_chat_reset,
+            "stt_start": self.handle_stt_start,
+            "stt_stop": self.handle_stt_stop,
         }
         handler = handlers.get(msg_type)
         if handler:
@@ -388,6 +408,74 @@ class WebSocketSessionHandler:
 
         await self.send_json("transcript", user_text)
         await self.run_turn(user_text, source="voice")
+
+    # --- Streaming STT ---
+
+    async def handle_stt_start(self, _data: dict):
+        self.state.stt_stream.reset()
+        self.state.stt_stream.active = True
+        log.debug("Streaming STT started")
+
+    async def handle_stt_chunk(self, pcm_bytes: bytes):
+        """Accumulate PCM audio and transcribe periodically."""
+        from stt import transcribe_pcm
+
+        stream = self.state.stt_stream
+        stream.pcm_buffer += pcm_bytes
+
+        # Transcribe the full buffer (skip if a transcription is already running)
+        if stream._transcribe_lock.locked():
+            return
+        async with stream._transcribe_lock:
+            buf = stream.pcm_buffer
+            if len(buf) < 16000 * 4:  # need at least ~1s of float32 audio
+                return
+            try:
+                text = await transcribe_pcm(buf)
+                if text and text != stream.last_text:
+                    stream.last_text = text
+                    await self.send_payload({"type": "transcript_partial", "text": text})
+            except Exception:
+                log.debug("Streaming STT chunk transcription failed", exc_info=True)
+
+    async def handle_stt_stop(self, _data: dict):
+        """Finalize streaming transcription and start agent turn.
+
+        Waits for any in-flight partial transcription, then uses that result.
+        Only re-transcribes the full buffer if no partial was captured yet
+        (e.g., recording was too short for any chunk to fire).
+        """
+        from stt import transcribe_pcm
+
+        stream = self.state.stt_stream
+        stream.active = False
+        buf = stream.pcm_buffer
+        last_text = stream.last_text
+
+        # Wait for any in-flight transcription to complete
+        async with stream._transcribe_lock:
+            # Check again — the in-flight transcription may have updated last_text
+            last_text = stream.last_text or last_text
+
+            if not last_text and len(buf) >= 1600 * 4:
+                # No partials captured yet (very short recording) — do a full transcription
+                await self.send_json("status", "Transcribing...")
+                try:
+                    last_text = await transcribe_pcm(buf)
+                except Exception as exc:
+                    log.exception("Streaming STT final transcription failed")
+                    await self.send_json("status", f"Transcription failed: {exc}")
+                    stream.reset()
+                    return
+
+        stream.reset()
+
+        if not last_text:
+            await self.send_json("status", "Couldn't hear anything. Try again.")
+            return
+
+        await self.send_json("transcript", last_text)
+        await self.run_turn(last_text, source="voice")
 
     async def run_turn(self, user_text: str, source: str):
         from agent import stream_agent_turn

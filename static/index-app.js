@@ -36,6 +36,14 @@
   let mediaRecorder = null;
   let audioChunks = [];
   let reconnectDelay = 1000;
+
+  // Streaming STT state
+  let sttAudioCtx = null;
+  let sttStream = null;
+  let sttProcessor = null;
+  let sttChunks = [];
+  let sttSendTimer = null;
+  let sttStreaming = false;
   let currentVoice = 'de_male';
   let sttEnabled = true;
   let ttsEnabled = true;
@@ -309,6 +317,9 @@
           } catch (_err) {
           }
         }
+        if (msg.type === 'transcript_partial') {
+          setUserText(msg.text);
+        }
         if (msg.type === 'transcript') {
           setUserText(msg.text);
           conversationHistory.push({ role: 'user', content: msg.text });
@@ -346,25 +357,44 @@
     ws = socketController.connect();
   }
 
+  // --- Streaming STT helpers ---
+
+  function sendPCMChunks() {
+    if (!sttChunks.length) return;
+    let total = 0;
+    for (const c of sttChunks) total += c.length;
+    const combined = new Float32Array(total);
+    let off = 0;
+    for (const c of sttChunks) { combined.set(c, off); off += c.length; }
+    sttChunks = [];
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(new Uint8Array(combined.buffer));
+    }
+  }
+
   async function startRecording() {
     if (!sttEnabled) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioChunks = [];
-      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) audioChunks.push(event.data);
+      sttStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
+      });
+      sttAudioCtx = new AudioContext({ sampleRate: 16000 });
+      const src = sttAudioCtx.createMediaStreamSource(sttStream);
+      sttProcessor = sttAudioCtx.createScriptProcessor(4096, 1, 1);
+      sttProcessor.onaudioprocess = (e) => {
+        if (sttStreaming) sttChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
       };
-      mediaRecorder.onstop = () => {
-        stream.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(audioChunks, { type: 'audio/webm' });
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(blob);
-          talkBtn.disabled = true;
-          setStatus('Sending audio...', true);
-        }
-      };
-      mediaRecorder.start();
+      src.connect(sttProcessor);
+      sttProcessor.connect(sttAudioCtx.destination);
+
+      sttStreaming = true;
+      sttChunks = [];
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'stt_start' }));
+      }
+      sttSendTimer = setInterval(sendPCMChunks, 1500);
+
       talkBtn.classList.add('recording');
       setStatus('Recording...', true);
     } catch (_err) {
@@ -373,16 +403,33 @@
   }
 
   function stopRecording() {
-    if (mediaRecorder && mediaRecorder.state === 'recording') {
-      mediaRecorder.stop();
-      talkBtn.classList.remove('recording');
+    if (!sttStreaming) return;
+    sttStreaming = false;
+
+    if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
+
+    // Send any remaining audio
+    sendPCMChunks();
+
+    // Signal stop to server
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'stt_stop' }));
+      talkBtn.disabled = true;
+      setStatus('Transcribing...', true);
     }
+
+    // Clean up audio resources
+    if (sttStream) { sttStream.getTracks().forEach((t) => t.stop()); sttStream = null; }
+    if (sttAudioCtx) { sttAudioCtx.close(); sttAudioCtx = null; }
+    sttProcessor = null;
+
+    talkBtn.classList.remove('recording');
   }
 
   function handleTalkDown(event) {
     event.preventDefault();
     if (toggleToTalk) {
-      if (mediaRecorder && mediaRecorder.state === 'recording') {
+      if (sttStreaming) {
         stopRecording();
       } else {
         startRecording();

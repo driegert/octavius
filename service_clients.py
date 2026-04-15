@@ -45,6 +45,17 @@ class STTClient:
             resp.raise_for_status()
             return resp.json().get("text", "").strip()
 
+    async def transcribe_pcm(self, pcm_bytes: bytes) -> str:
+        """Transcribe raw float32 PCM audio at 16kHz."""
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                self.url,
+                content=pcm_bytes,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            resp.raise_for_status()
+            return resp.json().get("text", "").strip()
+
 
 class TTSClient:
     """
