@@ -296,7 +296,7 @@ def load_settings() -> Settings:
         llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.5-9b"),
     )
     return Settings(
-        stt_url=_env_str("OCTAVIUS_STT_URL", "http://127.0.0.1:8502/api/transcribe"),
+        stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
         llm_chain=llm_chain,
         tts=tts,
         reader=reader,
