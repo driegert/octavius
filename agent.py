@@ -76,7 +76,7 @@ async def stream_agent_turn(
 
         payload_chars = sum(len(json.dumps(m)) for m in messages)
         tool_chars = sum(len(json.dumps(t)) for t in all_tools) if all_tools else 0
-        log.info(
+        log.debug(
             "LLM request: round %d/%d, %d messages (%d chars), %d tools (%d chars)",
             round_num + 1, settings.max_tool_rounds,
             len(messages), payload_chars,

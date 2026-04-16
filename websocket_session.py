@@ -38,18 +38,25 @@ def create_item_conversation(item: dict, item_id: int) -> Conversation:
     return conversation
 
 
+VAD_SILENCE_SECONDS = 1.5  # auto-stop after this much silence post-speech
+
+
 @dataclass
 class StreamingSTTState:
     """Per-session state for streaming speech-to-text."""
     active: bool = False
     pcm_buffer: bytes = b""
     last_text: str = ""
+    speech_detected: bool = False
+    silence_start: float | None = None
     _transcribe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def reset(self):
         self.active = False
         self.pcm_buffer = b""
         self.last_text = ""
+        self.speech_detected = False
+        self.silence_start = None
 
 
 @dataclass
@@ -65,6 +72,7 @@ class WebSocketSessionState:
     item_history_sessions: dict[int, object] = field(default_factory=dict)
     history_session: object | None = None
     stt_stream: StreamingSTTState = field(default_factory=StreamingSTTState)
+    vad: object | None = None  # SileroVAD instance, created on first stt_start
 
 
 class WebSocketSessionHandler:
@@ -412,16 +420,43 @@ class WebSocketSessionHandler:
     # --- Streaming STT ---
 
     async def handle_stt_start(self, _data: dict):
+        from vad import SileroVAD
+
         self.state.stt_stream.reset()
         self.state.stt_stream.active = True
+        if self.state.vad is None:
+            self.state.vad = SileroVAD()
+        else:
+            self.state.vad.reset()
         log.debug("Streaming STT started")
 
     async def handle_stt_chunk(self, pcm_bytes: bytes):
-        """Accumulate PCM audio and kick off a background transcription."""
+        """Accumulate PCM audio, run VAD, and kick off background transcription."""
         stream = self.state.stt_stream
         stream.pcm_buffer += pcm_bytes
 
-        # Skip if a transcription is already running or buffer too short
+        # Run VAD to detect speech/silence
+        vad = self.state.vad
+        if vad is not None:
+            probs = vad.process_chunk(pcm_bytes)
+            max_prob = max(probs) if probs else 0.0
+            has_speech = max_prob >= vad.threshold
+            if has_speech:
+                stream.speech_detected = True
+                stream.silence_start = None
+            elif stream.speech_detected:
+                # Silence after speech — track duration
+                now = time.monotonic()
+                if stream.silence_start is None:
+                    stream.silence_start = now
+                elif (now - stream.silence_start) >= VAD_SILENCE_SECONDS:
+                    # End of turn detected — auto-stop
+                    log.info("VAD: end of speech detected (%.1fs silence)", now - stream.silence_start)
+                    await self.send_payload({"type": "stt_auto_stop"})
+                    await self.handle_stt_stop({})
+                    return
+
+        # Skip transcription if a transcription is already running or buffer too short
         if stream._transcribe_lock.locked():
             return
         if len(stream.pcm_buffer) < 16000 * 4:  # need at least ~1s

@@ -14,4 +14,5 @@ dependencies = [
     "trafilatura>=2.0.0",
     "uvicorn[standard]>=0.42.0",
     "websockets>=16.0",
+    "onnxruntime>=1.18",
 ]

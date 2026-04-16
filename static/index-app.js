@@ -318,6 +318,17 @@
           } catch (_err) {
           }
         }
+        if (msg.type === 'stt_auto_stop') {
+          // Server detected end of speech — clean up recording on our side
+          sttStreaming = false;
+          if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
+          if (sttStream) { sttStream.getTracks().forEach((t) => t.stop()); sttStream = null; }
+          if (sttAudioCtx) { sttAudioCtx.close(); sttAudioCtx = null; }
+          sttProcessor = null;
+          talkBtn.classList.remove('recording');
+          talkBtn.disabled = true;
+          setStatus('Transcribing...', true);
+        }
         if (msg.type === 'transcript_partial') {
           setUserText(msg.text);
         }
@@ -394,7 +405,7 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'stt_start' }));
       }
-      sttSendTimer = setInterval(sendPCMChunks, 1500);
+      sttSendTimer = setInterval(sendPCMChunks, 250);
 
       talkBtn.classList.add('recording');
       setStatus('Recording...', true);
