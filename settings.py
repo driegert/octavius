@@ -161,7 +161,8 @@ DEFAULT_MCP_SERVERS = {
             "tool",
             "run",
             "--from",
-            "git+https://github.com/varlabz/searxng-mcp",
+            # Pinned to commit; update deliberately by bumping this ref.
+            "git+https://github.com/varlabz/searxng-mcp@f9797b7db6593082a331e02d852029f8ebbe6a9d",
             "mcp-server",
         ],
         "env": {
@@ -171,8 +172,9 @@ DEFAULT_MCP_SERVERS = {
     },
     "openalex": {
         "transport": "stdio",
-        "command": "/home/dave/.npm-global/bin/openalex-research-mcp",
-        "args": [],
+        "command": "/usr/bin/npx",
+        # Pinned version; update deliberately by bumping the @x.y.z suffix.
+        "args": ["-y", "openalex-research-mcp@0.4.0"],
         "env": {
             "OPENALEX_EMAIL": "davidriegert@trentu.ca",
         },
