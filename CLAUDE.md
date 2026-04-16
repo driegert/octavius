@@ -89,7 +89,7 @@ tool-schema-heavy payloads from causing LLM 500 errors.
 
 External services currently expected:
 
-- **STT**: Whisper at `127.0.0.1:8502/api/transcribe`
+- **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
 - **LLM chain**: Qwen3.5-35B-A3B via `OCTAVIUS_LLM_CHAIN`, defaulting to:
   - primary: `lilripper:8020/v1/chat/completions`
   - first fallback: `127.0.0.1:8001/v1/chat/completions` on lilbuddy
@@ -123,7 +123,7 @@ Configured MCP servers:
 
 WebSocket message families:
 
-- Voice: `status`, `transcript`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`
+- Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
 - Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
 
@@ -137,6 +137,7 @@ Core runtime:
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
 - `stt.py` - thin STT wrapper
 - `tts.py` - thin TTS wrapper
+- `vad.py` - Silero VAD ONNX wrapper for server-side voice activity detection
 
 Route modules:
 
@@ -205,6 +206,29 @@ Tests:
 - `tests/test_subagent.py`
 
 ## Feature Notes
+
+### Voice Interaction
+
+Three talk modes, selectable in the settings panel:
+
+- **Hold to talk** (default): press and hold to record, release to send.
+- **Tap to talk**: tap to start recording, tap again to stop.
+- **Continuous conversation**: press "Start Conversation" to begin a hands-free
+  loop. The user speaks, Silero VAD detects 1.5s of silence and auto-stops,
+  Octavius responds via TTS, then the mic automatically reopens for the next
+  turn. Press "End Conversation" to exit the loop.
+
+Streaming STT: the browser captures PCM at 16kHz via Web Audio API
+ScriptProcessor and sends binary chunks every 250ms over the WebSocket. The
+server accumulates a buffer, runs background faster-whisper transcription, and
+sends `transcript_partial` messages. On stop (manual or VAD auto-stop), the
+server uses the latest partial text immediately — no re-transcription needed.
+
+Server-side VAD: Silero VAD v6 ONNX model (`models/silero_vad.onnx`) runs on
+CPU via onnxruntime. Each 512-sample window (32ms at 16kHz) is prepended with
+a 64-sample context buffer before inference. Per-session LSTM state is carried
+between chunks and reset at the start of each turn. The `SileroVAD` class in
+`vad.py` wraps the ONNX model; each WebSocket session gets its own instance.
 
 ### Stash (formerly "Knowledge Inbox")
 

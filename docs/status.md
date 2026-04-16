@@ -40,6 +40,10 @@ Completed work:
 - local tool dispatch now routes through `tools.py` and `local_tool_registry.py`
 - local tool execution was further split by domain into `local_tool_downloads.py`, `local_tool_inbox.py`, and `local_tool_reader.py`
 - internal callers now use the concrete reader and local-tool modules directly; the old `reader.py`, `local_tool_handlers.py`, and `config.py` shims have been removed
+- STT moved from batch record-then-transcribe to streaming partial transcription using faster-whisper on lilripper
+- server-side Silero VAD added for automatic end-of-speech detection (1.5s silence threshold)
+- continuous conversation mode added: hands-free multi-turn loop where the mic auto-reopens after TTS playback
+- talk mode selector replaced the toggle-to-talk checkbox (hold / tap / continuous)
 
 ## Current Hotspots
 
@@ -70,6 +74,8 @@ Operational assumptions worth keeping in mind during debugging:
 - restart recovery is now manual requeue rather than automatic job resurrection
 - live conversation and item-chat history sessions still keep their own dedicated SQLite connection until they are ended
 - the browser UIs are less script-heavy than before, but layout and markup are still concentrated in large static HTML files
+- Silero VAD requires `models/silero_vad.onnx` to be present; if the file is missing, VAD is skipped and auto-stop will not work
+- STT failover (lilripper primary, lilbuddy fallback) is not yet implemented — switching requires a settings change
 
 ## Near-Term Work
 
