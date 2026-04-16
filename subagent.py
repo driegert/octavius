@@ -14,7 +14,7 @@ import re
 from typing import TYPE_CHECKING, Callable
 
 from service_clients import llm_client
-from settings import settings
+from settings import format_vikunja_default, format_vikunja_projects, settings
 
 if TYPE_CHECKING:
     from mcp_manager import MCPManager
@@ -57,11 +57,8 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "- Always set done=false when searching tasks unless Dave asks about completed ones.\n"
             "- Sort by due_date or created when listing tasks so the most relevant appear first.\n"
             "- When creating tasks, ask which project if not obvious from context.\n"
-            "- Key projects: Inbox (id=1), Teaching and Trent (id=9), math1052 (id=10), "
-            "amod5240 (id=2), math3560 (id=3), Email Tasks (id=14), Personal and "
-            "Professional (id=13), PhD (id=4), Projects (id=5), AI Projects (id=6), "
-            "SSC 2026 Workshop (id=11), Exploration (id=8).\n"
-            "- Default to Inbox (id=1) if Dave doesn't specify a project."
+            f"- Key projects: {format_vikunja_projects()}.\n"
+            f"- Default to {format_vikunja_default()} if Dave doesn't specify a project."
         ),
         "max_rounds": 4,
     },

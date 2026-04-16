@@ -211,7 +211,33 @@ DEFAULT_MCP_SERVERS = {
 }
 
 
-DEFAULT_SYSTEM_PROMPT = """You are Octavius, Dave's personal voice assistant. You run
+VIKUNJA_PROJECTS: dict[str, int] = {
+    "Inbox": 1,
+    "Teaching and Trent": 9,
+    "math1052": 10,
+    "amod5240": 2,
+    "math3560": 3,
+    "Email Tasks": 14,
+    "Personal and Professional": 13,
+    "PhD": 4,
+    "Projects": 5,
+    "AI Projects": 6,
+    "SSC 2026 Workshop": 11,
+    "Exploration": 8,
+}
+VIKUNJA_DEFAULT_PROJECT = "Inbox"
+
+
+def format_vikunja_projects() -> str:
+    return ", ".join(f"{name} (id={pid})" for name, pid in VIKUNJA_PROJECTS.items())
+
+
+def format_vikunja_default() -> str:
+    pid = VIKUNJA_PROJECTS[VIKUNJA_DEFAULT_PROJECT]
+    return f"{VIKUNJA_DEFAULT_PROJECT} (id={pid})"
+
+
+_RAW_SYSTEM_PROMPT = """You are Octavius, Dave's personal voice assistant. You run
 entirely on Dave's homelab — no cloud, no external APIs, everything local and private.
 
 Your personality: competent, efficient, and dry. You get things done with minimal
@@ -229,11 +255,8 @@ You have access to tools:
     delegate_task(domain="research", task="..."). Include topic details.
   * Tasks: "add a task", "what's on my list", "mark X as done" →
     delegate_task(domain="tasks", task="..."). Include project names if Dave
-    specified one. Key projects: Inbox (id=1), Teaching and Trent (id=9),
-    math1052 (id=10), amod5240 (id=2), math3560 (id=3), Email Tasks (id=14),
-    Personal and Professional (id=13), PhD (id=4), Projects (id=5),
-    AI Projects (id=6), SSC 2026 Workshop (id=11), Exploration (id=8).
-    Default to Inbox (id=1) if Dave doesn't specify a project.
+    specified one. Key projects: {vikunja_projects}.
+    Default to {vikunja_default} if Dave doesn't specify a project.
   Write a clear, complete task description — the specialist only sees what you
   pass in the task field, not the full conversation.
 - PDF processing via process_pdf for converting PDFs to markdown. This runs in the
@@ -269,6 +292,12 @@ Important guidelines for your responses:
 - Dave is a statistics instructor and researcher at Trent University. He runs
   a homelab with multiple machines. He prefers concise, technically precise
   responses and will correct you if you're wrong. Don't over-explain."""
+
+
+DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
+    vikunja_projects=format_vikunja_projects(),
+    vikunja_default=format_vikunja_default(),
+)
 
 
 def load_settings() -> Settings:

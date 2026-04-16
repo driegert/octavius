@@ -137,6 +137,22 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("research", subagent.SUBAGENT_DOMAINS)
         self.assertEqual(subagent.SUBAGENT_DOMAINS["research"]["servers"], ["openalex"])
 
+    async def test_vikunja_project_list_is_shared(self):
+        from settings import (
+            DEFAULT_SYSTEM_PROMPT,
+            format_vikunja_default,
+            format_vikunja_projects,
+        )
+
+        projects_snippet = format_vikunja_projects()
+        default_snippet = format_vikunja_default()
+        tasks_prompt = subagent.SUBAGENT_DOMAINS["tasks"]["system_prompt"]
+
+        self.assertIn(projects_snippet, DEFAULT_SYSTEM_PROMPT)
+        self.assertIn(projects_snippet, tasks_prompt)
+        self.assertIn(default_snippet, DEFAULT_SYSTEM_PROMPT)
+        self.assertIn(default_snippet, tasks_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
