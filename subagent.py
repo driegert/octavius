@@ -65,6 +65,47 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
 }
 
 MAX_RESULT_CHARS = 4000
+TOOL_DATA_HEADER = (
+    "===TOOL DATA (authoritative source for IDs and field values; "
+    "do not read aloud)==="
+)
+
+
+def _compose_result(final_text: str, observations: list[tuple[str, dict, str]]) -> str:
+    """Combine the subagent's natural-language summary with a verbatim block
+    of the raw tool observations, so the caller can extract exact IDs and
+    field values instead of relying on LLM-paraphrased numbers.
+    """
+    if not observations:
+        return final_text[:MAX_RESULT_CHARS]
+
+    header = f"\n\n{TOOL_DATA_HEADER}\n"
+    # Reserve budget for the natural-language summary + header + newlines.
+    remaining = MAX_RESULT_CHARS - len(final_text) - len(header)
+    if remaining <= 0:
+        return final_text[:MAX_RESULT_CHARS]
+
+    # Include observations newest-first so the most recent (usually the
+    # mutation the caller will ask about next) always survives truncation.
+    kept: list[str] = []
+    for name, args, result in reversed(observations):
+        try:
+            args_repr = json.dumps(args, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            args_repr = str(args)
+        line = f"[{name}] args={args_repr}\n{result}"
+        if len(line) + 2 > remaining:
+            if remaining > 40:
+                line = line[: remaining - len("\n...(truncated)")] + "\n...(truncated)"
+                kept.append(line)
+            break
+        kept.append(line)
+        remaining -= len(line) + 2  # 2 for the "\n\n" separator
+
+    # Reverse back to chronological order for readability.
+    block = "\n\n".join(reversed(kept))
+    combined = f"{final_text}{header}{block}"
+    return combined[:MAX_RESULT_CHARS]
 
 
 async def run_subagent(
@@ -73,7 +114,7 @@ async def run_subagent(
     mcp: "MCPManager",
     status_callback: Callable[[str], object] | None = None,
 ) -> str:
-    """Run a scoped subagent loop and return the final text."""
+    """Run a scoped subagent loop and return the final text plus raw tool data."""
     config = SUBAGENT_DOMAINS.get(domain)
     if not config:
         return f"Error: unknown delegation domain '{domain}'"
@@ -89,6 +130,7 @@ async def run_subagent(
 
     max_rounds = config["max_rounds"]
     last_text = ""
+    observations: list[tuple[str, dict, str]] = []
 
     for round_num in range(max_rounds):
         payload = {
@@ -104,7 +146,8 @@ async def run_subagent(
 
         message = await llm_client.complete_with_tools(payload)
         if message is None:
-            return last_text or "Error: all LLM endpoints failed during delegation."
+            fallback = last_text or "Error: all LLM endpoints failed during delegation."
+            return _compose_result(fallback, observations)
 
         content = message.get("content") or ""
         tool_calls = message.get("tool_calls") or []
@@ -116,7 +159,8 @@ async def run_subagent(
 
         if not tool_calls:
             # Final text response
-            return (last_text or "The assistant completed but produced no output.")[:MAX_RESULT_CHARS]
+            final_text = last_text or "The assistant completed but produced no output."
+            return _compose_result(final_text, observations)
 
         # Append the assistant message (with tool_calls) to context
         messages.append(message)
@@ -138,6 +182,7 @@ async def run_subagent(
 
             result = await mcp.call_tool(name, args)
             log.info("Subagent [%s] tool %s → %d chars", domain, name, len(result))
+            observations.append((name, args, result))
 
             messages.append({
                 "role": "tool",
@@ -146,4 +191,5 @@ async def run_subagent(
             })
 
     # Max rounds exhausted
-    return (last_text or "I ran out of steps before finishing. Here's what I found so far.")[:MAX_RESULT_CHARS]
+    final_text = last_text or "I ran out of steps before finishing. Here's what I found so far."
+    return _compose_result(final_text, observations)

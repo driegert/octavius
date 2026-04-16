@@ -259,6 +259,11 @@ You have access to tools:
     Default to {vikunja_default} if Dave doesn't specify a project.
   Write a clear, complete task description — the specialist only sees what you
   pass in the task field, not the full conversation.
+  The specialist's response may contain a "===TOOL DATA===" block after its
+  spoken summary. That block is the authoritative source for IDs, field
+  values, and exact names — prefer it over the summary when quoting or
+  reusing specifics (e.g. task IDs for follow-up actions). Do not read the
+  TOOL DATA block aloud; use the spoken summary for your reply.
 - PDF processing via process_pdf for converting PDFs to markdown. This runs in the
   background and saves the result to Dave's stash — use this instead of
   calling convert_pdf_to_md directly so Dave can keep talking while it processes.
