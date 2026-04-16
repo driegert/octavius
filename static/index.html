@@ -131,6 +131,18 @@
     color: #ff6666;
     box-shadow: 0 0 30px rgba(255, 68, 68, 0.2), 0 0 60px rgba(255, 68, 68, 0.08);
   }
+  #talk-btn.continuous-active {
+    border-color: #44bb88;
+    background: #101f18;
+    color: #66ddaa;
+    box-shadow: 0 0 30px rgba(68, 187, 136, 0.2), 0 0 60px rgba(68, 187, 136, 0.08);
+  }
+  #talk-btn.continuous-active.recording {
+    border-color: #ff4444;
+    background: #201015;
+    color: #ff6666;
+    box-shadow: 0 0 30px rgba(255, 68, 68, 0.2), 0 0 60px rgba(255, 68, 68, 0.08);
+  }
   #talk-btn:disabled {
     opacity: 0.3;
     cursor: not-allowed;
@@ -712,10 +724,12 @@
     </div>
 
     <div class="setting-group">
-      <div class="setting-row">
-        <input type="checkbox" id="toggle-talk-cb">
-        <span class="cb-label" onclick="document.getElementById('toggle-talk-cb').click()">Toggle-to-talk</span>
-      </div>
+      <label for="talk-mode-select">Talk mode</label>
+      <select id="talk-mode-select">
+        <option value="hold">Hold to talk</option>
+        <option value="toggle">Tap to talk</option>
+        <option value="continuous">Continuous conversation</option>
+      </select>
     </div>
 
     <button class="panel-close" id="settings-close">Done</button>

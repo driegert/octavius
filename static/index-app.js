@@ -19,7 +19,7 @@
   const textInputArea = document.getElementById('text-input-area');
   const textInput = document.getElementById('text-input');
   const textSend = document.getElementById('text-send');
-  const toggleTalkCb = document.getElementById('toggle-talk-cb');
+  const talkModeSelect = document.getElementById('talk-mode-select');
   const historyBtn = document.getElementById('history-btn');
   const historyBtnBot = document.getElementById('history-btn-bottom');
   const historyOver = document.getElementById('history-overlay');
@@ -48,7 +48,8 @@
   let currentVoice = 'de_male';
   let sttEnabled = true;
   let ttsEnabled = true;
-  let toggleToTalk = false;
+  let talkMode = 'hold';
+  let continuousActive = false;
   let currentConversationId = null;
   let conversationHistory = [];
 
@@ -74,9 +75,15 @@
     },
     onPlaybackIdle() {
       stopBtn.classList.remove('visible');
-      setStatus('Ready');
-      talkBtn.disabled = false;
-      textSend.disabled = !textInput.value.trim();
+      if (continuousActive && sttEnabled) {
+        setStatus('Listening...', true);
+        talkBtn.disabled = false;
+        startRecording();
+      } else {
+        setStatus('Ready');
+        talkBtn.disabled = false;
+        textSend.disabled = !textInput.value.trim();
+      }
     },
   });
 
@@ -184,7 +191,13 @@
     if (sttEnabled) {
       talkBtn.style.display = '';
       textInputArea.classList.remove('visible');
-      talkBtn.innerHTML = toggleToTalk ? 'TAP TO<br>TALK' : 'HOLD TO<br>TALK';
+      if (talkMode === 'continuous') {
+        talkBtn.innerHTML = continuousActive ? 'END<br>CONVERSATION' : 'START<br>CONVERSATION';
+      } else if (talkMode === 'toggle') {
+        talkBtn.innerHTML = 'TAP TO<br>TALK';
+      } else {
+        talkBtn.innerHTML = 'HOLD TO<br>TALK';
+      }
     } else {
       talkBtn.style.display = 'none';
       textInputArea.classList.add('visible');
@@ -193,12 +206,12 @@
 
     sttToggle.classList.toggle('off', !sttEnabled);
     ttsToggle.classList.toggle('off', !ttsEnabled);
-    toggleTalkCb.checked = toggleToTalk;
+    talkModeSelect.value = talkMode;
 
     const prefs = loadPrefs();
     prefs.sttEnabled = sttEnabled;
     prefs.ttsEnabled = ttsEnabled;
-    prefs.toggleToTalk = toggleToTalk;
+    prefs.talkMode = talkMode;
     savePrefs(prefs);
   }
 
@@ -340,9 +353,15 @@
           setAssistantText(msg.text);
           conversationHistory.push({ role: 'assistant', content: msg.text });
           if (!ttsEnabled) {
-            setStatus('Ready');
-            talkBtn.disabled = false;
-            textSend.disabled = !textInput.value.trim();
+            if (continuousActive && sttEnabled) {
+              setStatus('Listening...', true);
+              talkBtn.disabled = false;
+              startRecording();
+            } else {
+              setStatus('Ready');
+              talkBtn.disabled = false;
+              textSend.disabled = !textInput.value.trim();
+            }
           }
         }
         if (msg.type === 'conversation_loaded') {
@@ -363,6 +382,11 @@
       onClose() {
         talkBtn.disabled = true;
         textSend.disabled = true;
+        if (continuousActive) {
+          continuousActive = false;
+          talkBtn.classList.remove('continuous-active', 'recording');
+          updateInputMode();
+        }
         setStatus('Disconnected. Reconnecting...');
       },
     });
@@ -408,7 +432,7 @@
       sttSendTimer = setInterval(sendPCMChunks, 250);
 
       talkBtn.classList.add('recording');
-      setStatus('Recording...', true);
+      setStatus(continuousActive ? 'Listening...' : 'Recording...', true);
     } catch (_err) {
       setStatus('Microphone access denied.');
     }
@@ -438,9 +462,38 @@
     talkBtn.classList.remove('recording');
   }
 
+  function startContinuousConversation() {
+    continuousActive = true;
+    talkBtn.classList.add('continuous-active');
+    updateInputMode();
+    startRecording();
+  }
+
+  function endContinuousConversation() {
+    continuousActive = false;
+    talkBtn.classList.remove('continuous-active', 'recording');
+    // Tear down audio without sending stt_stop (no utterance to process)
+    if (sttStreaming) {
+      sttStreaming = false;
+      if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
+      if (sttStream) { sttStream.getTracks().forEach((t) => t.stop()); sttStream = null; }
+      if (sttAudioCtx) { sttAudioCtx.close(); sttAudioCtx = null; }
+      sttProcessor = null;
+      sttChunks = [];
+    }
+    setStatus('Ready');
+    updateInputMode();
+  }
+
   function handleTalkDown(event) {
     event.preventDefault();
-    if (toggleToTalk) {
+    if (talkMode === 'continuous') {
+      if (continuousActive) {
+        endContinuousConversation();
+      } else {
+        startContinuousConversation();
+      }
+    } else if (talkMode === 'toggle') {
       if (sttStreaming) {
         stopRecording();
       } else {
@@ -452,7 +505,7 @@
   }
 
   function handleTalkUp() {
-    if (!toggleToTalk) stopRecording();
+    if (talkMode === 'hold') stopRecording();
   }
 
   function openFullConversation() {
@@ -503,12 +556,17 @@
   if (prefs.voice) currentVoice = prefs.voice;
   if (prefs.sttEnabled !== undefined) sttEnabled = prefs.sttEnabled;
   if (prefs.ttsEnabled !== undefined) ttsEnabled = prefs.ttsEnabled;
-  if (prefs.toggleToTalk !== undefined) toggleToTalk = prefs.toggleToTalk;
+  if (prefs.talkMode) {
+    talkMode = prefs.talkMode;
+  } else if (prefs.toggleToTalk) {
+    talkMode = 'toggle';
+  }
   applyVoicePrefs(currentVoice);
   updateInputMode();
 
   sttToggle.addEventListener('click', () => {
     sttEnabled = !sttEnabled;
+    if (!sttEnabled && continuousActive) endContinuousConversation();
     updateInputMode();
   });
 
@@ -563,8 +621,11 @@
 
   trimCb.addEventListener('change', persistCurrent);
 
-  toggleTalkCb.addEventListener('change', () => {
-    toggleToTalk = toggleTalkCb.checked;
+  talkModeSelect.addEventListener('change', () => {
+    if (continuousActive && talkModeSelect.value !== 'continuous') {
+      endContinuousConversation();
+    }
+    talkMode = talkModeSelect.value;
     updateInputMode();
   });
 
@@ -586,6 +647,7 @@
 
   resetBtn.addEventListener('click', () => {
     if (ws && ws.readyState === WebSocket.OPEN) {
+      if (continuousActive) endContinuousConversation();
       ws.send(JSON.stringify({ type: 'reset' }));
       currentConversationId = null;
       conversationHistory = [];
