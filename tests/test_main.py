@@ -34,6 +34,9 @@ class _FakeMCPManager:
     async def disconnect_all(self):
         return None
 
+    def get_registered_tool_names(self):
+        return {t["function"]["name"] for t in self.tools}
+
     def get_health(self):
         return {
             "configured_servers": 2,

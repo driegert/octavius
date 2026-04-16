@@ -68,11 +68,22 @@ class MCPManager:
         tool_count = 0
         cfg = self._configs.get(server_name, {})
         allowlist = cfg.get("tool_allowlist")
+        upstream_names = {t.name for t in result.tools}
         for t in result.tools:
             if allowlist and t.name not in allowlist:
                 log.debug("Skipping tool %s from %s (not in allowlist)", t.name, server_name)
                 continue
             tool_count += 1
+            # Collision detection: warn only if a *different* server owns this
+            # name. Same-server re-registration after reconnect is expected
+            # and silent.
+            existing_owner = self._tool_route.get(t.name)
+            if existing_owner and existing_owner != server_name:
+                log.warning(
+                    "Tool name collision: '%s' previously registered by '%s', "
+                    "now being overwritten by '%s'",
+                    t.name, existing_owner, server_name,
+                )
             openai_tool = {
                 "type": "function",
                 "function": {
@@ -90,7 +101,19 @@ class MCPManager:
             self.tools.append(openai_tool)
             self._tool_route[t.name] = server_name
             log.info("Registered tool %s from %s", t.name, server_name)
+        if allowlist:
+            missing = set(allowlist) - upstream_names
+            if missing:
+                log.warning(
+                    "Allowlist drift for server '%s': %d entry(ies) in "
+                    "tool_allowlist not present upstream: %s",
+                    server_name, len(missing), sorted(missing),
+                )
         self._server_status[server_name]["tool_count"] = tool_count
+
+    def get_registered_tool_names(self) -> set[str]:
+        """Names of all MCP tools currently registered (post-allowlist)."""
+        return set(self._tool_route.keys())
 
     async def _reconnect(self, server_name: str) -> bool:
         """Tear down and re-establish a single server connection."""

@@ -90,6 +90,85 @@ class MCPManagerTests(unittest.TestCase):
         manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
         self.assertEqual(manager.get_tools_for_servers(["nonexistent"]), [])
 
+    def test_collision_warning_when_different_server_overwrites(self):
+        manager = MCPManager({
+            "alpha": {"transport": "http"},
+            "beta": {"transport": "http"},
+        })
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
+        with self.assertLogs("mcp_manager", level="WARNING") as cm:
+            manager._register_tools("beta", _FakeListTools([_FakeTool("search")]))
+        self.assertTrue(any("collision" in msg for msg in cm.output))
+        self.assertEqual(manager.get_server_for_tool("search"), "beta")
+
+    def test_no_collision_warning_on_same_server_reregister(self):
+        manager = MCPManager({"alpha": {"transport": "http"}})
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
+        # Re-registration after reconnect is expected and must be silent.
+        # assertNoLogs (3.10+) would be cleaner; this captures all and checks.
+        import logging as _logging
+        collision_logs = []
+
+        class _Capture(_logging.Handler):
+            def emit(self, record):
+                if "collision" in record.getMessage():
+                    collision_logs.append(record.getMessage())
+
+        handler = _Capture(level=_logging.WARNING)
+        _logging.getLogger("mcp_manager").addHandler(handler)
+        try:
+            manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
+        finally:
+            _logging.getLogger("mcp_manager").removeHandler(handler)
+        self.assertEqual(collision_logs, [])
+
+    def test_allowlist_drift_logs_warning(self):
+        manager = MCPManager({
+            "alpha": {
+                "transport": "stdio",
+                "tool_allowlist": ["kept_tool", "vanished_tool", "also_gone"],
+            },
+        })
+        # Only "kept_tool" is present upstream.
+        with self.assertLogs("mcp_manager", level="WARNING") as cm:
+            manager._register_tools("alpha", _FakeListTools([_FakeTool("kept_tool")]))
+        joined = "\n".join(cm.output)
+        self.assertIn("Allowlist drift", joined)
+        self.assertIn("vanished_tool", joined)
+        self.assertIn("also_gone", joined)
+
+    def test_allowlist_no_drift_no_warning(self):
+        manager = MCPManager({
+            "alpha": {"transport": "stdio", "tool_allowlist": ["a", "b"]},
+        })
+        import logging as _logging
+        drift_logs = []
+
+        class _Capture(_logging.Handler):
+            def emit(self, record):
+                if "Allowlist drift" in record.getMessage():
+                    drift_logs.append(record.getMessage())
+
+        handler = _Capture(level=_logging.WARNING)
+        _logging.getLogger("mcp_manager").addHandler(handler)
+        try:
+            manager._register_tools("alpha", _FakeListTools([_FakeTool("a"), _FakeTool("b"), _FakeTool("c")]))
+        finally:
+            _logging.getLogger("mcp_manager").removeHandler(handler)
+        self.assertEqual(drift_logs, [])
+
+    def test_get_registered_tool_names_returns_all_routed_names(self):
+        manager = MCPManager({
+            "alpha": {"transport": "http"},
+            "beta": {"transport": "http"},
+        })
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("search"), _FakeTool("get")]))
+        manager._register_tools("beta", _FakeListTools([_FakeTool("list_emails")]))
+        self.assertEqual(
+            manager.get_registered_tool_names(),
+            {"search", "get", "list_emails"},
+        )
+
     def test_get_health_reports_degraded_when_some_servers_disconnected(self):
         manager = MCPManager(
             {

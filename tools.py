@@ -44,6 +44,21 @@ def get_local_tool_handlers() -> dict[str, Callable]:
     }
 
 
+def validate_local_tool_registry() -> list[str]:
+    """Return a list of inconsistencies between local tool specs and handlers.
+    Empty list means everything matches. Each entry is a human-readable
+    description of one drift — suitable for log.warning output.
+    """
+    spec_names = {t["function"]["name"] for t in TOOLS}
+    handler_names = set(get_local_tool_handlers().keys())
+    issues: list[str] = []
+    for name in sorted(spec_names - handler_names):
+        issues.append(f"Local tool spec '{name}' has no handler in tools.py")
+    for name in sorted(handler_names - spec_names):
+        issues.append(f"Local tool handler '{name}' has no spec in local_tool_specs.py")
+    return issues
+
+
 async def call_tool(
     name: str,
     arguments: dict,

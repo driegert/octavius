@@ -14,6 +14,7 @@ from routes.inbox import router as inbox_router
 from routes.reader_api import router as reader_router
 from reader_store import fail_stale_processing_documents
 from service_clients import llm_client
+import tools as local_tools
 from websocket_session import handle_websocket_session
 
 logging.basicConfig(
@@ -38,6 +39,15 @@ async def lifespan(app: FastAPI):
     log.info("Connecting MCP servers...")
     await mcp_manager.connect_all()
     log.info("MCP ready — %d tools available", len(mcp_manager.tools))
+    for issue in local_tools.validate_local_tool_registry():
+        log.warning("%s", issue)
+    local_names = {t["function"]["name"] for t in local_tools.TOOLS}
+    overlap = local_names & mcp_manager.get_registered_tool_names()
+    if overlap:
+        log.warning(
+            "Local tool name(s) collide with MCP tools (local handler wins): %s",
+            sorted(overlap),
+        )
     yield
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
