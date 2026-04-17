@@ -65,11 +65,12 @@ class _RecordingAsyncClient:
         return outcome
 
 
-def _make_tts_client() -> TTSClient:
+def _make_tts_client(kokoro_voices: list[str] | None = None) -> TTSClient:
     return TTSClient(
         primary={"url": "http://primary-tts", "model": "voxtral", "voice": "alice"},
         fallback={"url": "http://fallback-tts", "model": "kokoro", "voice": "bob"},
         response_format="wav",
+        kokoro_voices=kokoro_voices,
     )
 
 
@@ -279,6 +280,59 @@ class TTSCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured["url"], "http://primary-tts")
         self.assertEqual(captured["json"]["voice"], "charlie")
+
+    async def test_kokoro_voice_bypasses_primary(self):
+        client = _make_tts_client(kokoro_voices=["af_heart"])
+        fake = _RecordingAsyncClient([_FakeTTSResponse(b"kokoro-audio")])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.synthesize("hi", voice="af_heart")
+
+        self.assertEqual(result, b"kokoro-audio")
+        self.assertEqual(fake.calls, ["http://fallback-tts"])
+        self.assertEqual(client._primary_consecutive_failures, 0)
+        self.assertFalse(client._primary_is_tripped())
+
+    async def test_kokoro_voice_sends_user_voice_not_fallback_default(self):
+        client = _make_tts_client(kokoro_voices=["af_heart"])
+
+        captured: dict = {}
+
+        class _Capturing(_RecordingAsyncClient):
+            async def post(self, url, json=None):
+                captured["url"] = url
+                captured["json"] = json
+                return _FakeTTSResponse(b"ok")
+
+        with patch("service_clients.httpx.AsyncClient", return_value=_Capturing([])):
+            await client.synthesize("hi", voice="af_heart")
+
+        self.assertEqual(captured["url"], "http://fallback-tts")
+        self.assertEqual(captured["json"]["voice"], "af_heart")
+
+    async def test_kokoro_voice_ignores_tripped_breaker(self):
+        client = _make_tts_client(kokoro_voices=["af_heart"])
+        client._primary_consecutive_failures = TTSClient.PRIMARY_FAILURE_THRESHOLD
+        client._primary_skip_until = time.monotonic() + 60.0
+        fake = _RecordingAsyncClient([_FakeTTSResponse(b"kokoro-audio")])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.synthesize("hi", voice="af_heart")
+
+        self.assertEqual(result, b"kokoro-audio")
+        self.assertEqual(fake.calls, ["http://fallback-tts"])
+        # Breaker state untouched by Kokoro-voice calls.
+        self.assertTrue(client._primary_is_tripped())
+
+    async def test_non_kokoro_voice_still_uses_primary(self):
+        client = _make_tts_client(kokoro_voices=["af_heart"])
+        fake = _RecordingAsyncClient([_FakeTTSResponse(b"primary-audio")])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.synthesize("hi", voice="de_male")
+
+        self.assertEqual(result, b"primary-audio")
+        self.assertEqual(fake.calls, ["http://primary-tts"])
 
 
 if __name__ == "__main__":

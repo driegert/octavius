@@ -70,19 +70,34 @@
   async function loadVoices(selectEl, options) {
     const {
       currentVoice,
-      fallbackVoice = 'de_male',
+      fallbackVoice = 'bm_lewis',
       onLoaded,
     } = options || {};
 
     const response = await fetch('/api/voices');
     const data = await response.json();
 
-    selectEl.innerHTML = '';
-    for (const voice of data.voices || []) {
+    function makeOption(voice) {
       const opt = document.createElement('option');
       opt.value = voice;
       opt.textContent = voice.replace(/_/g, ' ');
-      selectEl.appendChild(opt);
+      return opt;
+    }
+
+    selectEl.innerHTML = '';
+    const byEngine = data.voices_by_engine || null;
+    if (byEngine) {
+      const engineLabels = { kokoro: 'Kokoro (fast, reliable)', voxtral: 'Voxtral (expressive)' };
+      for (const engine of ['kokoro', 'voxtral']) {
+        const voices = byEngine[engine] || [];
+        if (!voices.length) continue;
+        const group = document.createElement('optgroup');
+        group.label = engineLabels[engine] || engine;
+        for (const voice of voices) group.appendChild(makeOption(voice));
+        selectEl.appendChild(group);
+      }
+    } else {
+      for (const voice of data.voices || []) selectEl.appendChild(makeOption(voice));
     }
 
     let resolvedVoice = data.default || fallbackVoice;

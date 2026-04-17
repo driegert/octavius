@@ -601,8 +601,8 @@
     },
   }).catch(() => {
     const opt = document.createElement('option');
-    opt.value = 'de_male';
-    opt.textContent = 'de male';
+    opt.value = 'bm_lewis';
+    opt.textContent = 'bm lewis';
     voiceSelect.appendChild(opt);
   });
 

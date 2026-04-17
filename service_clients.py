@@ -59,22 +59,36 @@ class STTClient:
 
 class TTSClient:
     """
-    Primary → fallback TTS with a circuit breaker on the primary.
+    Voice-routed TTS. The selected voice determines the engine:
 
-    After PRIMARY_FAILURE_THRESHOLD consecutive failures the primary is
-    "tripped": subsequent synth calls skip it entirely and go straight to the
-    fallback for PRIMARY_COOLDOWN_SECONDS. When the cooldown elapses the next
-    call probes the primary again ("half-open"); a success closes the breaker
-    and resets the counter, a failure re-trips it.
+    - Voices in `kokoro_voices` go straight to the fallback (Kokoro) endpoint,
+      with no Voxtral attempt and no breaker interaction. Users pick these
+      when they want reliable synthesis and don't care about Voxtral.
+    - Any other voice is treated as a primary (Voxtral) voice and goes through
+      the primary → fallback path with a circuit breaker on the primary.
+
+    Breaker behavior: after PRIMARY_FAILURE_THRESHOLD consecutive failures the
+    primary is "tripped": subsequent synth calls on primary voices skip it
+    entirely and go to the fallback with its own voice for
+    PRIMARY_COOLDOWN_SECONDS. When the cooldown elapses the next primary-voice
+    call probes the primary again ("half-open"); a success closes the breaker,
+    a failure re-trips it.
     """
 
     PRIMARY_FAILURE_THRESHOLD = 3
     PRIMARY_COOLDOWN_SECONDS = 300.0
 
-    def __init__(self, primary: dict, fallback: dict, response_format: str):
+    def __init__(
+        self,
+        primary: dict,
+        fallback: dict,
+        response_format: str,
+        kokoro_voices: list[str] | None = None,
+    ):
         self.primary = primary
         self.fallback = fallback
         self.response_format = response_format
+        self._kokoro_voices = set(kokoro_voices or [])
         self._primary_consecutive_failures = 0
         self._primary_skip_until = 0.0  # monotonic; 0 means breaker closed
 
@@ -100,6 +114,19 @@ class TTSClient:
 
     async def synthesize(self, text: str, voice: str | None = None) -> bytes:
         async with httpx.AsyncClient(timeout=120.0) as client:
+            if voice and voice in self._kokoro_voices:
+                resp = await client.post(
+                    self.fallback["url"],
+                    json={
+                        "input": text,
+                        "voice": voice,
+                        "model": self.fallback["model"],
+                        "response_format": self.response_format,
+                    },
+                )
+                resp.raise_for_status()
+                return resp.content
+
             if not self._primary_is_tripped():
                 try:
                     resp = await client.post(
@@ -488,6 +515,7 @@ tts_client = TTSClient(
         "voice": settings.tts.fallback_voice,
     },
     response_format=settings.tts.format,
+    kokoro_voices=settings.tts.kokoro_voices,
 )
 llm_client = LLMChainClient(settings.llm_chain)
 summary_client = SummaryClient(settings.summary_url, settings.summary_fallback_url)

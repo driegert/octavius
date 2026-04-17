@@ -24,6 +24,8 @@ class TTSSettings:
     voice: str
     format: str
     voices: list[str]
+    voxtral_voices: list[str]
+    kokoro_voices: list[str]
     fallback_url: str
     fallback_model: str
     fallback_voice: str
@@ -60,7 +62,7 @@ class Settings:
     tag_generation_min_messages: int
 
 
-DEFAULT_TTS_VOICES = [
+DEFAULT_VOXTRAL_VOICES = [
     "de_male",
     "de_female",
     "neutral_male",
@@ -81,6 +83,17 @@ DEFAULT_TTS_VOICES = [
     "nl_male",
     "pt_female",
     "pt_male",
+]
+
+DEFAULT_KOKORO_VOICES = [
+    # American English
+    "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica",
+    "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+    "am_michael", "am_onyx", "am_puck", "am_santa",
+    # British English
+    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
 ]
 
 
@@ -316,12 +329,16 @@ def load_settings() -> Settings:
             {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
         ],
     )
+    voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
+    kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
     tts = TTSSettings(
         url=_env_str("OCTAVIUS_TTS_URL", "http://triplestuffed:8020/v1/audio/speech"),
         model=_env_str("OCTAVIUS_TTS_MODEL", "/media/extra_stuff/huggingface/mistralai/Voxtral-4B-TTS-2603"),
-        voice=_env_str("OCTAVIUS_TTS_VOICE", "de_male"),
+        voice=_env_str("OCTAVIUS_TTS_VOICE", "bm_lewis"),
         format=_env_str("OCTAVIUS_TTS_FORMAT", "wav"),
-        voices=_env_json("OCTAVIUS_TTS_VOICES", DEFAULT_TTS_VOICES),
+        voices=voxtral_voices + kokoro_voices,
+        voxtral_voices=voxtral_voices,
+        kokoro_voices=kokoro_voices,
         fallback_url=_env_str("OCTAVIUS_TTS_FALLBACK_URL", "http://lilbuddy:8880/v1/audio/speech"),
         fallback_model=_env_str("OCTAVIUS_TTS_FALLBACK_MODEL", "kokoro"),
         fallback_voice=_env_str("OCTAVIUS_TTS_FALLBACK_VOICE", "bm_lewis"),

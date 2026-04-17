@@ -110,7 +110,14 @@ async def health(request: Request):
 
 @app.get("/api/voices")
 async def voices():
-    return JSONResponse({"voices": settings.tts.voices, "default": settings.tts.voice})
+    return JSONResponse({
+        "voices": settings.tts.voices,
+        "default": settings.tts.voice,
+        "voices_by_engine": {
+            "voxtral": settings.tts.voxtral_voices,
+            "kokoro": settings.tts.kokoro_voices,
+        },
+    })
 
 
 @app.websocket("/ws")
