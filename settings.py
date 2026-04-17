@@ -55,8 +55,7 @@ class Settings:
     summary_fallback_url: str
     summary_model: str
     summary_timeout: int
-    ollama_base_url: str
-    ollama_model: str
+    embedding_chain: list[dict]
     embedding_timeout: int
     result_summary_max_chars: int
     tag_generation_min_messages: int
@@ -364,8 +363,21 @@ def load_settings() -> Settings:
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://triplestuffed:8010/v1/chat/completions"),
         summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.5-35b-a3b"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
-        ollama_base_url=_env_str("OCTAVIUS_OLLAMA_BASE_URL", "http://workhorse:11434"),
-        ollama_model=_env_str("OCTAVIUS_OLLAMA_MODEL", "bge-m3"),
+        embedding_chain=_env_json(
+            "OCTAVIUS_EMBEDDING_CHAIN",
+            [
+                {
+                    "url": "http://lilbuddy:8010/v1/embeddings",
+                    "model": "bge-m3",
+                    "schema": "openai",
+                },
+                {
+                    "url": "http://workhorse:11434/api/embeddings",
+                    "model": "bge-m3",
+                    "schema": "ollama",
+                },
+            ],
+        ),
         embedding_timeout=_env_int("OCTAVIUS_EMBEDDING_TIMEOUT", 5),
         result_summary_max_chars=_env_int("OCTAVIUS_RESULT_SUMMARY_MAX_CHARS", 500),
         tag_generation_min_messages=_env_int("OCTAVIUS_TAG_GENERATION_MIN_MESSAGES", 4),

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import threading
@@ -469,37 +470,109 @@ class SummaryClient:
 
 
 class EmbeddingClient:
-    def __init__(self, base_url: str, model: str):
-        self.base_url = base_url
-        self.model = model
+    """Chain of embedding endpoints with per-endpoint schema and transient retry.
+
+    Each chain entry has `url`, `model`, and `schema` ("ollama" or "openai"):
+
+    - `ollama`  — POST `{url}` with `{"model", "prompt"}`, response `{"embedding": [...]}`
+    - `openai`  — POST `{url}` with `{"model", "input"}`, response `{"data": [{"embedding": [...]}]}`
+
+    On each endpoint the client retries once for transient errors (HTTP 5xx,
+    timeout). Connection errors (endpoint down) and programmer errors (bad
+    response shape) do not retry — the chain moves on to the next endpoint
+    immediately. Terminal failures after the whole chain is exhausted are
+    logged at WARNING so they show up in journalctl without debug logging.
+    """
+
+    PER_ENDPOINT_ATTEMPTS = 2
+    RETRY_BACKOFF_SECONDS = 0.3
+    _VALID_SCHEMAS = ("ollama", "openai")
+
+    def __init__(self, chain: list[dict]):
+        if not chain:
+            raise ValueError("embedding chain must have at least one endpoint")
+        for entry in chain:
+            if entry.get("schema") not in self._VALID_SCHEMAS:
+                raise ValueError(
+                    f"embedding endpoint {entry.get('url')!r} has unknown schema "
+                    f"{entry.get('schema')!r}; must be one of {self._VALID_SCHEMAS}"
+                )
+            if not entry.get("url") or not entry.get("model"):
+                raise ValueError(f"embedding endpoint missing url or model: {entry!r}")
+        self.chain = list(chain)
+
+    @staticmethod
+    def _build_payload(entry: dict, text: str) -> dict:
+        if entry["schema"] == "ollama":
+            return {"model": entry["model"], "prompt": text}
+        return {"model": entry["model"], "input": text}
+
+    @staticmethod
+    def _extract_vector(entry: dict, body: dict) -> list[float]:
+        if entry["schema"] == "ollama":
+            return body["embedding"]
+        return body["data"][0]["embedding"]
+
+    @staticmethod
+    def _is_retry_worthy(exc: Exception) -> bool:
+        """Should we retry the same endpoint? Only transient server-side issues."""
+        if isinstance(exc, httpx.TimeoutException):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            return exc.response.status_code >= 500
+        if isinstance(exc, requests.exceptions.Timeout):
+            return True
+        if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+            return exc.response.status_code >= 500
+        return False
 
     def embed_text(self, text: str, *, timeout: int) -> bytes | None:
-        try:
-            resp = requests.post(
-                f"{self.base_url}/api/embeddings",
-                json={"model": self.model, "prompt": text},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            vec = np.array(resp.json()["embedding"], dtype=np.float32)
-            return vec.tobytes()
-        except Exception:
-            log.debug("Embedding request failed", exc_info=True)
-            return None
+        last_exc: Exception | None = None
+        for entry in self.chain:
+            for attempt in range(1, self.PER_ENDPOINT_ATTEMPTS + 1):
+                try:
+                    resp = requests.post(
+                        entry["url"],
+                        json=self._build_payload(entry, text),
+                        timeout=timeout,
+                    )
+                    resp.raise_for_status()
+                    vec = np.array(self._extract_vector(entry, resp.json()), dtype=np.float32)
+                    return vec.tobytes()
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < self.PER_ENDPOINT_ATTEMPTS and self._is_retry_worthy(exc):
+                        log.debug("Embedding %s attempt %d failed (%s), retrying", entry["url"], attempt, exc)
+                        time.sleep(self.RETRY_BACKOFF_SECONDS)
+                        continue
+                    log.debug("Embedding endpoint %s failed: %s", entry["url"], exc)
+                    break
+        log.warning("All embedding endpoints failed: %s", last_exc)
+        return None
 
     async def aembed_text(self, text: str, *, timeout: int) -> bytes | None:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    f"{self.base_url}/api/embeddings",
-                    json={"model": self.model, "prompt": text},
-                )
-                resp.raise_for_status()
-                vec = np.array(resp.json()["embedding"], dtype=np.float32)
-                return vec.tobytes()
-        except Exception:
-            log.debug("Async embedding request failed", exc_info=True)
-            return None
+        last_exc: Exception | None = None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for entry in self.chain:
+                for attempt in range(1, self.PER_ENDPOINT_ATTEMPTS + 1):
+                    try:
+                        resp = await client.post(
+                            entry["url"],
+                            json=self._build_payload(entry, text),
+                        )
+                        resp.raise_for_status()
+                        vec = np.array(self._extract_vector(entry, resp.json()), dtype=np.float32)
+                        return vec.tobytes()
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt < self.PER_ENDPOINT_ATTEMPTS and self._is_retry_worthy(exc):
+                            log.debug("Async embedding %s attempt %d failed (%s), retrying", entry["url"], attempt, exc)
+                            await asyncio.sleep(self.RETRY_BACKOFF_SECONDS)
+                            continue
+                        log.debug("Async embedding endpoint %s failed: %s", entry["url"], exc)
+                        break
+        log.warning("All async embedding endpoints failed: %s", last_exc)
+        return None
 
 
 stt_client = STTClient(settings.stt_url)
@@ -519,4 +592,4 @@ tts_client = TTSClient(
 )
 llm_client = LLMChainClient(settings.llm_chain)
 summary_client = SummaryClient(settings.summary_url, settings.summary_fallback_url)
-embedding_client = EmbeddingClient(settings.ollama_base_url, settings.ollama_model)
+embedding_client = EmbeddingClient(settings.embedding_chain)

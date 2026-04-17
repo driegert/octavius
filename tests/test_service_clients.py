@@ -25,6 +25,11 @@ class _FakeAsyncClient:
         return outcome
 
 
+class _AsyncNoop:
+    async def __call__(self, *args, **kwargs):
+        return None
+
+
 class _FakeResponse:
     def __init__(self, content: str):
         self._content = content
@@ -142,7 +147,9 @@ class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "summary")
 
     async def test_embedding_client_aembed_text_returns_bytes(self):
-        client = EmbeddingClient("http://embed", "bge")
+        client = EmbeddingClient([
+            {"url": "http://embed/api/embeddings", "model": "bge", "schema": "ollama"},
+        ])
         response = _FakeResponse("ignored")
         response.json = lambda: {"embedding": [1.0, 2.0]}
         expected = np.array([1.0, 2.0], dtype=np.float32).tobytes()
@@ -151,6 +158,131 @@ class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
             result = await client.aembed_text("hello", timeout=5)
 
         self.assertEqual(result, expected)
+
+    async def test_embedding_client_retries_transient_500_on_same_endpoint(self):
+        client = EmbeddingClient([
+            {"url": "http://embed/api/embeddings", "model": "bge", "schema": "ollama"},
+        ])
+        success = _FakeResponse("ignored")
+        success.json = lambda: {"embedding": [3.0, 4.0]}
+        expected = np.array([3.0, 4.0], dtype=np.float32).tobytes()
+
+        transient = httpx.HTTPStatusError(
+            "500",
+            request=httpx.Request("POST", "http://embed/api/embeddings"),
+            response=httpx.Response(500),
+        )
+        fake = _FakeAsyncClient([transient, success])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+             patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+            result = await client.aembed_text("hello", timeout=5)
+
+        self.assertEqual(result, expected)
+
+    async def test_embedding_client_falls_over_to_next_endpoint(self):
+        client = EmbeddingClient([
+            {"url": "http://primary/v1/embeddings", "model": "bge", "schema": "openai"},
+            {"url": "http://fallback/api/embeddings", "model": "bge", "schema": "ollama"},
+        ])
+        # Primary fails both attempts with 500; fallback returns ollama-schema success.
+        transient = httpx.HTTPStatusError(
+            "500",
+            request=httpx.Request("POST", "http://primary/v1/embeddings"),
+            response=httpx.Response(500),
+        )
+        success = _FakeResponse("ignored")
+        success.json = lambda: {"embedding": [9.0]}
+        expected = np.array([9.0], dtype=np.float32).tobytes()
+
+        fake = _RecordingAsyncClient([transient, transient, success])
+        with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+             patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+            result = await client.aembed_text("hello", timeout=5)
+
+        self.assertEqual(result, expected)
+        self.assertEqual(fake.calls, [
+            "http://primary/v1/embeddings",
+            "http://primary/v1/embeddings",
+            "http://fallback/api/embeddings",
+        ])
+
+    async def test_embedding_client_uses_openai_payload_and_response_shape(self):
+        client = EmbeddingClient([
+            {"url": "http://llama/v1/embeddings", "model": "bge-m3", "schema": "openai"},
+        ])
+        captured: dict = {}
+
+        class _Capturing(_RecordingAsyncClient):
+            async def post(self, url, json=None):
+                captured["url"] = url
+                captured["json"] = json
+                resp = _FakeResponse("ignored")
+                resp.json = lambda: {"data": [{"embedding": [7.0, 8.0]}]}
+                return resp
+
+        with patch("service_clients.httpx.AsyncClient", return_value=_Capturing([])):
+            result = await client.aembed_text("hello", timeout=5)
+
+        self.assertEqual(result, np.array([7.0, 8.0], dtype=np.float32).tobytes())
+        self.assertEqual(captured["url"], "http://llama/v1/embeddings")
+        self.assertEqual(captured["json"], {"model": "bge-m3", "input": "hello"})
+
+    async def test_embedding_client_uses_ollama_payload(self):
+        client = EmbeddingClient([
+            {"url": "http://ollama/api/embeddings", "model": "bge-m3", "schema": "ollama"},
+        ])
+        captured: dict = {}
+
+        class _Capturing(_RecordingAsyncClient):
+            async def post(self, url, json=None):
+                captured["json"] = json
+                resp = _FakeResponse("ignored")
+                resp.json = lambda: {"embedding": [1.0]}
+                return resp
+
+        with patch("service_clients.httpx.AsyncClient", return_value=_Capturing([])):
+            await client.aembed_text("hello", timeout=5)
+
+        self.assertEqual(captured["json"], {"model": "bge-m3", "prompt": "hello"})
+
+    async def test_embedding_client_gives_up_after_all_endpoints(self):
+        client = EmbeddingClient([
+            {"url": "http://a/v1/embeddings", "model": "bge", "schema": "openai"},
+            {"url": "http://b/api/embeddings", "model": "bge", "schema": "ollama"},
+        ])
+        transient = httpx.HTTPStatusError(
+            "500",
+            request=httpx.Request("POST", "http://x"),
+            response=httpx.Response(500),
+        )
+        # 2 attempts × 2 endpoints = 4 transient failures.
+        fake = _FakeAsyncClient([transient] * 4)
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+             patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+            result = await client.aembed_text("hello", timeout=5)
+
+        self.assertIsNone(result)
+
+    async def test_embedding_client_does_not_retry_programmer_errors(self):
+        client = EmbeddingClient([
+            {"url": "http://embed/api/embeddings", "model": "bge", "schema": "ollama"},
+        ])
+        broken = _FakeResponse("ignored")
+        broken.json = lambda: {"no_embedding_key": True}
+        # Only one outcome provided — if the client retried we'd get IndexError.
+        with patch("service_clients.httpx.AsyncClient", return_value=_FakeAsyncClient([broken])):
+            result = await client.aembed_text("hello", timeout=5)
+        self.assertIsNone(result)
+
+    def test_embedding_client_rejects_unknown_schema(self):
+        with self.assertRaises(ValueError):
+            EmbeddingClient([{"url": "http://x", "model": "y", "schema": "bogus"}])
+
+    def test_embedding_client_rejects_empty_chain(self):
+        with self.assertRaises(ValueError):
+            EmbeddingClient([])
 
 
 class TTSCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
