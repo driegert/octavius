@@ -20,6 +20,7 @@ TAG_GENERATION_MIN_MESSAGES = settings.tag_generation_min_messages
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 SUMMARY_SYSTEM_PROMPT = (
+    "/no_think\n"
     "Summarize the following conversation in 2-3 sentences. "
     "Focus on the key topics discussed, decisions made, and any actions taken. "
     "Be concise and factual. Do not use markdown formatting. "
@@ -27,6 +28,7 @@ SUMMARY_SYSTEM_PROMPT = (
 )
 
 TAG_SYSTEM_PROMPT = (
+    "/no_think\n"
     "Extract 1-5 short topic tags from this conversation. "
     "Return ONLY a JSON array of lowercase strings, e.g. [\"statistics\", \"email\"]. "
     "No explanation, no markdown, just the JSON array."
@@ -95,44 +97,49 @@ async def _request_completion_async(payload: dict) -> str | None:
 
 
 def _clean_completion_text(text: str | None) -> str | None:
-    if not text:
+    if text is None:
         return None
-    text = THINK_RE.sub("", text).strip()
-    return text if text else None
+    if not text:
+        log.warning("Summary/tag pipeline received empty content from upstream LLM")
+        return None
+    cleaned = THINK_RE.sub("", text).strip()
+    if not cleaned:
+        log.warning(
+            "Summary/tag pipeline got %d chars but all of it was <think> content — "
+            "visible output is empty (try /no_think in prompt or bump max_tokens)",
+            len(text),
+        )
+        return None
+    return cleaned
+
+
+def _summary_payload(transcript: str) -> dict:
+    return {
+        "model": SUMMARY_MODEL,
+        "messages": [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript},
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        # Qwen 3.x: disable think mode so max_tokens isn't consumed by
+        # hidden reasoning before any visible output is produced.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
 
 def generate_summary(messages: list[dict]) -> str | None:
     transcript = build_transcript(messages, max_content_chars=1000)
     if not transcript:
         return None
-
-    payload = {
-        "model": SUMMARY_MODEL,
-        "messages": [
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": transcript},
-        ],
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    }
-    return _request_completion(payload)
+    return _request_completion(_summary_payload(transcript))
 
 
 async def generate_summary_async(messages: list[dict]) -> str | None:
     transcript = build_transcript(messages, max_content_chars=1000)
     if not transcript:
         return None
-
-    payload = {
-        "model": SUMMARY_MODEL,
-        "messages": [
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": transcript},
-        ],
-        "max_tokens": 1024,
-        "temperature": 0.3,
-    }
-    return await _request_completion_async(payload)
+    return await _request_completion_async(_summary_payload(transcript))
 
 
 def generate_tags(messages: list[dict]) -> list[str]:
@@ -158,6 +165,7 @@ def _build_tags_payload(messages: list[dict]) -> dict | None:
         ],
         "max_tokens": 768,
         "temperature": 0.2,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
 

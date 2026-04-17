@@ -57,10 +57,14 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "- Always set done=false when searching tasks unless Dave asks about completed ones.\n"
             "- Sort by due_date or created when listing tasks so the most relevant appear first.\n"
             "- When creating tasks, ask which project if not obvious from context.\n"
+            "- Avoid calling search_tasks more than twice for the same intent. "
+            "If two searches haven't surfaced the specific task, stop searching — "
+            "summarize what you did find and ask Dave to narrow it down (e.g. by "
+            "project, keyword, or due date) instead of retrying the same query.\n"
             f"- Key projects: {format_vikunja_projects()}.\n"
             f"- Default to {format_vikunja_default()} if Dave doesn't specify a project."
         ),
-        "max_rounds": 4,
+        "max_rounds": 6,
     },
 }
 
@@ -181,7 +185,16 @@ async def run_subagent(
                 args = {}
 
             result = await mcp.call_tool(name, args)
-            log.info("Subagent [%s] tool %s → %d chars", domain, name, len(result))
+            try:
+                args_preview = json.dumps(args, separators=(",", ":"), default=str)
+            except (TypeError, ValueError):
+                args_preview = str(args)
+            if len(args_preview) > 200:
+                args_preview = args_preview[:200] + "..."
+            log.info(
+                "Subagent [%s] tool %s args=%s → %d chars",
+                domain, name, args_preview, len(result),
+            )
             observations.append((name, args, result))
 
             messages.append({
