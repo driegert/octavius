@@ -25,10 +25,13 @@ async def run_agent_turn(
     user_text: str,
     status_callback=None,
     history_session=None,
+    session=None,
 ) -> str:
     """Run one user turn (non-streaming). Returns full assistant text."""
     result_parts = []
-    async for chunk in stream_agent_turn(conversation, mcp, user_text, status_callback, history_session):
+    async for chunk in stream_agent_turn(
+        conversation, mcp, user_text, status_callback, history_session, session,
+    ):
         result_parts.append(chunk)
     return "".join(result_parts)
 
@@ -39,15 +42,13 @@ async def stream_agent_turn(
     user_text: str,
     status_callback=None,
     history_session=None,
+    session=None,
 ) -> AsyncGenerator[str, None]:
     """Run one user turn, yielding sentence chunks as the LLM streams them.
 
     Tool call rounds are handled internally (non-streaming). Only the final
     text response is streamed sentence-by-sentence.
     """
-    # Make status_callback available to delegate_task → subagent
-    local_tools._status_callback = status_callback
-
     conversation.add_user(user_text)
     conversation.trim()
 
@@ -185,6 +186,7 @@ async def stream_agent_turn(
                         args,
                         history_session=history_session,
                         mcp_manager=mcp,
+                        session=session,
                     )
                     server_name = "local"
                 else:

@@ -42,6 +42,7 @@ class ReaderSettings:
 class Settings:
     stt_url: str
     llm_chain: list[dict]
+    subagent_llm_chain: list[dict]
     tts: TTSSettings
     reader: ReaderSettings
     agent_port: int
@@ -158,6 +159,7 @@ DEFAULT_TOOL_LABELS = {
     "read_item_content": "Reading Item Content",
     "process_pdf": "Processing PDF",
     "delegate_task": "Delegating...",
+    "cancel_delegation": "Cancelling...",
 }
 
 
@@ -261,7 +263,8 @@ your name is Octavius and you're not shy about it.
 You have access to tools:
 - Web search via SearXNG for general lookups
 - delegate_task for email, research, and task management. This hands off to a
-  specialist assistant with its own tools. Use it when Dave asks about:
+  specialist assistant running in the background on a separate machine. Use it
+  when Dave asks about:
   * Email: "check my email", "find emails from X", "any emails about Y" →
     delegate_task(domain="email", task="..."). Include dates, senders, or
     topics Dave mentioned.
@@ -271,13 +274,18 @@ You have access to tools:
     delegate_task(domain="tasks", task="..."). Include project names if Dave
     specified one. Key projects: {vikunja_projects}.
     Default to {vikunja_default} if Dave doesn't specify a project.
+  delegate_task is ASYNCHRONOUS. It returns a handle immediately; the result
+  will be spoken directly to Dave when the specialist finishes. After calling
+  delegate_task you MUST respond to Dave briefly (e.g. "On it.", "Checking
+  your email now.", "Looking that up.") and END YOUR TURN — do NOT call
+  delegate_task again for the same request, do NOT try to summarize the
+  handle, do NOT spin in further tool calls waiting for a result. Dave will
+  hear the answer when it arrives.
+  If Dave changes his mind before a delegation finishes ("never mind",
+  "forget that"), call cancel_delegation(handle=...) with the handle you got
+  from delegate_task.
   Write a clear, complete task description — the specialist only sees what you
   pass in the task field, not the full conversation.
-  The specialist's response may contain a "===TOOL DATA===" block after its
-  spoken summary. That block is the authoritative source for IDs, field
-  values, and exact names — prefer it over the summary when quoting or
-  reusing specifics (e.g. task IDs for follow-up actions). Do not read the
-  TOOL DATA block aloud; use the spoken summary for your reply.
 - PDF processing via process_pdf for converting PDFs to markdown. This runs in the
   background and saves the result to Dave's stash — use this instead of
   calling convert_pdf_to_md directly so Dave can keep talking while it processes.
@@ -328,6 +336,14 @@ def load_settings() -> Settings:
             {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
         ],
     )
+    subagent_llm_chain = _env_json(
+        "OCTAVIUS_SUBAGENT_LLM_CHAIN",
+        [
+            {"url": "http://lilripper:8030/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
+            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "secondary"},
+            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "fallback"},
+        ],
+    )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
     kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
     tts = TTSSettings(
@@ -350,6 +366,7 @@ def load_settings() -> Settings:
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
         llm_chain=llm_chain,
+        subagent_llm_chain=subagent_llm_chain,
         tts=tts,
         reader=reader,
         agent_port=_env_int("OCTAVIUS_AGENT_PORT", 8030),

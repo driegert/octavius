@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from typing import TYPE_CHECKING, Callable
 
 from local_tool_downloads import download_file
@@ -14,21 +15,30 @@ if TYPE_CHECKING:
     from history import ConversationSession
     from mcp_manager import MCPManager
 
-# Status callback is stashed here by websocket_session before the agent turn
-# so that delegate_task can forward it to the subagent.
-_status_callback = None
 
-
-async def _delegate_task(args: dict, session=None, mcp_manager=None) -> str:
-    from subagent import run_subagent
-
+async def _delegate_task(args: dict, history_session=None, mcp_manager=None, session=None) -> str:
     domain = args.get("domain", "")
     task = args.get("task", "")
     if not domain or not task:
         return "Error: domain and task are required."
-    if mcp_manager is None:
-        return "Error: MCP manager unavailable."
-    return await run_subagent(task, domain, mcp_manager, status_callback=_status_callback)
+    if session is None:
+        return "Error: delegation session unavailable."
+    summary = await session.spawn_delegation(domain, task)
+    summary["note"] = (
+        "Reply briefly to acknowledge (e.g. 'on it'). Results will be spoken "
+        "when ready. Do not wait."
+    )
+    return json.dumps(summary)
+
+
+async def _cancel_delegation(args: dict, history_session=None, mcp_manager=None, session=None) -> str:
+    handle = args.get("handle", "")
+    if not handle:
+        return "Error: handle is required."
+    if session is None:
+        return "Error: delegation session unavailable."
+    result = await session.cancel_delegation(handle)
+    return json.dumps(result)
 
 
 def get_local_tool_handlers() -> dict[str, Callable]:
@@ -41,6 +51,7 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
         "delegate_task": _delegate_task,
+        "cancel_delegation": _cancel_delegation,
     }
 
 
@@ -64,15 +75,21 @@ async def call_tool(
     arguments: dict,
     history_session: "ConversationSession | None" = None,
     mcp_manager: "MCPManager | None" = None,
+    session=None,
 ) -> str:
     handler = get_local_tool_handlers().get(name)
     if not handler:
         return f"Error: unknown local tool '{name}'"
     params = inspect.signature(handler).parameters
+    arity = len(params)
     if inspect.iscoroutinefunction(handler):
-        if len(params) >= 3:
+        if arity >= 4:
+            return await handler(arguments, history_session, mcp_manager, session)
+        if arity >= 3:
             return await handler(arguments, history_session, mcp_manager)
         return await handler(arguments, history_session)
-    if len(params) >= 3:
+    if arity >= 4:
+        return handler(arguments, history_session, mcp_manager, session)
+    if arity >= 3:
         return handler(arguments, history_session, mcp_manager)
     return handler(arguments, history_session)

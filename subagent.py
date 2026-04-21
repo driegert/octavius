@@ -13,7 +13,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Callable
 
-from service_clients import llm_client
+from service_clients import subagent_llm_client
 from settings import format_vikunja_default, format_vikunja_projects, settings
 
 if TYPE_CHECKING:
@@ -75,6 +75,13 @@ TOOL_DATA_HEADER = (
 )
 
 
+def _model_for_url(url: str) -> str | None:
+    for entry in settings.subagent_llm_chain:
+        if entry["url"] == url:
+            return entry.get("model")
+    return None
+
+
 def _compose_result(final_text: str, observations: list[tuple[str, dict, str]]) -> str:
     """Combine the subagent's natural-language summary with a verbatim block
     of the raw tool observations, so the caller can extract exact IDs and
@@ -116,6 +123,8 @@ async def run_subagent(
     task: str,
     domain: str,
     mcp: "MCPManager",
+    assigned_url: str | None = None,
+    fallback_url: str | None = None,
     status_callback: Callable[[str], object] | None = None,
 ) -> str:
     """Run a scoped subagent loop and return the final text plus raw tool data."""
@@ -132,23 +141,28 @@ async def run_subagent(
         {"role": "user", "content": task},
     ]
 
+    if assigned_url is None:
+        assigned_url = settings.subagent_llm_chain[0]["url"]
+    model = _model_for_url(assigned_url) or settings.subagent_llm_chain[0]["model"]
+    request_urls = [assigned_url] + ([fallback_url] if fallback_url else [])
+
     max_rounds = config["max_rounds"]
     last_text = ""
     observations: list[tuple[str, dict, str]] = []
 
     for round_num in range(max_rounds):
         payload = {
-            "model": settings.llm_chain[0]["model"],
+            "model": model,
             "messages": messages,
             "tools": tools,
         }
 
         log.info(
-            "Subagent [%s] round %d/%d, %d messages, %d tools",
-            domain, round_num + 1, max_rounds, len(messages), len(tools),
+            "Subagent [%s] round %d/%d, %d messages, %d tools, urls=%s",
+            domain, round_num + 1, max_rounds, len(messages), len(tools), request_urls,
         )
 
-        message = await llm_client.complete_with_tools(payload)
+        message = await subagent_llm_client.complete_with_tools(payload, urls=request_urls)
         if message is None:
             fallback = last_text or "Error: all LLM endpoints failed during delegation."
             return _compose_result(fallback, observations)

@@ -17,15 +17,21 @@ async def call_local_tool(
     arguments: dict,
     history_session: "ConversationSession | None" = None,
     mcp_manager: "MCPManager | None" = None,
+    session=None,
 ) -> str:
     handler = get_local_tool_handlers().get(name)
     if not handler:
         return f"Error: unknown local tool '{name}'"
     params = inspect.signature(handler).parameters
+    arity = len(params)
     if inspect.iscoroutinefunction(handler):
-        if len(params) >= 3:
+        if arity >= 4:
+            return await handler(arguments, history_session, mcp_manager, session)
+        if arity >= 3:
             return await handler(arguments, history_session, mcp_manager)
         return await handler(arguments, history_session)
-    if len(params) >= 3:
+    if arity >= 4:
+        return handler(arguments, history_session, mcp_manager, session)
+    if arity >= 3:
         return handler(arguments, history_session, mcp_manager)
     return handler(arguments, history_session)

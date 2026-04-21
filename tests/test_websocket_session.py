@@ -39,6 +39,14 @@ class _FakeHistory:
         return _ConnCtx()
 
 
+class _FakeDispatcher:
+    def snapshot(self):
+        return {}
+
+    def fallback_url(self):
+        return None
+
+
 class _FakeWS:
     def __init__(self):
         self.sent = []
@@ -46,6 +54,7 @@ class _FakeWS:
             state=SimpleNamespace(
                 history=_FakeHistory(),
                 mcp_manager=object(),
+                subagent_dispatcher=_FakeDispatcher(),
             )
         )
 

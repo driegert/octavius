@@ -18,6 +18,26 @@ class _FakeMCP:
 
 
 class SubagentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_urls_passed_to_complete_with_tools(self):
+        message = {"content": "done", "tool_calls": None}
+        captured = {}
+
+        async def capture(payload, *, urls=None):
+            captured["urls"] = urls
+            captured["model"] = payload.get("model")
+            return message
+
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=capture):
+            await subagent.run_subagent(
+                "do stuff", "email", _FakeMCP(),
+                assigned_url="http://primary/v1/chat/completions",
+                fallback_url="http://fallback/v1/chat/completions",
+            )
+        self.assertEqual(captured["urls"], [
+            "http://primary/v1/chat/completions",
+            "http://fallback/v1/chat/completions",
+        ])
+
     async def test_unknown_domain_returns_error(self):
         result = await subagent.run_subagent("do stuff", "bogus", _FakeMCP())
         self.assertIn("unknown delegation domain", result)
@@ -30,13 +50,13 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_only_response(self):
         """Subagent returns text when LLM responds without tool calls."""
         message = {"content": "Found 3 emails from the dean.", "tool_calls": None}
-        with patch.object(subagent.llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
             result = await subagent.run_subagent("check email from the dean", "email", _FakeMCP())
         self.assertEqual(result, "Found 3 emails from the dean.")
 
     async def test_think_tags_stripped(self):
         message = {"content": "<think>planning...</think>Here are the results.", "tool_calls": None}
-        with patch.object(subagent.llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
             result = await subagent.run_subagent("check email", "email", _FakeMCP())
         self.assertEqual(result, "Here are the results.")
 
@@ -55,13 +75,13 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
 
         call_count = 0
 
-        async def mock_complete(payload):
+        async def mock_complete(payload, **kwargs):
             nonlocal call_count
             call_count += 1
             return tool_message if call_count == 1 else final_message
 
         mcp = _FakeMCP(call_results={"search_emails": "3 emails found"})
-        with patch.object(subagent.llm_client, "complete_with_tools", side_effect=mock_complete):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             result = await subagent.run_subagent("check email from the dean", "email", mcp)
 
         self.assertIn("Found an email about the budget meeting.", result)
@@ -81,11 +101,11 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             }],
         }
 
-        async def always_tool_call(payload):
+        async def always_tool_call(payload, **kwargs):
             return tool_message
 
         mcp = _FakeMCP(call_results={"search_emails": "results"})
-        with patch.object(subagent.llm_client, "complete_with_tools", side_effect=always_tool_call):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=always_tool_call):
             result = await subagent.run_subagent("check email", "email", mcp)
 
         self.assertIn("Still working...", result)
@@ -93,14 +113,14 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[search_emails]", result)
 
     async def test_llm_failure_returns_error(self):
-        with patch.object(subagent.llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=None):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=None):
             result = await subagent.run_subagent("check email", "email", _FakeMCP())
         self.assertIn("all LLM endpoints failed", result)
 
     async def test_result_truncated_to_max_chars(self):
         long_text = "x" * 10000
         message = {"content": long_text, "tool_calls": None}
-        with patch.object(subagent.llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
             result = await subagent.run_subagent("check email", "email", _FakeMCP())
         self.assertEqual(len(result), subagent.MAX_RESULT_CHARS)
 
@@ -118,7 +138,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
 
         call_count = 0
 
-        async def mock_complete(payload):
+        async def mock_complete(payload, **kwargs):
             nonlocal call_count
             call_count += 1
             return tool_message if call_count == 1 else final_message
@@ -129,7 +149,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             statuses.append(text)
 
         mcp = _FakeMCP(call_results={"search_emails": "results"})
-        with patch.object(subagent.llm_client, "complete_with_tools", side_effect=mock_complete):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             await subagent.run_subagent("check email", "email", mcp, status_callback=status_cb)
 
         self.assertTrue(len(statuses) > 0)
@@ -167,14 +187,14 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
 
         call_count = 0
 
-        async def mock_complete(payload):
+        async def mock_complete(payload, **kwargs):
             nonlocal call_count
             call_count += 1
             return tool_message if call_count == 1 else final_message
 
         raw_result = 'Task #363 "grading rubric" created in project id=10.'
         mcp = _FakeMCP(call_results={"create_task": raw_result})
-        with patch.object(subagent.llm_client, "complete_with_tools", side_effect=mock_complete):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             result = await subagent.run_subagent("create a task", "tasks", mcp)
 
         self.assertIn("Task #363", result)
@@ -202,7 +222,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         ]
         call_count = 0
 
-        async def mock_complete(payload):
+        async def mock_complete(payload, **kwargs):
             nonlocal call_count
             msg = messages_seq[call_count]
             call_count += 1
@@ -224,7 +244,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
                 call_invocation += 1
                 return f"{'X' * 2000}MARKER-{call_invocation}"
 
-        with patch.object(subagent.llm_client, "complete_with_tools", side_effect=mock_complete):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             result = await subagent.run_subagent("do stuff", "tasks", _SeqMCP())
 
         # Newest observation (MARKER-3) must appear. Oldest (MARKER-1) may be dropped.
@@ -235,7 +255,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         """When no tool calls happened, output is just the LLM text — no
         empty TOOL DATA block."""
         message = {"content": "No tools needed.", "tool_calls": None}
-        with patch.object(subagent.llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
+        with patch.object(subagent.subagent_llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=message):
             result = await subagent.run_subagent("hi", "email", _FakeMCP())
         self.assertEqual(result, "No tools needed.")
         self.assertNotIn(subagent.TOOL_DATA_HEADER, result)

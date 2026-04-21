@@ -207,12 +207,17 @@ TOOLS = [
         "function": {
             "name": "delegate_task",
             "description": (
-                "Delegate a task to a specialist assistant. Use for: "
+                "Start a backgrounded specialist task. Use for: "
                 "email (searching, reading, summarizing emails), "
                 "research (finding papers, authors, citations via OpenAlex), "
                 "or tasks (searching, creating, updating Vikunja tasks). "
-                "The specialist has its own tools and returns a summary. "
-                "Include all relevant context in the task description."
+                "This tool returns IMMEDIATELY with a handle — the specialist "
+                "runs in the background on a separate machine and the result "
+                "will be spoken to Dave when it finishes. "
+                "After calling this, briefly acknowledge to Dave (e.g. 'on it', "
+                "'checking now') and END YOUR TURN — do not stall or loop. "
+                "Include all relevant context in the task description; the "
+                "specialist only sees what you pass, not the conversation."
             ),
             "parameters": {
                 "type": "object",
@@ -231,6 +236,29 @@ TOOLS = [
                     },
                 },
                 "required": ["domain", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_delegation",
+            "description": (
+                "Cancel a previously-started delegation by its handle. Use when "
+                "Dave changes his mind mid-task (e.g. 'never mind', 'forget that', "
+                "'actually don't') while a delegation is still running. The handle "
+                "was returned by delegate_task. Safe to call even if the task has "
+                "already finished — returns cancelled=false in that case."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "description": "The delegation handle returned by delegate_task.",
+                    },
+                },
+                "required": ["handle"],
             },
         },
     },

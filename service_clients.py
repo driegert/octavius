@@ -351,24 +351,36 @@ class LLMChainClient:
         )
         return None
 
-    async def complete_with_tools(self, payload: dict) -> dict | None:
+    async def complete_with_tools(self, payload: dict, *, urls: list[str] | None = None) -> dict | None:
         """Non-streaming completion returning the full message dict (content + tool_calls).
 
         Used by the subagent loop which needs to inspect tool_calls in the response.
+        When `urls` is provided, only chain entries whose url is in that list are
+        tried, preserving chain order. Each attempt uses the model from its chain
+        entry (payload["model"] is ignored when the entry carries a model).
         """
-        model = payload.get("model") or self.chain[0]["model"]
+        if urls is not None:
+            target_entries = [e for e in self.chain if e["url"] in urls]
+        else:
+            target_entries = list(self.chain)
+        if not target_entries:
+            log.warning("complete_with_tools called with urls=%s but no chain entries matched", urls)
+            return None
+
+        payload_model = payload.get("model") or self.chain[0]["model"]
         request_payload = dict(payload)
-        request_payload["model"] = model
         request_payload["stream"] = False
         failed_urls: list[str] = []
         async with httpx.AsyncClient(timeout=120.0) as client:
-            for i, entry in enumerate(self.chain):
+            for i, entry in enumerate(target_entries):
                 self._mark_attempt(entry["url"])
+                model = entry.get("model") or payload_model
+                request_payload["model"] = model
                 try:
                     if i > 0:
                         log.warning(
                             "LLM failover attempt %d/%d via %s",
-                            i + 1, len(self.chain), entry["url"],
+                            i + 1, len(target_entries), entry["url"],
                         )
                     resp = await client.post(entry["url"], json=request_payload)
                     resp.raise_for_status()
@@ -400,8 +412,8 @@ class LLMChainClient:
                     continue
         self._record_failure(
             RequestOutcome(
-                url=None, model=model,
-                attempts=len(self.chain),
+                url=None, model=payload_model,
+                attempts=len(target_entries),
                 failed_urls=failed_urls,
                 error="All LLM endpoints failed",
             )
@@ -591,5 +603,6 @@ tts_client = TTSClient(
     kokoro_voices=settings.tts.kokoro_voices,
 )
 llm_client = LLMChainClient(settings.llm_chain)
+subagent_llm_client = LLMChainClient(settings.subagent_llm_chain)
 summary_client = SummaryClient(settings.summary_url, settings.summary_fallback_url)
 embedding_client = EmbeddingClient(settings.embedding_chain)

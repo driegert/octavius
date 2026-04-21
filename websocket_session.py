@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 try:
@@ -17,6 +19,8 @@ except ModuleNotFoundError:
 from conversation import Conversation
 from reader_playback import stream_reader_audio
 from settings import settings
+from subagent import run_subagent
+from subagent_dispatcher import SubagentTicket
 
 log = logging.getLogger(__name__)
 
@@ -60,10 +64,28 @@ class StreamingSTTState:
 
 
 @dataclass
+class DelegationRecord:
+    handle: str
+    domain: str
+    submitted_task: str
+    ticket: SubagentTicket
+    created_at: datetime
+    task: asyncio.Task | None = None
+
+
+@dataclass
+class ProactiveMessage:
+    handle: str
+    domain: str
+    text: str
+
+
+@dataclass
 class WebSocketSessionState:
     ws: Any
     history: object
     mcp_manager: object
+    subagent_dispatcher: object
     conversation: Conversation = field(default_factory=Conversation)
     voice: str = settings.tts.voice
     tts_enabled: bool = True
@@ -73,6 +95,11 @@ class WebSocketSessionState:
     history_session: object | None = None
     stt_stream: StreamingSTTState = field(default_factory=StreamingSTTState)
     vad: object | None = None  # SileroVAD instance, created on first stt_start
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    delegations: dict[str, DelegationRecord] = field(default_factory=dict)
+    proactive_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    proactive_worker_task: asyncio.Task | None = None
 
 
 class WebSocketSessionHandler:
@@ -81,6 +108,7 @@ class WebSocketSessionHandler:
             ws=ws,
             history=ws.app.state.history,
             mcp_manager=ws.app.state.mcp_manager,
+            subagent_dispatcher=ws.app.state.subagent_dispatcher,
         )
 
     @property
@@ -88,10 +116,16 @@ class WebSocketSessionHandler:
         return self.state.ws
 
     async def send_json(self, msg_type: str, text: str):
-        await self.ws.send_text(json.dumps({"type": msg_type, "text": text}))
+        async with self.state.send_lock:
+            await self.ws.send_text(json.dumps({"type": msg_type, "text": text}))
 
     async def send_payload(self, payload: dict):
-        await self.ws.send_text(json.dumps(payload))
+        async with self.state.send_lock:
+            await self.ws.send_text(json.dumps(payload))
+
+    async def send_bytes(self, data: bytes):
+        async with self.state.send_lock:
+            await self.ws.send_bytes(data)
 
     async def start(self):
         await self.ws.accept()
@@ -101,6 +135,7 @@ class WebSocketSessionHandler:
             source="voice",
             model=settings.llm_chain[0]["model"],
         )
+        self.state.proactive_worker_task = asyncio.create_task(self._proactive_worker())
         await self.send_payload(
             {
                 "type": "session_id",
@@ -111,6 +146,11 @@ class WebSocketSessionHandler:
     async def cleanup(self):
         if self.state.reader_task and not self.state.reader_task.done():
             self.state.reader_task.cancel()
+        for record in list(self.state.delegations.values()):
+            if record.task and not record.task.done():
+                record.task.cancel()
+        if self.state.proactive_worker_task and not self.state.proactive_worker_task.done():
+            self.state.proactive_worker_task.cancel()
         for history_session in self.state.item_history_sessions.values():
             await history_session.end_async()
         if self.state.history_session:
@@ -346,6 +386,7 @@ class WebSocketSessionHandler:
                 user_text,
                 status_callback=item_status_cb,
                 history_session=history_session,
+                session=self,
             ):
                 full_parts.append(sentence)
         except Exception as exc:
@@ -527,64 +568,66 @@ class WebSocketSessionHandler:
     async def run_turn(self, user_text: str, source: str):
         from agent import stream_agent_turn
         from tts import synthesize
-        turn_start = time.monotonic()
-        await self.send_json("status", "Thinking...")
+        async with self.state.turn_lock:
+            turn_start = time.monotonic()
+            await self.send_json("status", "Thinking...")
 
-        if self.state.history_session:
-            user_kwargs = {}
-            if source == "voice":
-                user_kwargs["stt_model"] = "whisper"
-            await self.state.history_session.add_message_async(role="user", content=user_text, **user_kwargs)
-
-        async def status_cb(text: str):
-            await self.send_json("status", text)
-
-        full_reply_parts = []
-        first_sentence = True
-        try:
-            async for sentence in stream_agent_turn(
-                self.state.conversation,
-                self.state.mcp_manager,
-                user_text,
-                status_callback=status_cb,
-                history_session=self.state.history_session,
-            ):
-                full_reply_parts.append(sentence)
-                if self.state.tts_enabled:
-                    if first_sentence:
-                        await self.send_json("status", "Speaking...")
-                        first_sentence = False
-                    try:
-                        wav_bytes = await synthesize(sentence, voice=self.state.voice)
-                        await self.ws.send_bytes(wav_bytes)
-                    except Exception:
-                        log.exception("TTS failed for chunk")
-        except Exception as exc:
-            log.exception("Agent failed")
-            await self.send_json("status", f"Agent error: {exc}")
             if self.state.history_session:
+                user_kwargs = {}
+                if source == "voice":
+                    user_kwargs["stt_model"] = "whisper"
+                await self.state.history_session.add_message_async(role="user", content=user_text, **user_kwargs)
+
+            async def status_cb(text: str):
+                await self.send_json("status", text)
+
+            full_reply_parts = []
+            first_sentence = True
+            try:
+                async for sentence in stream_agent_turn(
+                    self.state.conversation,
+                    self.state.mcp_manager,
+                    user_text,
+                    status_callback=status_cb,
+                    history_session=self.state.history_session,
+                    session=self,
+                ):
+                    full_reply_parts.append(sentence)
+                    if self.state.tts_enabled:
+                        if first_sentence:
+                            await self.send_json("status", "Speaking...")
+                            first_sentence = False
+                        try:
+                            wav_bytes = await synthesize(sentence, voice=self.state.voice)
+                            await self.send_bytes(wav_bytes)
+                        except Exception:
+                            log.exception("TTS failed for chunk")
+            except Exception as exc:
+                log.exception("Agent failed")
+                await self.send_json("status", f"Agent error: {exc}")
+                if self.state.history_session:
+                    await self.state.history_session.add_message_async(
+                        role="assistant",
+                        content=f"Error: {exc}",
+                        error=str(exc),
+                    )
+                return
+
+            full_reply = "".join(full_reply_parts).strip()
+            if full_reply:
+                await self.send_json("response", full_reply)
+
+            if self.state.history_session and full_reply:
+                latency_ms = int((time.monotonic() - turn_start) * 1000)
                 await self.state.history_session.add_message_async(
                     role="assistant",
-                    content=f"Error: {exc}",
-                    error=str(exc),
+                    content=full_reply,
+                    model=settings.llm_chain[0]["model"],
+                    latency_ms=latency_ms,
+                    tts_model=settings.tts.model if self.state.tts_enabled else None,
                 )
-            return
 
-        full_reply = "".join(full_reply_parts).strip()
-        if full_reply:
-            await self.send_json("response", full_reply)
-
-        if self.state.history_session and full_reply:
-            latency_ms = int((time.monotonic() - turn_start) * 1000)
-            await self.state.history_session.add_message_async(
-                role="assistant",
-                content=full_reply,
-                model=settings.llm_chain[0]["model"],
-                latency_ms=latency_ms,
-                tts_model=settings.tts.model if self.state.tts_enabled else None,
-            )
-
-        await self.send_json("status", "audio_done")
+            await self.send_json("status", "audio_done")
 
     async def cancel_reader_task(self):
         if self.state.reader_task and not self.state.reader_task.done():
@@ -593,6 +636,138 @@ class WebSocketSessionHandler:
                 await self.state.reader_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+    async def _proactive_worker(self) -> None:
+        try:
+            while True:
+                msg = await self.state.proactive_queue.get()
+                try:
+                    async with self.state.turn_lock:
+                        await self._proactive_speak(msg)
+                except Exception:
+                    log.exception("Proactive speak failed for %s", msg.handle)
+        except asyncio.CancelledError:
+            pass
+
+    async def _proactive_speak(self, msg: ProactiveMessage) -> None:
+        from agent import SENTENCE_END
+        from tts import synthesize
+
+        spoken = msg.text.split("\n\n===TOOL DATA", 1)[0].strip()
+        if not spoken:
+            return
+
+        prelude = f"(from {msg.domain}) "
+        full = prelude + spoken
+        self.state.conversation.add_assistant(full)
+        if self.state.history_session:
+            await self.state.history_session.add_message_async(
+                role="assistant",
+                content=full,
+                model=settings.subagent_llm_chain[0]["model"],
+            )
+
+        await self.send_payload({
+            "type": "subagent_done",
+            "handle": msg.handle,
+            "domain": msg.domain,
+            "text": full,
+        })
+
+        if not self.state.tts_enabled:
+            return
+
+        await self.send_json("status", "Speaking...")
+        parts = SENTENCE_END.split(spoken)
+        sentences = [prelude + parts[0]] + parts[1:] if parts else [full]
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            try:
+                wav_bytes = await synthesize(sentence, voice=self.state.voice)
+                await self.send_bytes(wav_bytes)
+            except Exception:
+                log.exception("TTS failed for proactive chunk")
+        await self.send_json("status", "audio_done")
+
+    async def spawn_delegation(self, domain: str, task: str) -> dict:
+        """Reserve an endpoint, create a background asyncio.Task running the
+        subagent, and register it. Returns a summary dict for the tool response.
+        """
+        ticket = await self.state.subagent_dispatcher.reserve()
+        handle = f"dlg_{uuid.uuid4().hex[:12]}"
+        record = DelegationRecord(
+            handle=handle,
+            domain=domain,
+            submitted_task=task,
+            ticket=ticket,
+            created_at=datetime.now(),
+        )
+        record.task = asyncio.create_task(self._run_and_announce(record))
+        self.state.delegations[handle] = record
+        log.info(
+            "Spawned delegation %s (domain=%s, dispatcher=%s)",
+            handle, domain, self.state.subagent_dispatcher.snapshot(),
+        )
+        return {
+            "handle": handle,
+            "domain": domain,
+            "status": "started",
+        }
+
+    async def cancel_delegation(self, handle: str) -> dict:
+        record = self.state.delegations.get(handle)
+        if record is None:
+            return {"cancelled": False, "reason": "unknown handle", "handle": handle}
+        if record.ticket.assigned_url is None:
+            await record.ticket.cancel_pending()
+        if record.task and not record.task.done():
+            record.task.cancel()
+        self.state.delegations.pop(handle, None)
+        return {"cancelled": True, "handle": handle}
+
+    async def _run_and_announce(self, record: DelegationRecord) -> None:
+        assigned_url: str | None = None
+        try:
+            assigned_url = await record.ticket.acquire()
+            fallback_url = self.state.subagent_dispatcher.fallback_url()
+
+            async def status_cb(text: str):
+                label = settings.tool_labels.get(text, text)
+                await self.send_payload({
+                    "type": "subagent_progress",
+                    "handle": record.handle,
+                    "domain": record.domain,
+                    "text": label,
+                })
+
+            result = await run_subagent(
+                record.submitted_task,
+                record.domain,
+                self.state.mcp_manager,
+                assigned_url=assigned_url,
+                fallback_url=fallback_url,
+                status_callback=status_cb,
+            )
+            await self.state.proactive_queue.put(
+                ProactiveMessage(handle=record.handle, domain=record.domain, text=result)
+            )
+        except asyncio.CancelledError:
+            log.info("Delegation %s cancelled", record.handle)
+            raise
+        except Exception as exc:
+            log.exception("Delegation %s crashed", record.handle)
+            await self.state.proactive_queue.put(
+                ProactiveMessage(
+                    handle=record.handle,
+                    domain=record.domain,
+                    text=f"Background task failed: {exc}",
+                )
+            )
+        finally:
+            await record.ticket.release()
+            self.state.delegations.pop(record.handle, None)
 
 
 async def handle_websocket_session(ws: Any):

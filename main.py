@@ -14,6 +14,7 @@ from routes.inbox import router as inbox_router
 from routes.reader_api import router as reader_router
 from reader_store import fail_stale_processing_documents
 from service_clients import llm_client
+from subagent_dispatcher import SubagentDispatcher
 import tools as local_tools
 from websocket_session import handle_websocket_session
 
@@ -34,6 +35,11 @@ async def lifespan(app: FastAPI):
     app.state.mcp_manager = mcp_manager
     app.state.history = history
     app.state.db_path = db_path
+    app.state.subagent_dispatcher = SubagentDispatcher(settings.subagent_llm_chain)
+    log.info(
+        "Subagent dispatcher ready: %s",
+        app.state.subagent_dispatcher.snapshot(),
+    )
     if stale_count:
         log.warning("Marked %d stale reader document(s) as failed on startup", stale_count)
     log.info("Connecting MCP servers...")
