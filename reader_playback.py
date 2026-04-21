@@ -20,6 +20,7 @@ async def stream_reader_audio(
     chunk_index: int = 0,
     sentence_index: int = 0,
     voice: str | None = None,
+    seq: int = 0,
 ):
     """Stream TTS audio for a document over WebSocket."""
     current_chunk_index = chunk_index
@@ -59,6 +60,7 @@ async def stream_reader_audio(
 
                     await ws.send_text(json.dumps({
                         "type": "reader_position",
+                        "seq": seq,
                         "chunk_index": current_chunk_index,
                         "sentence_index": current_sentence_index,
                         "total_chunks": total_chunks,
@@ -76,7 +78,7 @@ async def stream_reader_audio(
                     sentence_global += 1
 
             update_document(conn, doc_id, last_chunk=0, last_sentence=0)
-            await ws.send_text(json.dumps({"type": "reader_audio_done"}))
+            await ws.send_text(json.dumps({"type": "reader_audio_done", "seq": seq}))
 
         except asyncio.CancelledError:
             update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index)

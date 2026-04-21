@@ -247,6 +247,7 @@ class WebSocketSessionHandler:
                 chunk_index=data.get("chunk_index", 0),
                 sentence_index=data.get("sentence_index", 0),
                 voice=data.get("voice", self.state.voice),
+                seq=data.get("seq", 0),
             )
         )
 

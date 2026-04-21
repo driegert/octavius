@@ -30,6 +30,7 @@
   const positionQueue = [];
   let pollTimer = null;
   let playSeqId = 0;
+  let audioEpochArmed = false;
   let seekDebounce = null;
 
   function enqueuePosition(pos) {
@@ -97,6 +98,7 @@
   function clearAudioQueue() {
     audioQueue.length = 0;
     positionQueue.length = 0;
+    audioEpochArmed = false;
     if (currentAudio) {
       currentAudio.pause();
       currentAudio = null;
@@ -112,11 +114,20 @@
       onMessage(evt) {
         ws = socketController.getSocket();
         if (evt.data instanceof ArrayBuffer) {
+          if (!isPlaying || !audioEpochArmed) return;
+          audioEpochArmed = false;
           enqueueAudio(evt.data);
           return;
         }
         const msg = JSON.parse(evt.data);
-        if (msg.type === 'reader_position') enqueuePosition(msg);
+        if (msg.seq !== undefined && msg.seq !== playSeqId) {
+          audioEpochArmed = false;
+          return;
+        }
+        if (msg.type === 'reader_position') {
+          audioEpochArmed = true;
+          enqueuePosition(msg);
+        }
         if (msg.type === 'reader_audio_done') {
           isPlaying = false;
           playPauseBtn.innerHTML = '&#9654;';
@@ -303,6 +314,7 @@
         chunk_index: chunkIdx !== undefined ? chunkIdx : currentChunk,
         sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
         voice: voiceSelect.value,
+        seq: mySeq,
       }));
       isPlaying = true;
       playPauseBtn.innerHTML = '&#10074;&#10074;';
