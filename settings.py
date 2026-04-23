@@ -331,9 +331,9 @@ def load_settings() -> Settings:
     llm_chain = _env_json(
         "OCTAVIUS_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
-            {"url": "http://127.0.0.1:8001/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
-            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.5-35b-a3b"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
+            {"url": "http://127.0.0.1:8001/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
+            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
         ],
     )
     subagent_llm_chain = _env_json(
@@ -378,7 +378,7 @@ def load_settings() -> Settings:
         system_prompt=_env_str("OCTAVIUS_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
         summary_url=_env_str("OCTAVIUS_SUMMARY_URL", "http://127.0.0.1:8001/v1/chat/completions"),
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://triplestuffed:8010/v1/chat/completions"),
-        summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.5-35b-a3b"),
+        summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
         embedding_chain=_env_json(
             "OCTAVIUS_EMBEDDING_CHAIN",

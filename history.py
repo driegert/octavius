@@ -59,7 +59,7 @@ class HistoryRecorder:
 
     Usage:
         recorder = HistoryRecorder(conn)
-        session = recorder.start_conversation(service="octavius", source="voice", model="qwen3.5-35b-a3b")
+        session = recorder.start_conversation(service="octavius", source="voice", model="qwen3.6-35b-a3b")
 
         msg_id = session.add_message(
             role="user", content="What is multitaper spectral estimation?",
@@ -68,7 +68,7 @@ class HistoryRecorder:
 
         msg_id = session.add_message(
             role="assistant", content="Multitaper spectral estimation is...",
-            model="qwen3.5-35b-a3b", latency_ms=1200,
+            model="qwen3.6-35b-a3b", latency_ms=1200,
             input_tokens=150, output_tokens=80, tts_model="voxtral-4b",
         )
 

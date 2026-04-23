@@ -9,6 +9,7 @@ from conversation import Conversation
 from mcp_manager import MCPManager
 from service_clients import llm_client
 from settings import settings
+from subagent import parse_xml_tool_calls
 import tools as local_tools
 
 log = logging.getLogger(__name__)
@@ -107,7 +108,11 @@ async def stream_agent_turn(
 
                     delta = data["choices"][0].get("delta", {})
 
-                    if "tool_calls" in delta:
+                    # Only treat tool_calls as exclusive of content when the
+                    # list is actually populated. vLLM emits tool_calls=[]
+                    # alongside every content delta — using `in` alone would
+                    # skip all content tokens.
+                    if delta.get("tool_calls"):
                         for tc_delta in delta["tool_calls"]:
                             idx = tc_delta["index"]
                             if idx not in tool_calls_acc:
@@ -153,6 +158,22 @@ async def stream_agent_turn(
             log.exception("LLM request failed")
             yield f"I'm having trouble reaching my brain right now. Error: {e}"
             return
+
+        # Some OpenAI-compatible servers (vLLM with Qwen, certain llama.cpp
+        # chat templates) emit tool calls as Hermes-XML inside content with
+        # tool_calls=[]. Parse them into tool_calls_acc so the agent still
+        # executes the tool instead of speaking the XML.
+        if not tool_calls_acc and "<tool_call>" in full_content:
+            parsed, stripped = parse_xml_tool_calls(full_content)
+            if parsed:
+                for idx, call in enumerate(parsed):
+                    tool_calls_acc[idx] = {
+                        "id": call["id"] or f"call_{uuid.uuid4().hex[:8]}",
+                        "name": call["function"]["name"],
+                        "arguments": call["function"]["arguments"],
+                    }
+                full_content = stripped
+                log.info("Agent parsed %d XML tool call(s) from content", len(parsed))
 
         # --- Handle tool calls if any ---
         if tool_calls_acc:

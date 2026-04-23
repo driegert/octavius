@@ -23,6 +23,92 @@ log = logging.getLogger(__name__)
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+TOOL_CALL_XML_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_HERMES_FUNCTION_RE = re.compile(r"<function=([^>\s]+)>(.*?)</function>", re.DOTALL)
+_HERMES_PARAMETER_RE = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL
+)
+
+
+def parse_xml_tool_calls(content: str) -> tuple[list[dict], str]:
+    """Extract Hermes/Qwen-XML tool calls embedded in assistant content.
+
+    Some chat templates (notably certain Qwen builds) emit tool calls as XML
+    text inside the content field rather than as structured OpenAI tool_calls.
+    Two variants are supported:
+
+        <tool_call>
+        {"name": "X", "arguments": {"k": "v"}}
+        </tool_call>
+
+        <tool_call>
+        <function=X>
+        <parameter=k>v</parameter>
+        </function>
+        </tool_call>
+
+    Returns (tool_calls, stripped_content). If no well-formed tool calls are
+    found, tool_calls is empty and content is returned unchanged.
+    """
+    if "<tool_call>" not in content:
+        return [], content
+
+    tool_calls: list[dict] = []
+    for idx, match in enumerate(TOOL_CALL_XML_RE.finditer(content)):
+        body = match.group(1).strip()
+        name: str | None = None
+        args: dict = {}
+
+        # Variant 1: JSON object inside <tool_call>.
+        if body.startswith("{"):
+            try:
+                obj = json.loads(body)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict) and obj.get("name"):
+                name = str(obj["name"])
+                raw_args = obj.get("arguments", {})
+                if isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        args = parsed
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+
+        # Variant 2: Hermes-style nested <function=...><parameter=...>.
+        if name is None:
+            fn_match = _HERMES_FUNCTION_RE.search(body)
+            if fn_match:
+                name = fn_match.group(1).strip()
+                for pm in _HERMES_PARAMETER_RE.finditer(fn_match.group(2)):
+                    key = pm.group(1).strip()
+                    raw_val = pm.group(2).strip()
+                    # Decode JSON-looking values (numbers, booleans, lists,
+                    # nested objects) so downstream tool schemas get the
+                    # right types.
+                    try:
+                        args[key] = json.loads(raw_val)
+                    except (json.JSONDecodeError, ValueError):
+                        args[key] = raw_val
+
+        if not name:
+            continue
+
+        tool_calls.append({
+            "id": f"synth_{idx}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        })
+
+    stripped = TOOL_CALL_XML_RE.sub("", content).strip()
+    return tool_calls, stripped
+
 SUBAGENT_DOMAINS: dict[str, dict] = {
     "email": {
         "servers": ["evangeline-email"],
@@ -172,6 +258,21 @@ async def run_subagent(
 
         # Strip Qwen think tags
         clean_content = THINK_RE.sub("", content).strip()
+
+        # Some chat templates emit tool calls as XML text in content rather
+        # than as structured tool_calls. Parse them out so delegated work
+        # actually executes instead of being echoed back as final text.
+        synthesized_from_xml = False
+        if not tool_calls and "<tool_call>" in clean_content:
+            parsed_calls, clean_content = parse_xml_tool_calls(clean_content)
+            if parsed_calls:
+                tool_calls = parsed_calls
+                synthesized_from_xml = True
+                log.info(
+                    "Subagent [%s] parsed %d XML tool call(s) from content",
+                    domain, len(parsed_calls),
+                )
+
         if clean_content:
             last_text = clean_content
 
@@ -180,8 +281,17 @@ async def run_subagent(
             final_text = last_text or "The assistant completed but produced no output."
             return _compose_result(final_text, observations)
 
-        # Append the assistant message (with tool_calls) to context
-        messages.append(message)
+        # Append the assistant message (with tool_calls) to context. When we
+        # synthesized tool_calls from XML, build a normalized message so the
+        # next round sees structured tool_calls without duplicated XML.
+        if synthesized_from_xml:
+            messages.append({
+                "role": "assistant",
+                "content": clean_content,
+                "tool_calls": tool_calls,
+            })
+        else:
+            messages.append(message)
 
         # Execute each tool call
         for tc in tool_calls:
