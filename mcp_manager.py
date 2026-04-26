@@ -68,6 +68,7 @@ class MCPManager:
         tool_count = 0
         cfg = self._configs.get(server_name, {})
         allowlist = cfg.get("tool_allowlist")
+        description_suffix = cfg.get("tool_description_suffix") or ""
         upstream_names = {t.name for t in result.tools}
         for t in result.tools:
             if allowlist and t.name not in allowlist:
@@ -88,7 +89,7 @@ class MCPManager:
                 "type": "function",
                 "function": {
                     "name": t.name,
-                    "description": t.description or "",
+                    "description": (t.description or "") + description_suffix,
                     "parameters": t.inputSchema
                     or {"type": "object", "properties": {}},
                 },

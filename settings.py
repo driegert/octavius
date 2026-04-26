@@ -183,6 +183,12 @@ DEFAULT_MCP_SERVERS = {
             "SEARX_HOST": "https://searxng.riegert.xyz",
             "SSL_CERT_FILE": "/etc/ssl/cert.pem",
         },
+        "tool_description_suffix": (
+            " | SCOPE: general web lookups only (news, recipes, product info, "
+            "how-to, definitions, current events). Do NOT use for academic "
+            "papers, journal articles, citations, authors, or scholarly "
+            "research — those ALWAYS go to delegate_task(domain=\"research\")."
+        ),
     },
     "openalex": {
         "transport": "stdio",
@@ -261,15 +267,21 @@ fuss and the occasional understated wit. Think Jarvis, but self-hosted. You know
 your name is Octavius and you're not shy about it.
 
 You have access to tools:
-- Web search via SearXNG for general lookups
+- Web search via SearXNG for GENERAL web lookups ONLY — news, recipes,
+  product info, how-to, definitions, current events. NEVER use web search
+  for academic papers, journal articles, citations, authors, or scholarly
+  research; those ALWAYS go through delegate_task(domain="research").
 - delegate_task for email, research, and task management. This hands off to a
   specialist assistant running in the background on a separate machine. Use it
   when Dave asks about:
   * Email: "check my email", "find emails from X", "any emails about Y" →
     delegate_task(domain="email", task="..."). Include dates, senders, or
     topics Dave mentioned.
-  * Research: "find papers about X", "who publishes on Y", "citations for Z" →
-    delegate_task(domain="research", task="..."). Include topic details.
+  * Research: "find papers about X", "who publishes on Y", "citations for Z",
+    "journal articles on W", "recent publications about V" →
+    delegate_task(domain="research", task="..."). This is the ONLY correct
+    tool for academic/scholarly queries — do not fall back to web search.
+    Include topic details.
   * Tasks: "add a task", "what's on my list", "mark X as done" →
     delegate_task(domain="tasks", task="..."). Include project names if Dave
     specified one. Key projects: {vikunja_projects}.

@@ -237,9 +237,20 @@ async def run_subagent(
     observations: list[tuple[str, dict, str]] = []
 
     for round_num in range(max_rounds):
+        # On later rounds, nudge the LLM to wrap up instead of spiraling.
+        # Must NOT use role=system here — Qwen's chat template requires
+        # system messages only at the beginning. Keep tools in the payload;
+        # removing them makes Qwen emit raw <tool_call> XML as content.
+        round_messages = messages
+        if round_num >= max_rounds - 2:
+            round_messages = messages + [{
+                "role": "user",
+                "content": "[System note: You have used many tool calls. Summarize what you've found so far and respond now. Do not make more tool calls.]",
+            }]
+
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": round_messages,
             "tools": tools,
         }
 
