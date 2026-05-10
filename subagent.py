@@ -117,7 +117,16 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "to search, read, and analyze Dave's email. Be thorough but concise — "
             "your output will be spoken aloud by a voice assistant.\n"
             "Do NOT use markdown formatting, bullet points, or numbered lists. "
-            "Summarize findings conversationally. Don't read out full email addresses or URLs."
+            "Summarize findings conversationally. Don't read out full email addresses or URLs.\n"
+            "Email guidelines:\n"
+            "- Dave's Inbox is his 'not yet dealt with' pile. Anything still in INBOX "
+            "is by definition unresolved, regardless of read status.\n"
+            "- Default to folder=\"INBOX\" on search_emails, semantic_search, "
+            "list_conversations, and extract_from_emails. Do NOT pass a seen/unread filter — "
+            "presence in INBOX is what matters, not read state.\n"
+            "- Only widen beyond INBOX when Dave explicitly asks about another folder "
+            "(e.g. 'check sent mail', 'search archived messages', 'across all folders'). "
+            "Searching all folders by default returns dealt-with mail and is noisy."
         ),
         "max_rounds": 5,
     },
@@ -140,7 +149,9 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "Be concise — your output will be spoken aloud by a voice assistant.\n"
             "Do NOT use markdown formatting, bullet points, or numbered lists.\n"
             "Vikunja guidelines:\n"
-            "- Always set done=false when searching tasks unless Dave asks about completed ones.\n"
+            "- Dave's task list is his 'not yet finished' pile. Always pass done=false on "
+            "search_tasks and list-style task calls. Only pass done=true (or omit the filter) "
+            "when Dave explicitly asks about completed/done/finished tasks.\n"
             "- Sort by due_date or created when listing tasks so the most relevant appear first.\n"
             "- When creating tasks, ask which project if not obvious from context.\n"
             "- Avoid calling search_tasks more than twice for the same intent. "
