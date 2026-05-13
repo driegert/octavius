@@ -451,6 +451,154 @@
     padding: 0 3px;
   }
 
+  #agents-btn { position: relative; }
+
+  #agents-btn .agents-icon {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2rem;
+    color: #8888a0;
+    opacity: 0.55;
+    transition: opacity 0.2s, color 0.2s;
+  }
+  #agents-btn:hover .agents-icon { opacity: 0.85; }
+  #agents-btn.has-ready .agents-icon { color: #60ff90; opacity: 0.9; }
+  #agents-btn.has-running .agents-icon { color: #60a0ff; opacity: 0.9; }
+
+  #agents-badge {
+    display: none;
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: #60ff90;
+    color: #0a0a0f;
+    font-size: 0.55rem;
+    font-weight: 700;
+    min-width: 14px;
+    height: 14px;
+    line-height: 14px;
+    text-align: center;
+    border-radius: 7px;
+    padding: 0 3px;
+  }
+  #agents-badge.running-only { background: #60a0ff; }
+
+  /* Agents-at-work overlay */
+  #agents-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 100;
+  }
+  #agents-overlay.open { display: flex; align-items: center; justify-content: center; }
+
+  #agents-panel {
+    background: #12121a;
+    border: 1px solid #2a2a35;
+    border-radius: 8px;
+    padding: 1.4rem 1.4rem;
+    width: 420px;
+    max-width: 92vw;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #agents-panel h2 {
+    font-size: 0.8rem;
+    font-weight: 400;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: #6a6a7a;
+    margin-bottom: 1rem;
+  }
+
+  #agents-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin-bottom: 0.8rem;
+  }
+
+  .agent-item {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    padding: 0.7rem 0.8rem;
+  }
+  .agent-item.ready { border-color: #2f5a3a; }
+  .agent-item.failed { border-color: #5a2f2f; }
+
+  .agent-item .ai-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.65rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #6a6a7a;
+    margin-bottom: 0.35rem;
+  }
+  .agent-item.ready .ai-head .ai-status { color: #60ff90; }
+  .agent-item.running .ai-head .ai-status { color: #60a0ff; }
+  .agent-item.failed .ai-head .ai-status { color: #ff7070; }
+
+  .agent-item .ai-task {
+    font-size: 0.75rem;
+    color: #888;
+    line-height: 1.35;
+    margin-bottom: 0.35rem;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .agent-item .ai-preview {
+    font-size: 0.8rem;
+    color: #c8c8d0;
+    line-height: 1.4;
+    margin-bottom: 0.55rem;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .agent-item .ai-actions {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .agent-item .ai-btn {
+    background: none;
+    border: 1px solid #2a2a35;
+    color: #aaa;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.7rem;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .agent-item .ai-btn:hover { border-color: #60a0ff; color: #c8c8d0; }
+  .agent-item .ai-btn.primary { border-color: #60a0ff; color: #60a0ff; }
+  .agent-item .ai-btn.primary:hover { background: rgba(96, 160, 255, 0.08); }
+  .agent-item .ai-btn.danger:hover { border-color: #ff7070; color: #ff7070; }
+
+  .agents-empty {
+    text-align: center;
+    color: #555;
+    font-size: 0.8rem;
+    padding: 2rem 0;
+  }
+
   /* Settings panel */
   #settings-overlay {
     display: none;
@@ -694,6 +842,10 @@
   <button class="top-btn" id="history-btn" title="Conversation history"><img src="/static/icon-conversation_history.png" alt="History"></button>
 </div>
 <div id="top-right">
+  <button class="top-btn" id="agents-btn" title="Agents at work">
+    <span class="agents-icon">&#9881;</span>
+    <span id="agents-badge"></span>
+  </button>
   <a id="inbox-link" class="top-btn" href="/inbox" title="Knowledge Inbox"><img src="/static/icon-knowledge_inbox.png" alt="Inbox"><span id="inbox-badge"></span></a>
   <a class="top-btn" href="/reader" title="Document Reader"><img src="/static/icon-reading.png" alt="Reader"></a>
 </div>
@@ -724,6 +876,13 @@
     </div>
 
     <div class="setting-group">
+      <div class="setting-row">
+        <input type="checkbox" id="proactive-speak-cb">
+        <span class="cb-label" onclick="document.getElementById('proactive-speak-cb').click()">Speak delegation results when ready</span>
+      </div>
+    </div>
+
+    <div class="setting-group">
       <label for="talk-mode-select">Talk mode</label>
       <select id="talk-mode-select">
         <option value="hold">Hold to talk</option>
@@ -742,6 +901,15 @@
     <h2>Previous Conversations</h2>
     <div id="history-list"></div>
     <button class="panel-close" id="history-close">Cancel</button>
+  </div>
+</div>
+
+<!-- Agents-at-work overlay -->
+<div id="agents-overlay">
+  <div id="agents-panel">
+    <h2>Agents at Work</h2>
+    <div id="agents-list"></div>
+    <button class="panel-close" id="agents-close">Done</button>
   </div>
 </div>
 

@@ -560,5 +560,51 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(default_snippet, tasks_prompt)
 
 
+class UnwrapDoubleEncodedArgsTests(unittest.TestCase):
+    def test_unwraps_quoted_string_values(self):
+        args = {"sort_by": '"priority"', "order_by": '"desc"', "per_page": 3}
+        cleaned = subagent._unwrap_double_encoded_args(args)
+        self.assertEqual(cleaned, {"sort_by": "priority", "order_by": "desc", "per_page": 3})
+
+    def test_leaves_plain_strings_alone(self):
+        args = {"sort_by": "priority", "title": "Make a plan"}
+        cleaned = subagent._unwrap_double_encoded_args(args)
+        self.assertEqual(cleaned, args)
+
+    def test_unwraps_quoted_string_that_looks_numeric(self):
+        # '"3"' is JSON for the string "3", not the number 3. Unwrap once and
+        # accept the result; we should not aggressively coerce types.
+        args = {"per_page": '"3"'}
+        cleaned = subagent._unwrap_double_encoded_args(args)
+        self.assertEqual(cleaned, {"per_page": "3"})
+
+    def test_does_not_unwrap_container_results(self):
+        # A string like '"[1,2]"' would decode to a list — we should keep the
+        # original string rather than silently changing the value type.
+        args = {"raw": '"[1,2,3]"'}
+        cleaned = subagent._unwrap_double_encoded_args(args)
+        # json.loads('"[1,2,3]"') == "[1,2,3]" (still a string), so this is fine.
+        # But '"{\"x\": 1}"' decodes to '{"x": 1}' as a string — also fine.
+        # The key invariant: cleaned value is never a dict/list.
+        for value in cleaned.values():
+            self.assertNotIsInstance(value, (dict, list))
+
+    def test_handles_non_dict_input_gracefully(self):
+        self.assertEqual(subagent._unwrap_double_encoded_args("not a dict"), "not a dict")
+        self.assertEqual(subagent._unwrap_double_encoded_args([1, 2]), [1, 2])
+
+    def test_handles_malformed_quoted_string(self):
+        # Starts and ends with a quote but isn't valid JSON inside — keep as-is.
+        args = {"weird": '"unterminated'}
+        cleaned = subagent._unwrap_double_encoded_args(args)
+        self.assertEqual(cleaned, {"weird": '"unterminated'})
+
+    def test_handles_quoted_boolean(self):
+        args = {"done": '"false"'}
+        cleaned = subagent._unwrap_double_encoded_args(args)
+        # json.loads('"false"') is the string "false"; we keep the unwrap.
+        self.assertEqual(cleaned, {"done": "false"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,20 +60,27 @@ class STTClient:
 
 class TTSClient:
     """
-    Voice-routed TTS. The selected voice determines the engine:
+    Voice-routed TTS.
+
+    When `primary_enabled` is False (the default), Voxtral is never attempted:
+    every call goes to Kokoro. Kokoro voices speak in their own voice; voices
+    that only exist on Voxtral (e.g. de_male) are remapped to the configured
+    fallback voice. This is the practical setup because Voxtral requires too
+    much VRAM to run reliably.
+
+    When `primary_enabled` is True, the original voice-routed behavior applies:
 
     - Voices in `kokoro_voices` go straight to the fallback (Kokoro) endpoint,
-      with no Voxtral attempt and no breaker interaction. Users pick these
-      when they want reliable synthesis and don't care about Voxtral.
+      with no Voxtral attempt and no breaker interaction.
     - Any other voice is treated as a primary (Voxtral) voice and goes through
       the primary → fallback path with a circuit breaker on the primary.
 
-    Breaker behavior: after PRIMARY_FAILURE_THRESHOLD consecutive failures the
-    primary is "tripped": subsequent synth calls on primary voices skip it
-    entirely and go to the fallback with its own voice for
-    PRIMARY_COOLDOWN_SECONDS. When the cooldown elapses the next primary-voice
-    call probes the primary again ("half-open"); a success closes the breaker,
-    a failure re-trips it.
+    Breaker behavior (only relevant when `primary_enabled` is True): after
+    PRIMARY_FAILURE_THRESHOLD consecutive failures the primary is "tripped":
+    subsequent synth calls on primary voices skip it entirely and go to the
+    fallback with its own voice for PRIMARY_COOLDOWN_SECONDS. When the cooldown
+    elapses the next primary-voice call probes the primary again ("half-open");
+    a success closes the breaker, a failure re-trips it.
     """
 
     PRIMARY_FAILURE_THRESHOLD = 3
@@ -85,11 +92,13 @@ class TTSClient:
         fallback: dict,
         response_format: str,
         kokoro_voices: list[str] | None = None,
+        primary_enabled: bool = True,
     ):
         self.primary = primary
         self.fallback = fallback
         self.response_format = response_format
         self._kokoro_voices = set(kokoro_voices or [])
+        self._primary_enabled = primary_enabled
         self._primary_consecutive_failures = 0
         self._primary_skip_until = 0.0  # monotonic; 0 means breaker closed
 
@@ -115,6 +124,25 @@ class TTSClient:
 
     async def synthesize(self, text: str, voice: str | None = None) -> bytes:
         async with httpx.AsyncClient(timeout=120.0) as client:
+            # When primary (Voxtral) is disabled, route everything to Kokoro:
+            # Kokoro voices speak in their voice; other voices fall back to
+            # the configured fallback voice. The breaker is never touched.
+            if not self._primary_enabled:
+                kokoro_voice = (
+                    voice if voice in self._kokoro_voices else self.fallback["voice"]
+                )
+                resp = await client.post(
+                    self.fallback["url"],
+                    json={
+                        "input": text,
+                        "voice": kokoro_voice,
+                        "model": self.fallback["model"],
+                        "response_format": self.response_format,
+                    },
+                )
+                resp.raise_for_status()
+                return resp.content
+
             if voice and voice in self._kokoro_voices:
                 resp = await client.post(
                     self.fallback["url"],
@@ -601,6 +629,7 @@ tts_client = TTSClient(
     },
     response_format=settings.tts.format,
     kokoro_voices=settings.tts.kokoro_voices,
+    primary_enabled=settings.tts.voxtral_enabled,
 )
 llm_client = LLMChainClient(settings.llm_chain)
 subagent_llm_client = LLMChainClient(settings.subagent_llm_chain)

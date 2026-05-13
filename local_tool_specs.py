@@ -262,4 +262,70 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pending_delegations",
+            "description": (
+                "List delegations that have been started in this session and have "
+                "not yet been pulled into the conversation. Use this when Dave "
+                "asks about the status of background work (e.g. 'what's pending?', "
+                "'are those emails ready?') or when you need to discover handles "
+                "for pull_delegation. Returns an array of {handle, domain, "
+                "status, preview, submitted_task}. status is 'running', 'ready', "
+                "or 'failed'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["running", "ready", "failed"],
+                        "description": "Optional. Filter to one status.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "enum": ["email", "research", "tasks"],
+                        "description": "Optional. Filter to one domain.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pull_delegation",
+            "description": (
+                "Bring a ready delegation result into the current conversation. "
+                "Use when Dave signals he's ready to hear results (e.g. 'let's go "
+                "over those emails now', 'show me the research', 'what did the "
+                "task search find?'). Returns the specialist's full reply; "
+                "summarize it conversationally in your response. Provide either "
+                "the handle (preferred when known) or the domain (picks the most "
+                "recent ready delegation in that domain). Only works for ready "
+                "delegations — running ones will be reported as still in progress."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "description": (
+                            "Delegation handle. Get one from list_pending_delegations "
+                            "or remember it from when delegate_task returned."
+                        ),
+                    },
+                    "domain": {
+                        "type": "string",
+                        "enum": ["email", "research", "tasks"],
+                        "description": (
+                            "Fallback when no specific handle is known. Picks the "
+                            "most recent ready delegation in that domain."
+                        ),
+                    },
+                },
+            },
+        },
+    },
 ]

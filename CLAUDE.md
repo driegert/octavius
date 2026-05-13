@@ -87,6 +87,15 @@ with only the tools for that domain, using the same MCP sessions. This keeps
 the main agent's context lean (~11 tools instead of ~44) and prevents
 tool-schema-heavy payloads from causing LLM 500 errors.
 
+Delegation results are parked on a per-session record (status `running` →
+`ready` / `failed`) and surfaced as an "Agents at Work" badge in the UI.
+By default Octavius does not interrupt the live conversation to speak the
+result; the user pulls it when ready, either by clicking "Bring into this
+chat" / "Open as new conversation" or by asking ("let's go over those emails
+now"), which routes through the `pull_delegation` local tool. The legacy
+interrupt-and-speak behavior is available via the `proactive_speak` setting
+(default off).
+
 External services currently expected:
 
 - **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
@@ -128,6 +137,7 @@ WebSocket message families:
 - Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
 - Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
+- Delegations: `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
 
 ## Code Map
 

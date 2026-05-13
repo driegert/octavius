@@ -30,6 +30,37 @@ _HERMES_PARAMETER_RE = re.compile(
 )
 
 
+def _unwrap_double_encoded_args(args: dict) -> dict:
+    """Defend against Qwen models emitting tool-call arguments where string
+    values are themselves JSON-encoded a second time.
+
+    Observed pattern (both llama.cpp- and vLLM-served Qwen):
+        arguments='{"sort_by": "\\"priority\\"", "per_page": 3}'
+    After one json.loads this gives {"sort_by": '"priority"'} — the inner
+    string still has literal quote characters. MCP servers like Vikunja then
+    reject `"priority"` as not matching the allowed enum.
+
+    For each string value we try one more json.loads. If it produces a
+    scalar (str/int/float/bool/None), we use that. We do NOT replace with
+    dict/list results, since legitimate strings should never decode to a
+    container.
+    """
+    if not isinstance(args, dict):
+        return args
+    cleaned = {}
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            try:
+                decoded = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                decoded = value
+            if isinstance(decoded, (str, int, float, bool)) or decoded is None:
+                cleaned[key] = decoded
+                continue
+        cleaned[key] = value
+    return cleaned
+
+
 def parse_xml_tool_calls(content: str) -> tuple[list[dict], str]:
     """Extract Hermes/Qwen-XML tool calls embedded in assistant content.
 
@@ -329,6 +360,7 @@ async def run_subagent(
                 args = json.loads(func.get("arguments", "{}"))
             except json.JSONDecodeError:
                 args = {}
+            args = _unwrap_double_encoded_args(args)
 
             result = await mcp.call_tool(name, args)
             try:

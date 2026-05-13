@@ -9,7 +9,7 @@ from conversation import Conversation
 from mcp_manager import MCPManager
 from service_clients import llm_client
 from settings import settings
-from subagent import parse_xml_tool_calls
+from subagent import _unwrap_double_encoded_args, parse_xml_tool_calls
 import tools as local_tools
 
 log = logging.getLogger(__name__)
@@ -196,6 +196,7 @@ async def stream_agent_turn(
                     args = json.loads(args_str) if args_str else {}
                 except json.JSONDecodeError:
                     args = {}
+                args = _unwrap_double_encoded_args(args)
 
                 conversation.add_tool_call(call_id, name, args_str)
                 # Route to local tools or MCP

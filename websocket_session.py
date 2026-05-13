@@ -44,6 +44,18 @@ def create_item_conversation(item: dict, item_id: int) -> Conversation:
 
 VAD_SILENCE_SECONDS = 1.5  # auto-stop after this much silence post-speech
 
+# Max chars in the per-delegation preview line shown in the UI badge.
+_DELEGATION_PREVIEW_CHARS = 180
+
+
+def _build_preview(text: str) -> str:
+    """Build a single-line preview of a delegation result for the UI badge."""
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    if len(first_line) <= _DELEGATION_PREVIEW_CHARS:
+        return first_line
+    cut = first_line[:_DELEGATION_PREVIEW_CHARS].rsplit(" ", 1)[0]
+    return cut + "..."
+
 
 @dataclass
 class StreamingSTTState:
@@ -71,6 +83,10 @@ class DelegationRecord:
     ticket: SubagentTicket
     created_at: datetime
     task: asyncio.Task | None = None
+    status: str = "running"  # 'running' | 'ready' | 'failed'
+    result: str | None = None  # full result text including TOOL DATA, parked for pull
+    preview: str | None = None  # short one-line preview for the UI badge
+    error: str | None = None
 
 
 @dataclass
@@ -100,6 +116,10 @@ class WebSocketSessionState:
     delegations: dict[str, DelegationRecord] = field(default_factory=dict)
     proactive_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     proactive_worker_task: asyncio.Task | None = None
+    # When False (default), finished delegations park their results on the
+    # record and the UI shows a non-intrusive badge instead of speaking
+    # results aloud. Flip to True to restore the old interrupt-and-speak path.
+    proactive_speak_enabled: bool = False
 
 
 class WebSocketSessionHandler:
@@ -194,6 +214,9 @@ class WebSocketSessionHandler:
             "item_chat_reset": self.handle_item_chat_reset,
             "stt_start": self.handle_stt_start,
             "stt_stop": self.handle_stt_stop,
+            "delegation_list": self.handle_delegation_list,
+            "delegation_pull": self.handle_delegation_pull,
+            "delegation_dismiss": self.handle_delegation_dismiss,
         }
         handler = handlers.get(msg_type)
         if handler:
@@ -269,6 +292,12 @@ class WebSocketSessionHandler:
         if "tts" in data:
             self.state.tts_enabled = data["tts"]
             log.info("TTS %s", "enabled" if self.state.tts_enabled else "disabled")
+        if "proactive_speak" in data:
+            self.state.proactive_speak_enabled = bool(data["proactive_speak"])
+            log.info(
+                "Proactive speak %s",
+                "enabled" if self.state.proactive_speak_enabled else "disabled",
+            )
 
     async def handle_text_input(self, data: dict):
         user_text = data.get("text", "").strip()
@@ -444,6 +473,22 @@ class WebSocketSessionHandler:
 
     async def handle_audio_message(self, audio_bytes: bytes):
         from stt import transcribe
+
+        # WebM/Opus blobs always start with the EBML magic header.
+        # When VAD auto-stops the streaming session, the browser's audio
+        # capture keeps producing PCM chunks for a brief window; those
+        # arrive after stt_stream.active flips False and would otherwise
+        # land here, get POSTed as audio/webm, and 500 on Whisper. Drop
+        # silently — the streaming path already produced the transcript
+        # for this turn.
+        if not audio_bytes.startswith(b"\x1A\x45\xDF\xA3"):
+            log.debug(
+                "Discarding %d bytes of non-WebM data on non-streaming "
+                "audio path (likely trailing PCM after VAD auto-stop)",
+                len(audio_bytes),
+            )
+            return
+
         await self.send_json("status", "Transcribing...")
         try:
             user_text = await transcribe(audio_bytes)
@@ -583,6 +628,7 @@ class WebSocketSessionHandler:
 
             full_reply_parts = []
             first_sentence = True
+            agent_error: Exception | None = None
             try:
                 async for sentence in stream_agent_turn(
                     self.state.conversation,
@@ -603,6 +649,10 @@ class WebSocketSessionHandler:
                         except Exception:
                             log.exception("TTS failed for chunk")
             except Exception as exc:
+                # Capture but do NOT early-return — the finally block must
+                # send audio_done so continuous mode re-arms. Without it,
+                # the browser sits in "Speaking..." forever.
+                agent_error = exc
                 log.exception("Agent failed")
                 await self.send_json("status", f"Agent error: {exc}")
                 if self.state.history_session:
@@ -611,23 +661,28 @@ class WebSocketSessionHandler:
                         content=f"Error: {exc}",
                         error=str(exc),
                     )
-                return
+            finally:
+                full_reply = "".join(full_reply_parts).strip()
 
-            full_reply = "".join(full_reply_parts).strip()
-            if full_reply:
-                await self.send_json("response", full_reply)
+                # On the happy path, send the response and persist it. On the
+                # error path, agent_error is set and we skip these — the
+                # history record was already written above.
+                if full_reply and agent_error is None:
+                    await self.send_json("response", full_reply)
+                    if self.state.history_session:
+                        latency_ms = int((time.monotonic() - turn_start) * 1000)
+                        await self.state.history_session.add_message_async(
+                            role="assistant",
+                            content=full_reply,
+                            model=settings.llm_chain[0]["model"],
+                            latency_ms=latency_ms,
+                            tts_model=settings.tts.model if self.state.tts_enabled else None,
+                        )
 
-            if self.state.history_session and full_reply:
-                latency_ms = int((time.monotonic() - turn_start) * 1000)
-                await self.state.history_session.add_message_async(
-                    role="assistant",
-                    content=full_reply,
-                    model=settings.llm_chain[0]["model"],
-                    latency_ms=latency_ms,
-                    tts_model=settings.tts.model if self.state.tts_enabled else None,
-                )
-
-            await self.send_json("status", "audio_done")
+                # Always signal turn-end so the client's audio queue drains
+                # and continuous mode re-arms recording. This must run on
+                # every path: success, empty reply, or exception.
+                await self.send_json("status", "audio_done")
 
     async def cancel_reader_task(self):
         if self.state.reader_task and not self.state.reader_task.done():
@@ -727,9 +782,21 @@ class WebSocketSessionHandler:
         self.state.delegations.pop(handle, None)
         return {"cancelled": True, "handle": handle}
 
+    async def _emit_delegation_update(self, record: DelegationRecord) -> None:
+        await self.send_payload({
+            "type": "delegation_update",
+            "handle": record.handle,
+            "domain": record.domain,
+            "submitted_task": record.submitted_task,
+            "status": record.status,
+            "preview": record.preview,
+            "error": record.error,
+        })
+
     async def _run_and_announce(self, record: DelegationRecord) -> None:
         assigned_url: str | None = None
         try:
+            await self._emit_delegation_update(record)
             assigned_url = await record.ticket.acquire()
             fallback_url = self.state.subagent_dispatcher.fallback_url()
 
@@ -750,24 +817,146 @@ class WebSocketSessionHandler:
                 fallback_url=fallback_url,
                 status_callback=status_cb,
             )
-            await self.state.proactive_queue.put(
-                ProactiveMessage(handle=record.handle, domain=record.domain, text=result)
-            )
+            spoken = result.split("\n\n===TOOL DATA", 1)[0].strip()
+            record.result = result
+            record.preview = _build_preview(spoken)
+            record.status = "ready"
+            await self._emit_delegation_update(record)
+            if self.state.proactive_speak_enabled:
+                await self.state.proactive_queue.put(
+                    ProactiveMessage(handle=record.handle, domain=record.domain, text=result)
+                )
         except asyncio.CancelledError:
             log.info("Delegation %s cancelled", record.handle)
+            # Cancelled records are removed by cancel_delegation already.
             raise
         except Exception as exc:
             log.exception("Delegation %s crashed", record.handle)
-            await self.state.proactive_queue.put(
-                ProactiveMessage(
-                    handle=record.handle,
-                    domain=record.domain,
-                    text=f"Background task failed: {exc}",
-                )
-            )
+            record.status = "failed"
+            record.error = str(exc)
+            await self._emit_delegation_update(record)
         finally:
             await record.ticket.release()
-            self.state.delegations.pop(record.handle, None)
+            # Note: we intentionally do NOT remove the record here. Ready and
+            # failed records stay parked until the user pulls or dismisses
+            # them (or the WebSocket disconnects, at which point cleanup
+            # cancels everything).
+
+    async def handle_delegation_list(self, _data: dict):
+        """Reply with the current snapshot. Used by the UI on connect/reconnect."""
+        for record in list(self.state.delegations.values()):
+            await self._emit_delegation_update(record)
+
+    async def handle_delegation_dismiss(self, data: dict):
+        handle = data.get("handle", "")
+        record = self.state.delegations.get(handle)
+        if record is None:
+            return
+        if record.status == "running":
+            # Treat dismiss-while-running as cancel.
+            await self.cancel_delegation(handle)
+        else:
+            self.state.delegations.pop(handle, None)
+        await self.send_payload({"type": "delegation_removed", "handle": handle})
+
+    async def handle_delegation_pull(self, data: dict):
+        handle = data.get("handle", "")
+        mode = data.get("mode", "merge")
+        await self.pull_delegation(handle=handle, mode=mode, via="ui")
+
+    async def pull_delegation(self, handle: str, mode: str, via: str = "ui") -> str:
+        """Bring a parked delegation result into the conversation.
+
+        mode='merge' injects the result into the running conversation. When
+        called via UI, runs a fresh agent turn so Octavius summarizes the
+        result naturally; when called via the agent's pull_delegation tool
+        (via='voice'), returns the result text as the tool observation so
+        the in-flight agent turn can incorporate it.
+
+        mode='new' (UI only) creates a fresh history session seeded with the
+        original task and result, and tells the UI to switch to it. The
+        previous conversation is left intact.
+        """
+        record = self.state.delegations.get(handle)
+        if record is None:
+            return f"No pending delegation found with handle {handle}."
+        if record.status == "running":
+            return (
+                f"Delegation {handle} is still running. "
+                "I'll pull the result once it's ready."
+            )
+
+        if record.status == "failed":
+            err = record.error or "unknown error"
+            self.state.delegations.pop(handle, None)
+            await self.send_payload({"type": "delegation_removed", "handle": handle})
+            return f"That delegation failed: {err}"
+
+        spoken = (record.result or "").split("\n\n===TOOL DATA", 1)[0].strip()
+        domain = record.domain
+        submitted = record.submitted_task
+        self.state.delegations.pop(handle, None)
+        await self.send_payload({"type": "delegation_removed", "handle": handle})
+
+        if mode == "new":
+            await self._spawn_seeded_conversation(domain, submitted, spoken)
+            return f"Started a new conversation seeded with the {domain} results."
+
+        # mode == "merge"
+        if via == "ui":
+            prompt = (
+                f"[I earlier delegated this {domain} task and the specialist has "
+                f"now returned. Original task: {submitted}\n\nSpecialist reply:\n"
+                f"{spoken}\n\nSummarize this for me conversationally.]"
+            )
+            await self.send_json("transcript", f"(reviewing {domain} results)")
+            await self.run_turn(prompt, source="text")
+            return ""
+        # via == "voice" — caller is the agent mid-turn; hand it the text.
+        return spoken
+
+    async def _spawn_seeded_conversation(
+        self, domain: str, submitted_task: str, result_text: str,
+    ) -> None:
+        """End the current history session, start a new one seeded with the
+        delegation exchange, and tell the UI to switch to it.
+        """
+        if self.state.history_session:
+            await self.state.history_session.end_async()
+        new_session = self.state.history.start_conversation(
+            service="octavius",
+            source="voice",
+            model=settings.llm_chain[0]["model"],
+        )
+        seed_user = (
+            f"[Earlier I delegated this {domain} task and the specialist has "
+            f"returned. Original task: {submitted_task}]"
+        )
+        seed_assistant = result_text or "(no content)"
+        await new_session.add_message_async(
+            role="user", content=seed_user, model=None,
+        )
+        await new_session.add_message_async(
+            role="assistant",
+            content=seed_assistant,
+            model=settings.subagent_llm_chain[0]["model"],
+        )
+        self.state.history_session = new_session
+        self.state.conversation.reset()
+        self.state.conversation.add_user(seed_user)
+        self.state.conversation.add_assistant(seed_assistant)
+        await self.send_payload({
+            "type": "conversation_loaded",
+            "conversation_id": new_session.conv_id,
+            "messages": [
+                {"role": "user", "content": seed_user},
+                {"role": "assistant", "content": seed_assistant},
+            ],
+        })
+        await self.send_payload({
+            "type": "session_id",
+            "conversation_id": new_session.conv_id,
+        })
 
 
 async def handle_websocket_session(ws: Any):

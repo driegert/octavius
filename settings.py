@@ -29,6 +29,11 @@ class TTSSettings:
     fallback_url: str
     fallback_model: str
     fallback_voice: str
+    # When False (default), Voxtral is never attempted: all synth calls go
+    # straight to Kokoro, with Voxtral-only voices remapped to the fallback
+    # voice. Set OCTAVIUS_TTS_VOXTRAL_ENABLED=1 to restore the primary→fallback
+    # path with circuit breaker.
+    voxtral_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -351,13 +356,14 @@ def load_settings() -> Settings:
     subagent_llm_chain = _env_json(
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8030/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "secondary"},
             {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "fallback"},
         ],
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
     kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
+    voxtral_enabled = _env_str("OCTAVIUS_TTS_VOXTRAL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
     tts = TTSSettings(
         url=_env_str("OCTAVIUS_TTS_URL", "http://triplestuffed:8020/v1/audio/speech"),
         model=_env_str("OCTAVIUS_TTS_MODEL", "/media/extra_stuff/huggingface/mistralai/Voxtral-4B-TTS-2603"),
@@ -369,6 +375,7 @@ def load_settings() -> Settings:
         fallback_url=_env_str("OCTAVIUS_TTS_FALLBACK_URL", "http://lilbuddy:8880/v1/audio/speech"),
         fallback_model=_env_str("OCTAVIUS_TTS_FALLBACK_MODEL", "kokoro"),
         fallback_voice=_env_str("OCTAVIUS_TTS_FALLBACK_VOICE", "bm_lewis"),
+        voxtral_enabled=voxtral_enabled,
     )
     reader = ReaderSettings(
         directory=_env_str("OCTAVIUS_READER_DIR", "/home/dave/octavius-reader"),

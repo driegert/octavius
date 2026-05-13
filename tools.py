@@ -6,6 +6,7 @@ import inspect
 import json
 from typing import TYPE_CHECKING, Callable
 
+from local_tool_delegations import list_pending_delegations, pull_delegation
 from local_tool_downloads import download_file
 from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
 from local_tool_reader import list_reader_documents, process_pdf_background, read_document
@@ -25,8 +26,10 @@ async def _delegate_task(args: dict, history_session=None, mcp_manager=None, ses
         return "Error: delegation session unavailable."
     summary = await session.spawn_delegation(domain, task)
     summary["note"] = (
-        "Reply briefly to acknowledge (e.g. 'on it'). Results will be spoken "
-        "when ready. Do not wait."
+        "Reply briefly to acknowledge (e.g. 'on it'). The result will be "
+        "parked on a UI badge when ready — Dave can ask for it later (e.g. "
+        "'let's go over those emails now') and you will then call "
+        "pull_delegation to bring it in. Do not wait or stall."
     )
     return json.dumps(summary)
 
@@ -52,6 +55,8 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "process_pdf": process_pdf_background,
         "delegate_task": _delegate_task,
         "cancel_delegation": _cancel_delegation,
+        "list_pending_delegations": list_pending_delegations,
+        "pull_delegation": pull_delegation,
     }
 
 

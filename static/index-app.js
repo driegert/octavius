@@ -31,6 +31,12 @@
   const fullConvOverlay = document.getElementById('full-conv-overlay');
   const fullConvClose = document.getElementById('full-conv-close');
   const fullConvMessages = document.getElementById('full-conv-messages');
+  const agentsBtn = document.getElementById('agents-btn');
+  const agentsBadge = document.getElementById('agents-badge');
+  const agentsOver = document.getElementById('agents-overlay');
+  const agentsClose = document.getElementById('agents-close');
+  const agentsList = document.getElementById('agents-list');
+  const proactiveSpeakCb = document.getElementById('proactive-speak-cb');
 
   let ws = null;
   let mediaRecorder = null;
@@ -52,6 +58,11 @@
   let continuousActive = false;
   let currentConversationId = null;
   let conversationHistory = [];
+  let proactiveSpeak = false;
+
+  // Parked delegations keyed by handle.
+  // Shape per entry: {handle, domain, submitted_task, status, preview, error}.
+  const delegations = new Map();
 
   try {
     const stored = localStorage.getItem('octavius-conv-id');
@@ -183,7 +194,12 @@
 
   function sendSettings() {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'settings', voice: currentVoice, tts: ttsEnabled }));
+      ws.send(JSON.stringify({
+        type: 'settings',
+        voice: currentVoice,
+        tts: ttsEnabled,
+        proactive_speak: proactiveSpeak,
+      }));
     }
   }
 
@@ -284,6 +300,145 @@
     historyOver.classList.remove('open');
   }
 
+  // ---------- Agents-at-work (delegations) ----------
+
+  const DOMAIN_LABELS = { email: 'Email', research: 'Research', tasks: 'Tasks' };
+
+  function statusLabel(status) {
+    if (status === 'ready') return 'Ready';
+    if (status === 'running') return 'Working';
+    if (status === 'failed') return 'Failed';
+    return status || '';
+  }
+
+  function escapeHtml(text) {
+    if (typeof OctaviusApp !== 'undefined' && OctaviusApp.escapeHtml) {
+      return OctaviusApp.escapeHtml(text);
+    }
+    return String(text).replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch]));
+  }
+
+  function renderAgents() {
+    if (!agentsList) return;
+    if (delegations.size === 0) {
+      agentsList.innerHTML = '<div class="agents-empty">No agents at work.</div>';
+      return;
+    }
+    const items = Array.from(delegations.values()).sort((a, b) => {
+      // Ready first, then running, then failed.
+      const order = { ready: 0, running: 1, failed: 2 };
+      return (order[a.status] ?? 3) - (order[b.status] ?? 3);
+    });
+    agentsList.innerHTML = '';
+    for (const rec of items) {
+      const node = document.createElement('div');
+      node.className = `agent-item ${rec.status}`;
+      const domainLabel = DOMAIN_LABELS[rec.domain] || rec.domain;
+      const headHtml = `
+        <div class="ai-head">
+          <span class="ai-domain">${escapeHtml(domainLabel)}</span>
+          <span class="ai-status">${escapeHtml(statusLabel(rec.status))}</span>
+        </div>
+      `;
+      const taskHtml = `<div class="ai-task">${escapeHtml(rec.submitted_task || '')}</div>`;
+      let bodyHtml = '';
+      let actionsHtml = '';
+      if (rec.status === 'ready') {
+        bodyHtml = `<div class="ai-preview">${escapeHtml(rec.preview || '(no preview)')}</div>`;
+        actionsHtml = `
+          <div class="ai-actions">
+            <button class="ai-btn primary" data-act="merge" data-handle="${escapeHtml(rec.handle)}">Bring into this chat</button>
+            <button class="ai-btn" data-act="new" data-handle="${escapeHtml(rec.handle)}">Open as new conversation</button>
+            <button class="ai-btn danger" data-act="dismiss" data-handle="${escapeHtml(rec.handle)}">Dismiss</button>
+          </div>
+        `;
+      } else if (rec.status === 'failed') {
+        bodyHtml = `<div class="ai-preview">${escapeHtml(rec.error || 'Unknown error.')}</div>`;
+        actionsHtml = `
+          <div class="ai-actions">
+            <button class="ai-btn danger" data-act="dismiss" data-handle="${escapeHtml(rec.handle)}">Dismiss</button>
+          </div>
+        `;
+      } else {
+        // running
+        actionsHtml = `
+          <div class="ai-actions">
+            <button class="ai-btn danger" data-act="dismiss" data-handle="${escapeHtml(rec.handle)}">Cancel</button>
+          </div>
+        `;
+      }
+      node.innerHTML = headHtml + taskHtml + bodyHtml + actionsHtml;
+      agentsList.appendChild(node);
+    }
+  }
+
+  function refreshAgentsBadge() {
+    let readyCount = 0;
+    let runningCount = 0;
+    for (const rec of delegations.values()) {
+      if (rec.status === 'ready') readyCount += 1;
+      else if (rec.status === 'running') runningCount += 1;
+    }
+    const total = readyCount + runningCount;
+    if (total === 0) {
+      agentsBadge.style.display = 'none';
+      agentsBtn.classList.remove('has-ready', 'has-running');
+      return;
+    }
+    agentsBadge.style.display = 'block';
+    agentsBadge.textContent = readyCount > 0 ? String(readyCount) : String(runningCount);
+    if (readyCount > 0) {
+      agentsBadge.classList.remove('running-only');
+      agentsBtn.classList.add('has-ready');
+      agentsBtn.classList.remove('has-running');
+    } else {
+      agentsBadge.classList.add('running-only');
+      agentsBtn.classList.add('has-running');
+      agentsBtn.classList.remove('has-ready');
+    }
+  }
+
+  function applyDelegationUpdate(msg) {
+    delegations.set(msg.handle, {
+      handle: msg.handle,
+      domain: msg.domain,
+      submitted_task: msg.submitted_task,
+      status: msg.status,
+      preview: msg.preview,
+      error: msg.error,
+    });
+    refreshAgentsBadge();
+    if (agentsOver.classList.contains('open')) renderAgents();
+  }
+
+  function applyDelegationRemoved(msg) {
+    delegations.delete(msg.handle);
+    refreshAgentsBadge();
+    if (agentsOver.classList.contains('open')) renderAgents();
+  }
+
+  function openAgents() {
+    renderAgents();
+    agentsOver.classList.add('open');
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'delegation_list' }));
+    }
+  }
+
+  function handleAgentAction(action, handle) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (action === 'dismiss') {
+      ws.send(JSON.stringify({ type: 'delegation_dismiss', handle }));
+      return;
+    }
+    if (action === 'merge' || action === 'new') {
+      ws.send(JSON.stringify({ type: 'delegation_pull', handle, mode: action }));
+      agentsOver.classList.remove('open');
+    }
+  }
+
   function connect() {
     const socketController = OctaviusApp.createWebSocket({
       binaryType: 'arraybuffer',
@@ -302,6 +457,10 @@
         if (currentConversationId) {
           ws.send(JSON.stringify({ type: 'restore_session', conversation_id: currentConversationId }));
         }
+        // Clear local list and resync with server snapshot.
+        delegations.clear();
+        refreshAgentsBadge();
+        ws.send(JSON.stringify({ type: 'delegation_list' }));
       },
       onMessage(evt) {
         ws = socketController.getSocket();
@@ -377,6 +536,12 @@
           setAssistantText(lastAssistant);
           setStatus(`Resumed conversation #${msg.conversation_id}`, true);
           setTimeout(() => setStatus('Ready'), 2000);
+        }
+        if (msg.type === 'delegation_update') {
+          applyDelegationUpdate(msg);
+        }
+        if (msg.type === 'delegation_removed') {
+          applyDelegationRemoved(msg);
         }
       },
       onClose() {
@@ -621,6 +786,26 @@
 
   trimCb.addEventListener('change', persistCurrent);
 
+  proactiveSpeakCb.addEventListener('change', () => {
+    proactiveSpeak = proactiveSpeakCb.checked;
+    sendSettings();
+    // Persist alongside other preferences.
+    try {
+      const prefs = JSON.parse(localStorage.getItem('octavius-prefs') || '{}');
+      prefs.proactiveSpeak = proactiveSpeak;
+      localStorage.setItem('octavius-prefs', JSON.stringify(prefs));
+    } catch (_err) {}
+  });
+
+  // Restore proactiveSpeak preference if previously set.
+  try {
+    const stored = JSON.parse(localStorage.getItem('octavius-prefs') || '{}');
+    if (typeof stored.proactiveSpeak === 'boolean') {
+      proactiveSpeak = stored.proactiveSpeak;
+      proactiveSpeakCb.checked = proactiveSpeak;
+    }
+  } catch (_err) {}
+
   talkModeSelect.addEventListener('change', () => {
     if (continuousActive && talkModeSelect.value !== 'continuous') {
       endContinuousConversation();
@@ -634,6 +819,21 @@
   historyClose.addEventListener('click', () => historyOver.classList.remove('open'));
   historyOver.addEventListener('click', (event) => {
     if (event.target === historyOver) historyOver.classList.remove('open');
+  });
+
+  agentsBtn.addEventListener('click', openAgents);
+  agentsClose.addEventListener('click', () => agentsOver.classList.remove('open'));
+  agentsOver.addEventListener('click', (event) => {
+    if (event.target === agentsOver) agentsOver.classList.remove('open');
+  });
+  agentsList.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const btn = target.closest('button.ai-btn');
+    if (!btn) return;
+    const action = btn.getAttribute('data-act');
+    const handle = btn.getAttribute('data-handle');
+    if (action && handle) handleAgentAction(action, handle);
   });
 
   stopBtn.addEventListener('click', () => audioPlayer.stop());
