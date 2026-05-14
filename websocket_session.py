@@ -112,6 +112,7 @@ class WebSocketSessionState:
     stt_stream: StreamingSTTState = field(default_factory=StreamingSTTState)
     vad: object | None = None  # SileroVAD instance, created on first stt_start
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    turn_task: asyncio.Task | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     delegations: dict[str, DelegationRecord] = field(default_factory=dict)
     proactive_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -164,6 +165,8 @@ class WebSocketSessionHandler:
         )
 
     async def cleanup(self):
+        if self.state.turn_task and not self.state.turn_task.done():
+            self.state.turn_task.cancel()
         if self.state.reader_task and not self.state.reader_task.done():
             self.state.reader_task.cancel()
         for record in list(self.state.delegations.values()):
@@ -308,7 +311,7 @@ class WebSocketSessionHandler:
         if not user_text:
             return
         await self.send_json("transcript", user_text)
-        await self.run_turn(user_text, source="text")
+        self._spawn_turn(user_text, source="text")
 
     async def handle_reader_play(self, data: dict):
         await self.cancel_reader_task()
@@ -506,7 +509,7 @@ class WebSocketSessionHandler:
             return
 
         await self.send_json("transcript", user_text)
-        await self.run_turn(user_text, source="voice")
+        self._spawn_turn(user_text, source="voice")
 
     # --- Streaming STT ---
 
@@ -612,7 +615,35 @@ class WebSocketSessionHandler:
             return
 
         await self.send_json("transcript", last_text)
-        await self.run_turn(last_text, source="voice")
+        self._spawn_turn(last_text, source="voice")
+
+    def _spawn_turn(self, user_text: str, source: str) -> None:
+        """Run a turn as a background task.
+
+        The WebSocket receive loop is single-threaded: awaiting a turn
+        inline blocks it from reading further frames, so heartbeat pings
+        sent during a long turn pile up unanswered and the client's
+        watchdog force-closes the socket. Spawning the turn keeps the
+        receive loop free to answer pings while the agent streams.
+
+        The client UI disables input until a turn finishes, so overlapping
+        turns shouldn't happen; if one slips through we drop it rather than
+        queue, since stale voice input is not worth replaying.
+        """
+        if self.state.turn_task and not self.state.turn_task.done():
+            log.warning("Turn already in flight; dropping new turn request")
+            return
+        self.state.turn_task = asyncio.create_task(
+            self._run_turn_guarded(user_text, source)
+        )
+
+    async def _run_turn_guarded(self, user_text: str, source: str) -> None:
+        try:
+            await self.run_turn(user_text, source)
+        except (WebSocketDisconnect, RuntimeError):
+            log.info("Turn aborted: client disconnected mid-turn")
+        except Exception:
+            log.exception("Turn task crashed")
 
     async def run_turn(self, user_text: str, source: str):
         from agent import stream_agent_turn
@@ -914,7 +945,7 @@ class WebSocketSessionHandler:
                 f"{spoken}\n\nSummarize this for me conversationally.]"
             )
             await self.send_json("transcript", f"(reviewing {domain} results)")
-            await self.run_turn(prompt, source="text")
+            self._spawn_turn(prompt, source="text")
             return ""
         # via == "voice" — caller is the agent mid-turn; hand it the text.
         return spoken

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from websocket_session import build_item_chat_context, create_item_conversation
-from websocket_session import WebSocketSessionHandler
+from websocket_session import WebSocketSessionHandler, WebSocketDisconnect
 from settings import settings
 
 
@@ -267,6 +267,88 @@ class RunTurnAudioDoneTests(unittest.TestCase):
             # Error status appears AND audio_done still fires.
             self.assertTrue(any("Agent error" in s for s in statuses))
             self.assertIn("audio_done", statuses)
+
+        asyncio.run(run())
+
+
+class SpawnTurnTests(unittest.TestCase):
+    """_spawn_turn runs the turn off the receive loop so heartbeat pings
+    keep being answered while the agent streams. Overlapping turns are
+    dropped rather than queued.
+    """
+
+    def _make_handler(self):
+        ws = _FakeWS()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=1)
+        handler.state.tts_enabled = False
+        return handler, ws
+
+    def test_spawn_turn_runs_as_background_task(self):
+        async def run():
+            handler, _ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                yield "Done."
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                handler._spawn_turn("hello", source="text")
+                self.assertIsNotNone(handler.state.turn_task)
+                self.assertFalse(handler.state.turn_task.done())
+                await handler.state.turn_task
+
+            self.assertTrue(handler.state.turn_task.done())
+
+        asyncio.run(run())
+
+    def test_overlapping_turn_is_dropped(self):
+        async def run():
+            handler, _ws = self._make_handler()
+            release = asyncio.Event()
+
+            async def slow_stream(*args, **kwargs):
+                await release.wait()
+                yield "Done."
+
+            with patch("agent.stream_agent_turn", side_effect=slow_stream):
+                handler._spawn_turn("first", source="text")
+                first_task = handler.state.turn_task
+                # Second request while the first is still in flight.
+                handler._spawn_turn("second", source="text")
+                self.assertIs(handler.state.turn_task, first_task)
+                release.set()
+                await first_task
+
+        asyncio.run(run())
+
+    def test_turn_after_previous_finishes_is_accepted(self):
+        async def run():
+            handler, _ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                yield "Done."
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                handler._spawn_turn("first", source="text")
+                first_task = handler.state.turn_task
+                await first_task
+                handler._spawn_turn("second", source="text")
+                self.assertIsNot(handler.state.turn_task, first_task)
+                await handler.state.turn_task
+
+        asyncio.run(run())
+
+    def test_guarded_turn_swallows_disconnect(self):
+        async def run():
+            handler, _ws = self._make_handler()
+
+            async def disconnecting_stream(*args, **kwargs):
+                raise WebSocketDisconnect()
+                yield  # unreachable; marks this an async generator
+
+            with patch("agent.stream_agent_turn", side_effect=disconnecting_stream):
+                # Must not raise out of the task.
+                await handler._run_turn_guarded("hello", source="text")
 
         asyncio.run(run())
 
