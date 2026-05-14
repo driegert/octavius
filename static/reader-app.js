@@ -108,6 +108,7 @@
   function connectWS() {
     const socketController = OctaviusApp.createWebSocket({
       binaryType: 'arraybuffer',
+      heartbeat: true,
       onOpen(_evt, socket) {
         ws = socket;
       },

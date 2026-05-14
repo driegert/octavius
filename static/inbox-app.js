@@ -204,6 +204,7 @@
 
   function connectWS() {
     const socketController = OctaviusApp.createWebSocket({
+      heartbeat: true,
       onOpen(_evt, socket) {
         ws = socket;
       },

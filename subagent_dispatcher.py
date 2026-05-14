@@ -51,6 +51,7 @@ class _Endpoint:
     url: str
     model: str
     role: str
+    capacity: int = 1
 
 
 class SubagentDispatcher:
@@ -59,7 +60,12 @@ class SubagentDispatcher:
         secondary = None
         fallback = None
         for entry in chain:
-            ep = _Endpoint(url=entry["url"], model=entry.get("model", ""), role=entry.get("role", ""))
+            ep = _Endpoint(
+                url=entry["url"],
+                model=entry.get("model", ""),
+                role=entry.get("role", ""),
+                capacity=max(1, int(entry.get("capacity", 1))),
+            )
             if ep.role == "primary" and primary is None:
                 primary = ep
             elif ep.role == "secondary" and secondary is None:
@@ -71,8 +77,10 @@ class SubagentDispatcher:
         self.primary = primary
         self.secondary = secondary
         self.fallback = fallback
+        self.capacity: dict[str, int] = {primary.url: primary.capacity}
         self.in_flight: dict[str, int] = {primary.url: 0}
         if secondary is not None:
+            self.capacity[secondary.url] = secondary.capacity
             self.in_flight[secondary.url] = 0
         self.queue: deque[SubagentTicket] = deque()
         self._lock = asyncio.Lock()
@@ -107,9 +115,9 @@ class SubagentDispatcher:
             return ticket
 
     def _try_assign_locked(self) -> str | None:
-        if self.in_flight.get(self.primary.url, 0) == 0:
+        if self.in_flight.get(self.primary.url, 0) < self.capacity[self.primary.url]:
             return self.primary.url
-        if self.secondary is not None and self.in_flight.get(self.secondary.url, 0) == 0:
+        if self.secondary is not None and self.in_flight.get(self.secondary.url, 0) < self.capacity[self.secondary.url]:
             return self.secondary.url
         return None
 

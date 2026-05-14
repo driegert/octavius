@@ -356,7 +356,7 @@ def load_settings() -> Settings:
     subagent_llm_chain = _env_json(
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "secondary"},
             {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "fallback"},
         ],

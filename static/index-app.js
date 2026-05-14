@@ -442,6 +442,7 @@
   function connect() {
     const socketController = OctaviusApp.createWebSocket({
       binaryType: 'arraybuffer',
+      heartbeat: true,
       getReconnectDelayMs() {
         const delay = reconnectDelay;
         reconnectDelay = Math.min(reconnectDelay * 2, 15000);

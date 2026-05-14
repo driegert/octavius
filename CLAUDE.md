@@ -99,10 +99,16 @@ interrupt-and-speak behavior is available via the `proactive_speak` setting
 External services currently expected:
 
 - **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
-- **LLM chain**: Qwen3.5-35B-A3B via `OCTAVIUS_LLM_CHAIN`, defaulting to:
+- **LLM chain (main agent)**: Qwen3.6-35B-A3B via `OCTAVIUS_LLM_CHAIN`, defaulting to:
   - primary: `lilripper:8020/v1/chat/completions`
   - first fallback: `127.0.0.1:8001/v1/chat/completions` on lilbuddy
   - second fallback: `triplestuffed:8010/v1/chat/completions`
+- **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
+  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b` (capacity 1; runs serially)
+  - secondary: `lilbuddy:8010/v1/chat/completions` running `qwen3.6-35b-a3b`
+  - fallback: `triplestuffed:8010/v1/chat/completions` running `qwen3.6-35b-a3b`
+  - The dispatcher routes by role; per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
+  - Note: `lilripper:8010` is shared with the reader LLM (different model alias). The host is a llama-swap so the model loaded swaps when calls hit different aliases — back-to-back reader and subagent calls will pay a swap cost.
 - **TTS**: Voxtral 4B at `triplestuffed:8020/v1/audio/speech`
 - **TTS fallback**: Kokoro at `lilbuddy:8880`
 - **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions`

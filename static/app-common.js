@@ -22,24 +22,76 @@
       reconnectDelayMs = 2000,
       getReconnectDelayMs,
       reconnect = true,
+      heartbeat = false,
+      heartbeatIntervalMs = 15000,
+      heartbeatTimeoutMs = 10000,
     } = options || {};
 
     let socket = null;
     let closedExplicitly = false;
+    let heartbeatTimer = null;
+    let pongDeadline = null;
+
+    function stopHeartbeat() {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      pongDeadline = null;
+    }
+
+    function startHeartbeat(sock) {
+      if (!heartbeat) return;
+      stopHeartbeat();
+      heartbeatTimer = setInterval(() => {
+        // If we previously sent a ping and the deadline passed without a
+        // pong, the underlying TCP is likely dead (e.g. mobile network
+        // handoff). Force the socket closed so onclose fires and the
+        // reconnect path runs.
+        if (pongDeadline !== null && Date.now() > pongDeadline) {
+          stopHeartbeat();
+          try { sock.close(); } catch (_err) { /* ignore */ }
+          return;
+        }
+        if (sock.readyState !== WebSocket.OPEN) {
+          stopHeartbeat();
+          return;
+        }
+        try {
+          sock.send(JSON.stringify({ type: 'ping' }));
+          pongDeadline = Date.now() + heartbeatTimeoutMs;
+        } catch (_err) {
+          stopHeartbeat();
+          try { sock.close(); } catch (_err2) { /* ignore */ }
+        }
+      }, heartbeatIntervalMs);
+    }
 
     function connect() {
       socket = new WebSocket(websocketUrl(path));
       if (binaryType) socket.binaryType = binaryType;
 
       socket.onopen = (event) => {
+        startHeartbeat(socket);
         if (onOpen) onOpen(event, socket);
       };
 
       socket.onmessage = (event) => {
+        if (heartbeat) {
+          // Any inbound message means the link is alive.
+          pongDeadline = null;
+          if (typeof event.data === 'string') {
+            try {
+              const parsed = JSON.parse(event.data);
+              if (parsed && parsed.type === 'pong') return;
+            } catch (_err) { /* fall through to app handler */ }
+          }
+        }
         if (onMessage) onMessage(event, socket);
       };
 
       socket.onclose = (event) => {
+        stopHeartbeat();
         if (onClose) onClose(event, socket);
         if (!closedExplicitly && reconnect) {
           const delay = getReconnectDelayMs ? getReconnectDelayMs() : reconnectDelayMs;
@@ -62,6 +114,7 @@
       },
       close() {
         closedExplicitly = true;
+        stopHeartbeat();
         if (socket) socket.close();
       },
     };

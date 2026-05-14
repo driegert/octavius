@@ -92,5 +92,59 @@ class SubagentDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(disp.model_for("http://unknown/"))
 
 
+class SubagentDispatcherCapacityTests(unittest.IsolatedAsyncioTestCase):
+    CHAIN = [
+        {"url": "http://primary/v1/chat/completions",   "model": "m", "role": "primary",   "capacity": 2},
+        {"url": "http://secondary/v1/chat/completions", "model": "m", "role": "secondary"},
+        {"url": "http://fallback/v1/chat/completions",  "model": "m", "role": "fallback"},
+    ]
+
+    async def test_primary_serves_up_to_capacity_before_secondary(self):
+        disp = SubagentDispatcher(self.CHAIN)
+        a = await disp.reserve()
+        b = await disp.reserve()
+        self.assertEqual(await a.acquire(), "http://primary/v1/chat/completions")
+        self.assertEqual(await b.acquire(), "http://primary/v1/chat/completions")
+        self.assertEqual(disp.in_flight["http://primary/v1/chat/completions"], 2)
+        c = await disp.reserve()
+        self.assertEqual(await c.acquire(), "http://secondary/v1/chat/completions")
+        await a.release()
+        await b.release()
+        await c.release()
+
+    async def test_fourth_request_queues_when_primary_full_and_secondary_busy(self):
+        disp = SubagentDispatcher(self.CHAIN)
+        a = await disp.reserve()
+        b = await disp.reserve()
+        c = await disp.reserve()
+        await a.acquire()
+        await b.acquire()
+        await c.acquire()
+        d = await disp.reserve()
+        self.assertEqual(len(disp.queue), 1)
+        self.assertFalse(d._future.done())
+        await a.release()
+        self.assertEqual(await d.acquire(), "http://primary/v1/chat/completions")
+        await b.release()
+        await c.release()
+        await d.release()
+
+    async def test_capacity_defaults_to_one(self):
+        chain = [
+            {"url": "http://p/", "model": "m", "role": "primary"},
+            {"url": "http://s/", "model": "m", "role": "secondary"},
+        ]
+        disp = SubagentDispatcher(chain)
+        self.assertEqual(disp.capacity["http://p/"], 1)
+        self.assertEqual(disp.capacity["http://s/"], 1)
+
+    async def test_capacity_floors_to_one(self):
+        chain = [
+            {"url": "http://p/", "model": "m", "role": "primary", "capacity": 0},
+        ]
+        disp = SubagentDispatcher(chain)
+        self.assertEqual(disp.capacity["http://p/"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -201,6 +201,7 @@ class WebSocketSessionHandler:
 
         msg_type = data.get("type")
         handlers = {
+            "ping": self.handle_ping,
             "restore_session": self.handle_restore_session,
             "reset": self.handle_reset,
             "load_conversation": self.handle_load_conversation,
@@ -221,6 +222,9 @@ class WebSocketSessionHandler:
         handler = handlers.get(msg_type)
         if handler:
             await handler(data)
+
+    async def handle_ping(self, _data: dict):
+        await self.send_payload({"type": "pong"})
 
     async def handle_restore_session(self, data: dict):
         from history import get_conversation_messages
