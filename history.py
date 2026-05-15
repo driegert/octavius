@@ -304,15 +304,24 @@ class ConversationSession:
         self._finalize_conversation_row()
 
         # Generate summary
-        summary = generate_summary(self._messages_for_summary)
-        if summary:
+        result = generate_summary(self._messages_for_summary)
+        if result.summary:
             self.conn.execute(
                 "UPDATE conversations SET summary = ? WHERE id = ?",
-                (summary, self.conv_id),
+                (result.summary, self.conv_id),
             )
             self.conn.commit()
-            store_embedding(self.conn, "summary_embeddings", "conversation_id", self.conv_id, summary)
-            log.info("Conversation %d summary: %s", self.conv_id, summary[:80])
+            if result.index:
+                store_embedding(
+                    self.conn, "summary_embeddings", "conversation_id", self.conv_id, result.summary
+                )
+                log.info("Conversation %d summary: %s", self.conv_id, result.summary[:80])
+            else:
+                log.info(
+                    "Conversation %d not indexed (summary kept): %s",
+                    self.conv_id,
+                    result.summary[:80],
+                )
 
         # Generate tags
         tags = generate_tags(self._messages_for_summary)
@@ -326,15 +335,24 @@ class ConversationSession:
             return
         self._finalize_conversation_row()
 
-        summary = await generate_summary_async(self._messages_for_summary)
-        if summary:
+        result = await generate_summary_async(self._messages_for_summary)
+        if result.summary:
             self.conn.execute(
                 "UPDATE conversations SET summary = ? WHERE id = ?",
-                (summary, self.conv_id),
+                (result.summary, self.conv_id),
             )
             self.conn.commit()
-            await store_embedding_async(self.conn, "summary_embeddings", "conversation_id", self.conv_id, summary)
-            log.info("Conversation %d summary: %s", self.conv_id, summary[:80])
+            if result.index:
+                await store_embedding_async(
+                    self.conn, "summary_embeddings", "conversation_id", self.conv_id, result.summary
+                )
+                log.info("Conversation %d summary: %s", self.conv_id, result.summary[:80])
+            else:
+                log.info(
+                    "Conversation %d not indexed (summary kept): %s",
+                    self.conv_id,
+                    result.summary[:80],
+                )
 
         tags = await generate_tags_async(self._messages_for_summary)
         self._store_tags(tags)

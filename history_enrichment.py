@@ -3,6 +3,7 @@ import logging
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from service_clients import embedding_client, summary_client
 from settings import settings
@@ -21,11 +22,28 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 SUMMARY_SYSTEM_PROMPT = (
     "/no_think\n"
-    "Summarize the following conversation in 2-3 sentences. "
-    "Focus on the key topics discussed, decisions made, and any actions taken. "
-    "Be concise and factual. Do not use markdown formatting. "
-    "Do not include any preamble like 'Here is a summary' — just the summary itself."
+    "Produce a one-sentence summary of this conversation for later search, "
+    "and decide whether it is worth indexing.\n\n"
+    "Rules for the summary:\n"
+    "- One sentence, action-oriented, past tense.\n"
+    "- Include the specific subject — project name, person, document, concept — "
+    "not a generic noun like 'tasks' or 'emails'.\n"
+    "- No preamble. No markdown.\n\n"
+    "Rules for the index flag:\n"
+    "- index=true if the conversation contains decisions, novel content, "
+    "drafted text, conclusions, or anything the user might later want to find.\n"
+    "- index=false if the conversation is purely read-only retrieval "
+    "(listing emails, listing tasks, asking the date, weather lookups, etc.) "
+    "and nothing was added on top.\n\n"
+    "Output ONLY a single-line JSON object, no markdown fence:\n"
+    '{"summary": "...", "index": true}'
 )
+
+
+@dataclass
+class SummaryResult:
+    summary: str | None
+    index: bool
 
 TAG_SYSTEM_PROMPT = (
     "/no_think\n"
@@ -128,18 +146,50 @@ def _summary_payload(transcript: str) -> dict:
     }
 
 
-def generate_summary(messages: list[dict]) -> str | None:
+def generate_summary(messages: list[dict]) -> SummaryResult:
     transcript = build_transcript(messages, max_content_chars=1000)
     if not transcript:
-        return None
-    return _request_completion(_summary_payload(transcript))
+        return SummaryResult(summary=None, index=False)
+    return _parse_summary_result(_request_completion(_summary_payload(transcript)))
 
 
-async def generate_summary_async(messages: list[dict]) -> str | None:
+async def generate_summary_async(messages: list[dict]) -> SummaryResult:
     transcript = build_transcript(messages, max_content_chars=1000)
     if not transcript:
-        return None
-    return await _request_completion_async(_summary_payload(transcript))
+        return SummaryResult(summary=None, index=False)
+    return _parse_summary_result(await _request_completion_async(_summary_payload(transcript)))
+
+
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_summary_result(text: str | None) -> SummaryResult:
+    if not text:
+        return SummaryResult(summary=None, index=False)
+    match = _JSON_OBJECT_RE.search(text)
+    if not match:
+        log.warning("Summary output had no JSON object; treating as plain summary: %r", text[:120])
+        return SummaryResult(summary=text.strip() or None, index=True)
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        log.warning("Summary JSON failed to parse; treating raw text as summary: %r", text[:120])
+        return SummaryResult(summary=text.strip() or None, index=True)
+    if not isinstance(obj, dict):
+        return SummaryResult(summary=text.strip() or None, index=True)
+    summary = obj.get("summary")
+    if isinstance(summary, str):
+        summary = summary.strip() or None
+    else:
+        summary = None
+    index_raw = obj.get("index", True)
+    if isinstance(index_raw, bool):
+        index = index_raw
+    elif isinstance(index_raw, str):
+        index = index_raw.strip().lower() not in {"false", "0", "no"}
+    else:
+        index = bool(index_raw)
+    return SummaryResult(summary=summary, index=index)
 
 
 def generate_tags(messages: list[dict]) -> list[str]:

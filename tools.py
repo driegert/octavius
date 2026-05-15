@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 
 from local_tool_delegations import list_pending_delegations, pull_delegation
 from local_tool_downloads import download_file
+from local_tool_history import search_conversation_history
 from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
 from local_tool_reader import list_reader_documents, process_pdf_background, read_document
 from local_tool_specs import TOOLS
@@ -53,6 +54,7 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "read_document": read_document,
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
+        "search_conversation_history": search_conversation_history,
         "delegate_task": _delegate_task,
         "cancel_delegation": _cancel_delegation,
         "list_pending_delegations": list_pending_delegations,

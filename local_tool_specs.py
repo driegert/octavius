@@ -205,6 +205,35 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_conversation_history",
+            "description": (
+                "Search Dave's prior Octavius conversations by semantic meaning. "
+                "Use when he asks things like 'did we talk about X?', 'when did "
+                "we last discuss Y?', or 'remind me what we decided about Z'. "
+                "Returns past conversations with their one-line summary, age, "
+                "and topic tags. Note: purely retrieval-only conversations "
+                "(e.g. just listing emails or tasks) are not indexed, so the "
+                "absence of a match may mean nothing substantive was said."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language search phrase.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max conversations to return (1-20, default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate_task",
             "description": (
                 "Start a backgrounded specialist task. Use for: "

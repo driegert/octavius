@@ -33,5 +33,61 @@ class HistoryEnrichmentTests(unittest.TestCase):
         mock_embed.assert_called_once()
 
 
+class GenerateSummaryTests(unittest.TestCase):
+    def _messages(self):
+        return [
+            {"role": "user", "content": "what tasks do I have?"},
+            {"role": "assistant", "content": "Listed 3 tasks."},
+        ]
+
+    def test_empty_transcript_returns_skip(self):
+        result = enrichment.generate_summary([])
+        self.assertIsNone(result.summary)
+        self.assertFalse(result.index)
+
+    def test_valid_json_index_true(self):
+        raw = '{"summary": "Designed conversation-history search.", "index": true}'
+        with patch.object(enrichment.summary_client, "complete", return_value=raw):
+            result = enrichment.generate_summary(self._messages())
+        self.assertEqual(result.summary, "Designed conversation-history search.")
+        self.assertTrue(result.index)
+
+    def test_valid_json_index_false(self):
+        raw = '{"summary": "Listed open Vikunja tasks.", "index": false}'
+        with patch.object(enrichment.summary_client, "complete", return_value=raw):
+            result = enrichment.generate_summary(self._messages())
+        self.assertEqual(result.summary, "Listed open Vikunja tasks.")
+        self.assertFalse(result.index)
+
+    def test_json_with_think_prefix(self):
+        raw = (
+            "<think>weighing whether this is novel</think>\n"
+            '{"summary": "Discussed Qwen3.6 thinking-mode.", "index": true}'
+        )
+        with patch.object(enrichment.summary_client, "complete", return_value=raw):
+            result = enrichment.generate_summary(self._messages())
+        self.assertEqual(result.summary, "Discussed Qwen3.6 thinking-mode.")
+        self.assertTrue(result.index)
+
+    def test_malformed_json_falls_back_to_indexed_text(self):
+        raw = "Designed conversation-history search."
+        with patch.object(enrichment.summary_client, "complete", return_value=raw):
+            result = enrichment.generate_summary(self._messages())
+        self.assertEqual(result.summary, "Designed conversation-history search.")
+        self.assertTrue(result.index)
+
+    def test_string_index_flag_parsed(self):
+        raw = '{"summary": "Listed emails.", "index": "false"}'
+        with patch.object(enrichment.summary_client, "complete", return_value=raw):
+            result = enrichment.generate_summary(self._messages())
+        self.assertFalse(result.index)
+
+    def test_empty_completion_returns_no_summary(self):
+        with patch.object(enrichment.summary_client, "complete", return_value=""):
+            result = enrichment.generate_summary(self._messages())
+        self.assertIsNone(result.summary)
+        self.assertFalse(result.index)
+
+
 if __name__ == "__main__":
     unittest.main()

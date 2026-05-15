@@ -288,7 +288,17 @@ Reader storage:
 ### Conversation History
 
 - Conversations are recorded in `octavius_history.db`.
-- Summaries and topic tags are generated when a conversation ends.
+- Summaries and topic tags are generated when a conversation ends. The summary
+  prompt asks for a one-sentence, action-oriented summary *and* an `index`
+  flag; conversations the LLM judges as purely read-only retrieval (e.g.
+  listing emails/tasks, weather lookups) get the summary stored but skip the
+  embedding write, so they don't pollute semantic search results. Tags are
+  still generated for all conversations.
+- The main agent can search prior Octavius conversations via the
+  `search_conversation_history` local tool, which wraps
+  `history_store.search_conversations()` (semantic-first against
+  `summary_embeddings`, with a text-LIKE fallback). Filtered to
+  `service="octavius"` and excludes the current conversation.
 - History can be resumed from the browser UI through `load_conversation`.
 - The same DB is shared with other AI services and exposed through the conversation-history MCP server.
 - Request handlers and background reader jobs use short-lived SQLite connections; live conversation history sessions keep their own dedicated connection until the session ends.
