@@ -77,7 +77,13 @@
         </div>
       `;
 
-      card.addEventListener('click', () => toggleExpand(card, item.id));
+      card.addEventListener('click', () => {
+        const sel = window.getSelection();
+        if (sel && sel.toString().length > 0 && card.contains(sel.anchorNode)) {
+          return;
+        }
+        toggleExpand(card, item.id);
+      });
       itemsEl.appendChild(card);
     }
   }
