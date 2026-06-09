@@ -29,11 +29,12 @@ class TTSSettings:
     fallback_url: str
     fallback_model: str
     fallback_voice: str
-    # When False (default), Voxtral is never attempted: all synth calls go
-    # straight to Kokoro, with Voxtral-only voices remapped to the fallback
-    # voice. Set OCTAVIUS_TTS_VOXTRAL_ENABLED=1 to restore the primary→fallback
-    # path with circuit breaker.
-    voxtral_enabled: bool = False
+    # When True (default), the primary→fallback path with circuit breaker is
+    # active: Voxtral-style voices (e.g. de_male) synth on the primary endpoint
+    # and fall back to Kokoro on failure. Set OCTAVIUS_TTS_VOXTRAL_ENABLED=0 to
+    # force everything straight to Kokoro, with Voxtral-only voices remapped to
+    # the fallback voice.
+    voxtral_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -363,11 +364,11 @@ def load_settings() -> Settings:
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
     kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
-    voxtral_enabled = _env_str("OCTAVIUS_TTS_VOXTRAL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+    voxtral_enabled = _env_str("OCTAVIUS_TTS_VOXTRAL_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
     tts = TTSSettings(
-        url=_env_str("OCTAVIUS_TTS_URL", "http://triplestuffed:8020/v1/audio/speech"),
-        model=_env_str("OCTAVIUS_TTS_MODEL", "/media/extra_stuff/huggingface/mistralai/Voxtral-4B-TTS-2603"),
-        voice=_env_str("OCTAVIUS_TTS_VOICE", "bm_lewis"),
+        url=_env_str("OCTAVIUS_TTS_URL", "http://lilripper:8030/v1/audio/speech"),
+        model=_env_str("OCTAVIUS_TTS_MODEL", "voxtral-4b-tts"),
+        voice=_env_str("OCTAVIUS_TTS_VOICE", "de_male"),
         format=_env_str("OCTAVIUS_TTS_FORMAT", "wav"),
         voices=voxtral_voices + kokoro_voices,
         voxtral_voices=voxtral_voices,
