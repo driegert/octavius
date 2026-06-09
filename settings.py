@@ -403,7 +403,7 @@ def load_settings() -> Settings:
             "OCTAVIUS_EMBEDDING_CHAIN",
             [
                 {
-                    "url": "http://lilbuddy:8010/v1/embeddings",
+                    "url": "http://lilbuddy:8020/v1/embeddings",
                     "model": "bge-m3",
                     "schema": "openai",
                 },

@@ -114,7 +114,7 @@ External services currently expected:
 - **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions`
 - **Summary/tag generation**: summary chain defaults to `127.0.0.1:8001/v1/chat/completions` with fallback `triplestuffed:8010/v1/chat/completions`
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
-  - primary: `lilbuddy:8010/v1/embeddings` (llama.cpp, OpenAI schema)
+  - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
 
 Configured MCP servers:
