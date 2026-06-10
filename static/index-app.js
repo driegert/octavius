@@ -21,7 +21,6 @@
   const textSend = document.getElementById('text-send');
   const talkModeSelect = document.getElementById('talk-mode-select');
   const historyBtn = document.getElementById('history-btn');
-  const historyBtnBot = document.getElementById('history-btn-bottom');
   const historyOver = document.getElementById('history-overlay');
   const historyClose = document.getElementById('history-close');
   const historyList = document.getElementById('history-list');
@@ -384,9 +383,10 @@
     const total = readyCount + runningCount;
     if (total === 0) {
       agentsBadge.style.display = 'none';
-      agentsBtn.classList.remove('has-ready', 'has-running');
+      agentsBtn.classList.remove('visible', 'has-ready', 'has-running');
       return;
     }
+    agentsBtn.classList.add('visible');
     agentsBadge.style.display = 'block';
     agentsBadge.textContent = readyCount > 0 ? String(readyCount) : String(runningCount);
     if (readyCount > 0) {
@@ -816,7 +816,6 @@
   });
 
   historyBtn.addEventListener('click', openHistory);
-  historyBtnBot.addEventListener('click', openHistory);
   historyClose.addEventListener('click', () => historyOver.classList.remove('open'));
   historyOver.addEventListener('click', (event) => {
     if (event.target === historyOver) historyOver.classList.remove('open');
