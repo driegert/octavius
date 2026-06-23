@@ -75,26 +75,43 @@ Browser (WebSocket) -> FastAPI app -> main agent (streaming, ~11 core tools)
                                         │
                                         ├─ direct: web search, stash, reader, PDF, download
                                         │
-                                        └─ delegate_task → subagent (non-streaming, scoped tools)
-                                             ├─ email domain (~9 tools, evangeline-email)
-                                             ├─ research domain (~14 tools, openalex)
-                                             └─ tasks domain (~10 tools, vikunja-tasks)
+                                        └─ consult_specialist(domain, task) → subagent
+                                             (non-streaming, scoped tools, runs INLINE)
+                                             ├─ email domain (evangeline-email)
+                                             ├─ research domain (openalex)
+                                             └─ tasks domain (vikunja-tasks)
 ```
 
 The main agent never sees email/research/task tool schemas. It calls
-`delegate_task(domain, task)` which runs a separate non-streaming LLM loop
-with only the tools for that domain, using the same MCP sessions. This keeps
-the main agent's context lean (~11 tools instead of ~44) and prevents
+`consult_specialist(domain, task)` which runs a separate non-streaming LLM
+loop with only the tools for that domain, using the same MCP sessions. This
+keeps the main agent's context lean (~11 tools instead of ~44) and prevents
 tool-schema-heavy payloads from causing LLM 500 errors.
 
-Delegation results are parked on a per-session record (status `running` →
-`ready` / `failed`) and surfaced as an "Agents at Work" badge in the UI.
-By default Octavius does not interrupt the live conversation to speak the
-result; the user pulls it when ready, either by clicking "Bring into this
-chat" / "Open as new conversation" or by asking ("let's go over those emails
-now"), which routes through the `pull_delegation` local tool. The legacy
-interrupt-and-speak behavior is available via the `proactive_speak` setting
-(default off).
+`consult_specialist` is **synchronous/inline**: the specialist runs to
+completion inside the main agent's tool round (via
+`WebSocketSessionHandler.run_inline_subagent`) and its result is returned into
+the same turn, so Octavius speaks the answer immediately — no badge, no pull.
+A `subagent_dispatcher` ticket is reserved per call so inline consults respect
+subagent endpoint capacity, and per-step progress is forwarded to the UI
+`status` line so the user isn't left in silence.
+
+**Async delegation is reserved, not removed.** The async path
+(`delegate_task` / `pull_delegation` / `list_pending_delegations` /
+`cancel_delegation`, the "Agents at Work" badge, the
+`spawn_delegation`/`_run_and_announce` lifecycle, the `proactive_speak` setting,
+and the `delegation_*` WebSocket messages) is kept in the codebase but is
+currently **unexposed** to the agent (no tool specs/handlers registered). It is
+reserved for a future `deep_research` domain that will shell out to the **pi
+harness headless** (`pi --mode json -p --no-session ...`, parsing the final
+assistant `message_end`), which already has a parallel `deep_research`
+orchestrator. Re-enabling it is one tool spec + one registry line. Quick
+domains (email/tasks/research) deliberately stay inline (low voice latency,
+warm MCP sessions); only long-running deep research is backgrounded.
+
+The email subagent prompt defaults to evangeline's `hybrid_search` (RRF fusion
+of semantic + BM25) and passes `folder=null` / `date_after="1970-01-01"` to
+defeat the Inbox-only and 6-month-lookback defaults on the other search tools.
 
 External services currently expected:
 
@@ -143,7 +160,7 @@ WebSocket message families:
 - Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
 - Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
-- Delegations: `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
+- Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
 
 ## Code Map
 
@@ -170,7 +187,7 @@ Conversation and tool loop:
 - `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
 - `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
 - `tools.py` - local tool schemas and dispatch entrypoint used by the agent loop
-- `subagent.py` - internal subagent for delegated domains (email, research, tasks)
+- `subagent.py` - internal scoped subagent for specialist domains (email, research, tasks); invoked inline via `consult_specialist` (`run_inline_subagent`)
 - `local_tool_specs.py` - local tool schemas
 - `local_tool_registry.py` - compatibility wrapper for older local-tool imports
 - `local_tool_downloads.py` - local download filename logic and download tool execution
