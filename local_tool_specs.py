@@ -234,26 +234,25 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "delegate_task",
+            "name": "consult_specialist",
             "description": (
-                "Start a backgrounded specialist task. Use for: "
-                "email (searching, reading, summarizing emails), "
+                "Consult a scoped specialist assistant and get its answer back "
+                "immediately, in this same turn. Use for: "
+                "email (searching, reading, summarizing Dave's email), "
                 "research (finding papers, authors, citations via OpenAlex), "
                 "or tasks (searching, creating, updating Vikunja tasks). "
-                "This tool returns IMMEDIATELY with a handle — the specialist "
-                "runs in the background on a separate machine and the result "
-                "will be spoken to Dave when it finishes. "
-                "After calling this, briefly acknowledge to Dave (e.g. 'on it', "
-                "'checking now') and END YOUR TURN — do not stall or loop. "
-                "Include all relevant context in the task description; the "
-                "specialist only sees what you pass, not the conversation."
+                "This runs synchronously: it returns the specialist's findings as "
+                "the tool result, and you then weave them into your spoken reply "
+                "to Dave. Do NOT acknowledge-and-stop; wait for the result and "
+                "answer. Include all relevant context in the task description — "
+                "the specialist only sees what you pass, not the conversation."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "domain": {
                         "type": "string",
-                        "enum": ["email", "research", "tasks"],
+                        "enum": ["email", "tasks", "research"],
                         "description": "The specialist domain.",
                     },
                     "task": {
@@ -265,95 +264,6 @@ TOOLS = [
                     },
                 },
                 "required": ["domain", "task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_delegation",
-            "description": (
-                "Cancel a previously-started delegation by its handle. Use when "
-                "Dave changes his mind mid-task (e.g. 'never mind', 'forget that', "
-                "'actually don't') while a delegation is still running. The handle "
-                "was returned by delegate_task. Safe to call even if the task has "
-                "already finished — returns cancelled=false in that case."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "handle": {
-                        "type": "string",
-                        "description": "The delegation handle returned by delegate_task.",
-                    },
-                },
-                "required": ["handle"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_pending_delegations",
-            "description": (
-                "List delegations that have been started in this session and have "
-                "not yet been pulled into the conversation. Use this when Dave "
-                "asks about the status of background work (e.g. 'what's pending?', "
-                "'are those emails ready?') or when you need to discover handles "
-                "for pull_delegation. Returns an array of {handle, domain, "
-                "status, preview, submitted_task}. status is 'running', 'ready', "
-                "or 'failed'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["running", "ready", "failed"],
-                        "description": "Optional. Filter to one status.",
-                    },
-                    "domain": {
-                        "type": "string",
-                        "enum": ["email", "research", "tasks"],
-                        "description": "Optional. Filter to one domain.",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "pull_delegation",
-            "description": (
-                "Bring a ready delegation result into the current conversation. "
-                "Use when Dave signals he's ready to hear results (e.g. 'let's go "
-                "over those emails now', 'show me the research', 'what did the "
-                "task search find?'). Returns the specialist's full reply; "
-                "summarize it conversationally in your response. Provide either "
-                "the handle (preferred when known) or the domain (picks the most "
-                "recent ready delegation in that domain). Only works for ready "
-                "delegations — running ones will be reported as still in progress."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "handle": {
-                        "type": "string",
-                        "description": (
-                            "Delegation handle. Get one from list_pending_delegations "
-                            "or remember it from when delegate_task returned."
-                        ),
-                    },
-                    "domain": {
-                        "type": "string",
-                        "enum": ["email", "research", "tasks"],
-                        "description": (
-                            "Fallback when no specific handle is known. Picks the "
-                            "most recent ready delegation in that domain."
-                        ),
-                    },
-                },
             },
         },
     },

@@ -164,8 +164,8 @@ DEFAULT_TOOL_LABELS = {
     "list_reader_documents": "Listing Reader Docs",
     "read_item_content": "Reading Item Content",
     "process_pdf": "Processing PDF",
-    "delegate_task": "Delegating...",
-    "cancel_delegation": "Cancelling...",
+    "consult_specialist": "Consulting Specialist",
+    "hybrid_search": "Email Search",
 }
 
 
@@ -193,7 +193,7 @@ DEFAULT_MCP_SERVERS = {
             " | SCOPE: general web lookups only (news, recipes, product info, "
             "how-to, definitions, current events). Do NOT use for academic "
             "papers, journal articles, citations, authors, or scholarly "
-            "research — those ALWAYS go to delegate_task(domain=\"research\")."
+            "research — those ALWAYS go to consult_specialist(domain=\"research\")."
         ),
     },
     "openalex": {
@@ -276,32 +276,26 @@ You have access to tools:
 - Web search via SearXNG for GENERAL web lookups ONLY — news, recipes,
   product info, how-to, definitions, current events. NEVER use web search
   for academic papers, journal articles, citations, authors, or scholarly
-  research; those ALWAYS go through delegate_task(domain="research").
-- delegate_task for email, research, and task management. This hands off to a
-  specialist assistant running in the background on a separate machine. Use it
-  when Dave asks about:
+  research; those ALWAYS go through consult_specialist(domain="research").
+- consult_specialist for email, research, and task management. This hands off
+  to a scoped specialist assistant and returns its answer to you in the SAME
+  turn. Use it when Dave asks about:
   * Email: "check my email", "find emails from X", "any emails about Y" →
-    delegate_task(domain="email", task="..."). Include dates, senders, or
+    consult_specialist(domain="email", task="..."). Include dates, senders, or
     topics Dave mentioned.
   * Research: "find papers about X", "who publishes on Y", "citations for Z",
     "journal articles on W", "recent publications about V" →
-    delegate_task(domain="research", task="..."). This is the ONLY correct
+    consult_specialist(domain="research", task="..."). This is the ONLY correct
     tool for academic/scholarly queries — do not fall back to web search.
     Include topic details.
   * Tasks: "add a task", "what's on my list", "mark X as done" →
-    delegate_task(domain="tasks", task="..."). Include project names if Dave
-    specified one. Key projects: {vikunja_projects}.
+    consult_specialist(domain="tasks", task="..."). Include project names if
+    Dave specified one. Key projects: {vikunja_projects}.
     Default to {vikunja_default} if Dave doesn't specify a project.
-  delegate_task is ASYNCHRONOUS. It returns a handle immediately; the result
-  will be spoken directly to Dave when the specialist finishes. After calling
-  delegate_task you MUST respond to Dave briefly (e.g. "On it.", "Checking
-  your email now.", "Looking that up.") and END YOUR TURN — do NOT call
-  delegate_task again for the same request, do NOT try to summarize the
-  handle, do NOT spin in further tool calls waiting for a result. Dave will
-  hear the answer when it arrives.
-  If Dave changes his mind before a delegation finishes ("never mind",
-  "forget that"), call cancel_delegation(handle=...) with the handle you got
-  from delegate_task.
+  consult_specialist is SYNCHRONOUS. It returns the specialist's findings as
+  the tool result; wait for them and then weave them into a natural, spoken
+  reply to Dave. Do NOT just acknowledge and stop — the answer comes back to
+  you in this turn, so deliver it. It can take a few seconds; that's expected.
   Write a clear, complete task description — the specialist only sees what you
   pass in the task field, not the full conversation.
 - PDF processing via process_pdf for converting PDFs to markdown. This runs in the

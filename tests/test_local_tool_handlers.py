@@ -1,8 +1,39 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
+import tools
 from local_tool_downloads import safe_filename
+
+
+class ConsultSpecialistTests(unittest.TestCase):
+    def test_returns_inline_subagent_result(self):
+        class FakeSession:
+            async def run_inline_subagent(self, domain, task):
+                return f"result for {domain}: {task}"
+
+        result = asyncio.run(
+            tools._consult_specialist(
+                {"domain": "email", "task": "find tax emails"},
+                session=FakeSession(),
+            )
+        )
+        self.assertEqual(result, "result for email: find tax emails")
+
+    def test_requires_domain_and_task(self):
+        result = asyncio.run(
+            tools._consult_specialist({"domain": "email"}, session=object())
+        )
+        self.assertEqual(result, "Error: domain and task are required.")
+
+    def test_requires_session(self):
+        result = asyncio.run(
+            tools._consult_specialist(
+                {"domain": "email", "task": "x"}, session=None
+            )
+        )
+        self.assertEqual(result, "Error: specialist session unavailable.")
 
 
 class LocalToolHandlerTests(unittest.TestCase):

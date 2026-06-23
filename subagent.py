@@ -1,9 +1,10 @@
 """Internal subagent for delegated tool-heavy tasks.
 
 The main Octavius agent keeps a lean set of core tools. When the user asks
-about email, research, or tasks, the main agent calls delegate_task which
+about email, research, or tasks, the main agent calls consult_specialist which
 runs a scoped subagent here — a separate non-streaming LLM loop with only
-the tools for that domain.
+the tools for that domain. The subagent runs inline (synchronously) and its
+result is returned into the same turn.
 """
 
 from __future__ import annotations
@@ -149,15 +150,20 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "your output will be spoken aloud by a voice assistant.\n"
             "Do NOT use markdown formatting, bullet points, or numbered lists. "
             "Summarize findings conversationally. Don't read out full email addresses or URLs.\n"
-            "Email guidelines:\n"
-            "- Dave's Inbox is his 'not yet dealt with' pile. Anything still in INBOX "
-            "is by definition unresolved, regardless of read status.\n"
-            "- Default to folder=\"INBOX\" on search_emails, semantic_search, "
-            "list_conversations, and extract_from_emails. Do NOT pass a seen/unread filter — "
-            "presence in INBOX is what matters, not read state.\n"
-            "- Only widen beyond INBOX when Dave explicitly asks about another folder "
-            "(e.g. 'check sent mail', 'search archived messages', 'across all folders'). "
-            "Searching all folders by default returns dealt-with mail and is noisy."
+            "Search guidelines:\n"
+            "- Default to hybrid_search for finding emails by topic or content. It "
+            "fuses semantic meaning with exact keywords and searches ALL folders "
+            "with no date cutoff — the right default for 'find the email about X'.\n"
+            "- Watch the default-value traps on search_emails and semantic_search: "
+            "they silently default to the Inbox (nearly empty) and apply a ~6-month "
+            "lookback. For a general search, pass folder=null to search all folders "
+            "and date_after=\"1970-01-01\" to disable the lookback.\n"
+            "- search_emails has no body search; use hybrid_search to match on body text.\n"
+            "- Only narrow with a folder or date filter when Dave gives a real lead — "
+            "a specific folder ('check sent mail', 'archived messages') or a timeframe.\n"
+            "- When Dave asks what's in his inbox or what still needs attention, scope "
+            "to folder=\"INBOX\": anything still there is unresolved regardless of read "
+            "state, so do NOT pass a seen/unread filter."
         ),
         "max_rounds": 5,
     },

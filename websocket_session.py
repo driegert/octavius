@@ -781,6 +781,37 @@ class WebSocketSessionHandler:
                 log.exception("TTS failed for proactive chunk")
         await self.send_json("status", "audio_done")
 
+    async def run_inline_subagent(self, domain: str, task: str) -> str:
+        """Run a scoped subagent synchronously and return its result text.
+
+        Used by the consult_specialist local tool. The main agent's turn blocks
+        on this and then weaves the returned text into its spoken reply in the
+        SAME turn (no badge, no pull). A dispatcher ticket is reserved so inline
+        consults still respect endpoint capacity, and the subagent's per-step
+        progress is forwarded to the UI status line so Dave isn't left in
+        silence while it works.
+        """
+        ticket = await self.state.subagent_dispatcher.reserve()
+        try:
+            assigned_url = await ticket.acquire()
+            fallback_url = self.state.subagent_dispatcher.fallback_url()
+
+            async def status_cb(text: str):
+                # run_subagent already maps tool names through tool_labels and
+                # formats the text (e.g. "Email Search..."); forward as-is.
+                await self.send_json("status", text)
+
+            return await run_subagent(
+                task,
+                domain,
+                self.state.mcp_manager,
+                assigned_url=assigned_url,
+                fallback_url=fallback_url,
+                status_callback=status_cb,
+            )
+        finally:
+            await ticket.release()
+
     async def spawn_delegation(self, domain: str, task: str) -> dict:
         """Reserve an endpoint, create a background asyncio.Task running the
         subagent, and register it. Returns a summary dict for the tool response.

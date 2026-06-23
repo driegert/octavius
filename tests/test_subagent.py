@@ -17,6 +17,16 @@ class _FakeMCP:
         return self._call_results.get(name, f"Result for {name}")
 
 
+class EmailPromptTests(unittest.TestCase):
+    def test_email_prompt_prefers_hybrid_search(self):
+        prompt = subagent.SUBAGENT_DOMAINS["email"]["system_prompt"]
+        self.assertIn("hybrid_search", prompt)
+
+    def test_email_prompt_drops_inbox_default(self):
+        prompt = subagent.SUBAGENT_DOMAINS["email"]["system_prompt"]
+        self.assertNotIn('Default to folder="INBOX"', prompt)
+
+
 class SubagentTests(unittest.IsolatedAsyncioTestCase):
     async def test_urls_passed_to_complete_with_tools(self):
         message = {"content": "done", "tool_calls": None}

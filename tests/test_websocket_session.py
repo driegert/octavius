@@ -46,11 +46,18 @@ class _FakeHistory:
 
 
 class _FakeDispatcher:
+    def __init__(self):
+        self.last_ticket = None
+
     def snapshot(self):
         return {}
 
     def fallback_url(self):
         return None
+
+    async def reserve(self):
+        self.last_ticket = _StubTicket()
+        return self.last_ticket
 
 
 class _FakeWS:
@@ -149,6 +156,52 @@ class WebSocketSessionTests(unittest.TestCase):
                 await handler.handle_item_chat_load({"item_id": 7})
 
             set_chat.assert_called_once_with(unittest.mock.ANY, 7, 100)
+
+        asyncio.run(run())
+
+    def test_run_inline_subagent_runs_releases_ticket_and_forwards_status(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+
+            captured = {}
+
+            async def fake_subagent(task, domain, mcp, assigned_url=None,
+                                    fallback_url=None, status_callback=None):
+                captured["task"] = task
+                captured["domain"] = domain
+                captured["assigned_url"] = assigned_url
+                await status_callback("Email Search...")
+                return "found 3 emails\n\n===TOOL DATA===\n..."
+
+            with patch("websocket_session.run_subagent", side_effect=fake_subagent):
+                result = await handler.run_inline_subagent("email", "find tax emails")
+
+            self.assertEqual(result, "found 3 emails\n\n===TOOL DATA===\n...")
+            self.assertEqual(captured["domain"], "email")
+            self.assertEqual(captured["task"], "find tax emails")
+            # The reserved ticket's URL is handed to run_subagent and released.
+            ticket = handler.state.subagent_dispatcher.last_ticket
+            self.assertEqual(captured["assigned_url"], ticket._url)
+            self.assertTrue(ticket.released)
+            # The subagent's progress is forwarded to the UI status line.
+            statuses = [p["text"] for p in _payloads(ws) if p.get("type") == "status"]
+            self.assertIn("Email Search...", statuses)
+
+        asyncio.run(run())
+
+    def test_run_inline_subagent_releases_ticket_on_error(self):
+        async def run():
+            handler = WebSocketSessionHandler(_FakeWS())
+
+            async def boom(*args, **kwargs):
+                raise RuntimeError("subagent failed")
+
+            with patch("websocket_session.run_subagent", side_effect=boom):
+                with self.assertRaises(RuntimeError):
+                    await handler.run_inline_subagent("email", "x")
+
+            self.assertTrue(handler.state.subagent_dispatcher.last_ticket.released)
 
         asyncio.run(run())
 

@@ -33,6 +33,24 @@ class ValidateLocalToolRegistryTests(unittest.TestCase):
         import tools
         self.assertEqual(tools.validate_local_tool_registry(), [])
 
+    def test_consult_specialist_exposed_and_async_tools_unexposed(self):
+        """email/tasks/research run inline via consult_specialist; the async
+        delegation tools are kept as dormant plumbing but must NOT be exposed
+        to the agent."""
+        import tools
+        handler_names = set(tools.get_local_tool_handlers().keys())
+        spec_names = {t["function"]["name"] for t in tools.TOOLS}
+        self.assertIn("consult_specialist", handler_names)
+        self.assertIn("consult_specialist", spec_names)
+        for absent in (
+            "delegate_task",
+            "cancel_delegation",
+            "list_pending_delegations",
+            "pull_delegation",
+        ):
+            self.assertNotIn(absent, handler_names)
+            self.assertNotIn(absent, spec_names)
+
     def test_spec_without_handler_reported(self):
         import tools
         fake_tools = tools.TOOLS + [

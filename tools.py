@@ -6,7 +6,6 @@ import inspect
 import json
 from typing import TYPE_CHECKING, Callable
 
-from local_tool_delegations import list_pending_delegations, pull_delegation
 from local_tool_downloads import download_file
 from local_tool_history import search_conversation_history
 from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
@@ -16,6 +15,16 @@ from local_tool_specs import TOOLS
 if TYPE_CHECKING:
     from history import ConversationSession
     from mcp_manager import MCPManager
+
+
+async def _consult_specialist(args: dict, history_session=None, mcp_manager=None, session=None) -> str:
+    domain = args.get("domain", "")
+    task = args.get("task", "")
+    if not domain or not task:
+        return "Error: domain and task are required."
+    if session is None:
+        return "Error: specialist session unavailable."
+    return await session.run_inline_subagent(domain, task)
 
 
 async def _delegate_task(args: dict, history_session=None, mcp_manager=None, session=None) -> str:
@@ -55,10 +64,12 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
         "search_conversation_history": search_conversation_history,
-        "delegate_task": _delegate_task,
-        "cancel_delegation": _cancel_delegation,
-        "list_pending_delegations": list_pending_delegations,
-        "pull_delegation": pull_delegation,
+        "consult_specialist": _consult_specialist,
+        # The async delegation tools (delegate_task / cancel_delegation /
+        # list_pending_delegations / pull_delegation) are intentionally NOT
+        # exposed: email/tasks/research now run inline via consult_specialist.
+        # The handler functions and the websocket_session plumbing stay defined
+        # so the async path can be re-wired for a future deep_research domain.
     }
 
 
