@@ -391,6 +391,39 @@ class SpawnTurnTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_stt_start_cancels_inflight_turn(self):
+        """Barge-in: opening a new capture cancels a reply still in flight so
+        the client's interruption actually stops the server too."""
+        async def run():
+            handler, _ws = self._make_handler()
+            release = asyncio.Event()
+
+            async def slow_stream(*args, **kwargs):
+                await release.wait()
+                yield "Done."
+
+            with patch("agent.stream_agent_turn", side_effect=slow_stream), \
+                    patch("vad.SileroVAD", return_value=SimpleNamespace(reset=lambda: None)):
+                handler._spawn_turn("first", source="text")
+                turn = handler.state.turn_task
+                self.assertFalse(turn.done())
+                await handler.handle_stt_start({})
+                self.assertTrue(turn.done())
+                self.assertTrue(turn.cancelled())
+            release.set()
+
+        asyncio.run(run())
+
+    def test_stt_start_without_inflight_turn_is_fine(self):
+        """The cancel path is a no-op when no turn is running (normal flow)."""
+        async def run():
+            handler, _ws = self._make_handler()
+            with patch("vad.SileroVAD", return_value=SimpleNamespace(reset=lambda: None)):
+                await handler.handle_stt_start({})
+                self.assertTrue(handler.state.stt_stream.active)
+
+        asyncio.run(run())
+
     def test_guarded_turn_swallows_disconnect(self):
         async def run():
             handler, _ws = self._make_handler()

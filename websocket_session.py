@@ -516,6 +516,21 @@ class WebSocketSessionHandler:
     async def handle_stt_start(self, _data: dict):
         from vad import SileroVAD
 
+        # Starting a new capture means the user is speaking now — cancel any
+        # response still in flight so a "barge-in" actually interrupts it (the
+        # client clears its own audio queue in parallel). In the normal flow the
+        # turn is already finished by the time the mic reopens, so this is a
+        # no-op; it only bites when the user talks over a still-streaming reply.
+        turn = self.state.turn_task
+        if turn and not turn.done():
+            turn.cancel()
+            try:
+                await turn
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug("In-flight turn ended during barge-in", exc_info=True)
+
         self.state.stt_stream.reset()
         self.state.stt_stream.active = True
         if self.state.vad is None:

@@ -411,6 +411,13 @@ transcription sends **no `audio_done`** (just a "Couldn't hear anything" status)
 wake-word conversation loop and silence watchdog are built around exactly this. If you change
 it, the PWA *and* the Android client change together.
 
+**Barge-in:** `handle_stt_start` now cancels any in-flight `turn_task` — starting a new
+capture means the user is talking, so the current reply (LLM stream + TTS) is stopped. This
+is a no-op in normal flows (the turn is already done by the time the mic reopens) and lets a
+client interrupt a long reply by opening capture mid-stream. The Android client uses this for
+its "interrupt while speaking" feature (energy-gated detector during playback). A future PWA
+Stop button could send `stt_start`/cancel the same way.
+
 ## Claude Code Access
 
 Claude Code MCP access is configured in `~/.claude.json`.
