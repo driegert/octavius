@@ -396,6 +396,21 @@ For current refactor notes, recent fixes, and change-oriented status, see `docs/
 - `octavius-prd.md` - broader product/design document
 - `octavius-android-design.md` - Android companion app design exploration
 
+## Native Android client
+
+A working native client lives in the sibling repo `../octavius-android` (Kotlin/Compose
+foreground-service app; its own `CLAUDE.md`). It is an **independent client of the same
+`/ws`** as the browser PWA — each WS connection gets its own `Conversation`, so both run
+side by side with no server change. It speaks the exact `static/index-app.js` protocol
+(Float32 LE PCM @16k up; `transcript`/`response`/`status`(incl. `audio_done`)/`stt_auto_stop`
++ WAV down).
+
+**Before changing the WS protocol or STT/VAD/audio_done behavior, know the app depends on:**
+the server VAD only auto-stops *after* speech (pure silence never auto-stops), and an empty
+transcription sends **no `audio_done`** (just a "Couldn't hear anything" status). The app's
+wake-word conversation loop and silence watchdog are built around exactly this. If you change
+it, the PWA *and* the Android client change together.
+
 ## Claude Code Access
 
 Claude Code MCP access is configured in `~/.claude.json`.
