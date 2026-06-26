@@ -14,6 +14,7 @@
   const speedSlider = document.getElementById('speed-slider');
   const speedValue = document.getElementById('speed-value');
   const trimCb = document.getElementById('trim-cb');
+  const normalizeCb = document.getElementById('normalize-cb');
   const sttToggle = document.getElementById('stt-toggle');
   const ttsToggle = document.getElementById('tts-toggle');
   const textInputArea = document.getElementById('text-input-area');
@@ -79,6 +80,9 @@
     },
     shouldTrimSilence() {
       return trimCb.checked;
+    },
+    shouldNormalizeVolume() {
+      return normalizeCb.checked;
     },
     onPlaybackStart() {
       stopBtn.classList.add('visible');
@@ -163,13 +167,13 @@
   function getVoicePrefs(voice) {
     const prefs = loadPrefs();
     const voicePrefs = (prefs.voices || {})[voice];
-    return voicePrefs || { speed: 1.4, trim: true };
+    return voicePrefs || { speed: 1.4, trim: true, normalize: true };
   }
 
-  function saveVoicePrefs(voice, speed, trim) {
+  function saveVoicePrefs(voice, speed, trim, normalize) {
     const prefs = loadPrefs();
     if (!prefs.voices) prefs.voices = {};
-    prefs.voices[voice] = { speed, trim };
+    prefs.voices[voice] = { speed, trim, normalize };
     prefs.voice = voice;
     savePrefs(prefs);
   }
@@ -179,11 +183,12 @@
     speedSlider.value = voicePrefs.speed;
     speedValue.textContent = parseFloat(voicePrefs.speed).toFixed(1) + 'x';
     trimCb.checked = voicePrefs.trim;
+    normalizeCb.checked = voicePrefs.normalize !== false;
     audioPlayer.updatePlaybackRate();
   }
 
   function persistCurrent() {
-    saveVoicePrefs(currentVoice, parseFloat(speedSlider.value), trimCb.checked);
+    saveVoicePrefs(currentVoice, parseFloat(speedSlider.value), trimCb.checked, normalizeCb.checked);
   }
 
   function setStatus(text, active) {
@@ -786,6 +791,7 @@
   });
 
   trimCb.addEventListener('change', persistCurrent);
+  normalizeCb.addEventListener('change', persistCurrent);
 
   proactiveSpeakCb.addEventListener('change', () => {
     proactiveSpeak = proactiveSpeakCb.checked;

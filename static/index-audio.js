@@ -3,6 +3,7 @@
     const {
       getPlaybackRate,
       shouldTrimSilence,
+      shouldNormalizeVolume,
       onPlaybackStart,
       onPlaybackIdle,
     } = options || {};
@@ -93,6 +94,53 @@
       return newBuffer;
     }
 
+    function normalizeLoudness(audioBuffer) {
+      const data = audioBuffer.getChannelData(0);
+      const len = data.length;
+      const sampleRate = audioBuffer.sampleRate;
+      const windowSize = Math.floor(sampleRate * 0.025);
+      const speechThreshold = 0.008;
+      const TARGET_RMS = 0.08;
+      const MIN_GAIN = 0.5;
+      const MAX_GAIN = 4.0;
+      const PEAK_CEILING = 0.95;
+
+      // Measure RMS over speech-bearing windows only, so leading/trailing
+      // silence doesn't skew the loudness estimate.
+      let sum = 0;
+      let count = 0;
+      for (let i = 0; i < len; i += windowSize) {
+        const end = Math.min(i + windowSize, len);
+        let wsum = 0;
+        for (let j = i; j < end; j++) wsum += data[j] * data[j];
+        if (Math.sqrt(wsum / (end - i)) >= speechThreshold) {
+          sum += wsum;
+          count += end - i;
+        }
+      }
+      if (count === 0) return audioBuffer;
+
+      const rms = Math.sqrt(sum / count);
+      let gain = Math.max(MIN_GAIN, Math.min(MAX_GAIN, TARGET_RMS / rms));
+
+      let peak = 0;
+      for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+        const d = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < d.length; i++) {
+          const a = Math.abs(d[i]);
+          if (a > peak) peak = a;
+        }
+      }
+      if (peak * gain > PEAK_CEILING) gain = PEAK_CEILING / peak;
+      if (Math.abs(gain - 1) < 0.05) return audioBuffer;
+
+      for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+        const d = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < d.length; i++) d[i] *= gain;
+      }
+      return audioBuffer;
+    }
+
     function audioBufferToWav(buffer) {
       const numChannels = buffer.numberOfChannels;
       const sampleRate = buffer.sampleRate;
@@ -156,11 +204,15 @@
       isPlaying = true;
       let arrayBuffer = audioQueue.shift();
 
-      if (shouldTrimSilence && shouldTrimSilence()) {
+      const trimEnabled = shouldTrimSilence && shouldTrimSilence();
+      const normalizeEnabled = shouldNormalizeVolume && shouldNormalizeVolume();
+      if (trimEnabled || normalizeEnabled) {
         try {
           const ctx = getAudioCtx();
           if (ctx.state === 'suspended') await ctx.resume();
-          const buffer = trimSilence(await ctx.decodeAudioData(arrayBuffer));
+          let buffer = await ctx.decodeAudioData(arrayBuffer);
+          if (trimEnabled) buffer = trimSilence(buffer);
+          if (normalizeEnabled) buffer = normalizeLoudness(buffer);
           arrayBuffer = audioBufferToWav(buffer);
         } catch (_err) {
         }
