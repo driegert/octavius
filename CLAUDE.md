@@ -420,11 +420,15 @@ Stop button could send `stt_start`/cancel the same way.
 
 ## Claude Code Access
 
-Claude Code MCP access is configured in `~/.claude.json`.
+Claude Code MCP access for this repo is configured in `.mcp.json` (committed; you
+approve the server on first launch in this repo).
 
-Expected entries:
+Configured server:
 
-- `vikunja-tasks`: `http://triplestuffed:8252/mcp`
-- `conversation-history`: `http://127.0.0.1:8203/mcp`
+- `conversation-history`: `http://127.0.0.1:8203/mcp` — the conversation-history
+  MCP server (`mcp-tools/server_history.py`), running as the
+  `conversation-history.service` user unit on triplestuffed.
 
 The conversation-history server includes inbox-related tools such as `save_to_inbox`, `search_inbox`, `list_inbox`, `get_inbox_item`, and `update_inbox_item`.
+
+`vikunja-tasks` is intentionally **not** exposed to Claude Code.
