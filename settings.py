@@ -351,9 +351,8 @@ def load_settings() -> Settings:
     subagent_llm_chain = _env_json(
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general", "role": "primary"},
-            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "secondary"},
-            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "fallback"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general", "role": "fallback"},
         ],
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
