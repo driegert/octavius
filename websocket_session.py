@@ -206,6 +206,7 @@ class WebSocketSessionHandler:
         handlers = {
             "ping": self.handle_ping,
             "restore_session": self.handle_restore_session,
+            "attach_session": self.handle_attach_session,
             "reset": self.handle_reset,
             "load_conversation": self.handle_load_conversation,
             "settings": self.handle_settings,
@@ -245,6 +246,38 @@ class WebSocketSessionHandler:
                     "conversation_id": self.state.history_session.conv_id,
                 }
             )
+
+    async def handle_attach_session(self, data: dict):
+        """Bind this connection to a durable conversation by client key.
+
+        The client (e.g. the Matrix sidecar) supplies a stable `key` per logical
+        thread. We retire the empty connect-time record, resume-or-create the
+        keyed conversation, and reload its history so the agent continues with
+        full context across idle drops and restarts.
+        """
+        from history import get_conversation_messages
+        key = data.get("key")
+        if not key:
+            return
+        await self.state.history_session.end_async()  # retire the empty connect-time record
+        self.state.history_session = self.state.history.resume_or_start_conversation(
+            key,
+            source="matrix",
+            model=settings.llm_chain[0]["model"],
+        )
+        conv_id = self.state.history_session.conv_id
+        msgs = get_conversation_messages(self.state.history_session.conn, conv_id)
+        if msgs:
+            self.state.conversation.load_from_history(msgs)
+            log.info("Attached conversation %d for key %s (%d messages)", conv_id, key[:16], len(msgs))
+        else:
+            log.info("Attached new conversation %d for key %s", conv_id, key[:16])
+        await self.send_payload(
+            {
+                "type": "session_id",
+                "conversation_id": conv_id,
+            }
+        )
 
     async def handle_reset(self, _data: dict):
         await self.state.history_session.end_async()

@@ -89,9 +89,10 @@ class HistoryRecorder:
 
     def start_conversation(self, service: str = "octavius",
                            source: str = "voice",
-                           model: str | None = None) -> "ConversationSession":
+                           model: str | None = None,
+                           session_id: str | None = None) -> "ConversationSession":
         conn = self.connect()
-        session_id = uuid.uuid4().hex
+        session_id = session_id or uuid.uuid4().hex
         now = _now()
         cursor = conn.execute(
             "INSERT INTO conversations (session_id, started_at, service, source, model) "
@@ -102,6 +103,33 @@ class HistoryRecorder:
         conv_id = cursor.lastrowid
         log.info("Started %s conversation %s (session %s)", service, conv_id, session_id[:8])
         return ConversationSession(conn, conv_id, session_id, self.db_path)
+
+    def resume_or_start_conversation(self, key: str,
+                                     service: str = "octavius",
+                                     source: str = "matrix",
+                                     model: str | None = None) -> "ConversationSession":
+        """Resume a conversation identified by a client-supplied stable key, or
+        start a fresh one keyed on it.
+
+        The key is stored in the UNIQUE conversations.session_id column, giving a
+        permanent 1:1 between an external thread and one conversation record. A
+        reconnect re-attaches to the *same* record and appends, so context
+        survives idle drops, restarts, and long gaps with no fragmentation.
+        """
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE session_id = ?", (key,)
+        ).fetchone()
+        if row is None:
+            conn.close()
+            return self.start_conversation(service, source, model, session_id=key)
+        conv_id = row[0]
+        conn.execute(
+            "UPDATE conversations SET ended_at = NULL WHERE id = ?", (conv_id,)
+        )
+        conn.commit()
+        log.info("Resumed %s conversation %s (session %s)", service, conv_id, key[:16])
+        return ConversationSession(conn, conv_id, key, self.db_path)
 
 
 class ConversationSession:
