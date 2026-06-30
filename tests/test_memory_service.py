@@ -71,14 +71,19 @@ class MemoryServiceTests(unittest.TestCase):
         profile = self.client.get("/profile").json()["profile"]
         self.assertIn("ripgrep", profile)
 
-    def test_retrieve_facts_endpoint(self):
+    def test_facts_endpoint_dedups_against_profile(self):
+        # /facts is per-turn retrieval: facts BEYOND the always-on profile. A lone
+        # high-confidence identity fact lives in the profile, so /facts excludes it
+        # (while /profile and /facts/all still surface it).
         self.client.post("/conversations", json={
             "service": "octavius", "conv_key": "t1",
             "transcript": [{"role": "user", "content": "I use ripgrep"}],
             "summary": "s", "index": True})
         r = self.client.get("/facts", params={"q": "ripgrep"})
         self.assertEqual(r.status_code, 200)
-        self.assertTrue(any("ripgrep" in f for f in r.json()["facts"]))
+        self.assertFalse(any("ripgrep" in f for f in r.json()["facts"]))   # in profile, deduped
+        self.assertIn("ripgrep", self.client.get("/profile").json()["profile"])
+        self.assertTrue(any("ripgrep" in f for f in self.client.get("/facts/all").json()["facts"]))
 
     def test_reinforce_across_distinct_conversations(self):
         for key in ("t1", "t2"):

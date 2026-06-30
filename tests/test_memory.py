@@ -35,6 +35,40 @@ def facts_complete(facts_json: str):
     return lambda system, user: facts_json
 
 
+def _wire_memory_client(svc_db_path):
+    """Point the module-level memory_client at an in-process memory service over an
+    httpx ASGITransport (no network). Returns a restore() to undo the wiring."""
+    import httpx
+    import memory_client as mc_mod
+    from memory_service.app import create_app
+
+    client = mc_mod.memory_client
+    saved = (client.base_url, client._transport)
+    client.base_url = "http://memory"
+    client._transport = httpx.ASGITransport(app=create_app(db_path=svc_db_path))
+
+    def restore():
+        client.base_url, client._transport = saved
+
+    return restore
+
+
+def _seed_service_facts(svc_db_path, facts):
+    """Reconcile facts straight into the service DB (provenance = one seed conv)."""
+    import memory_service.db as msdb
+    from memory import reconcile
+
+    conn = msdb.connect(svc_db_path)
+    try:
+        cid = conn.execute(
+            "INSERT INTO conversations (service, conv_key, started_at) "
+            "VALUES ('octavius', 'seed', ?)", (store.now_iso(),)).lastrowid
+        reconcile.reconcile_facts(conn, facts, cid, embed_fn=fake_embed)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class MemoryTestBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -266,63 +300,81 @@ class ToolsTests(MemoryTestBase):
         self.assertNotIn("Kingston", objs)
 
 
-class ReadPathBlockTests(MemoryTestBase):
-    """agent._build_memory_block: profile + per-turn facts + first-turn recall."""
+class ReadPathBlockTests(unittest.IsolatedAsyncioTestCase):
+    """agent._build_memory_block: profile + per-turn facts come from the HTTP memory
+    service; first-turn episodic recall stays local."""
 
     def setUp(self):
-        super().setUp()
         from unittest.mock import patch
-        self._p = patch.object(memory, "default_embed_fn", new=fake_embed)
-        self._p.start()
-        self.reconcile([
+        self._tmp = tempfile.TemporaryDirectory()
+        self.local_db = Path(self._tmp.name) / "local.db"   # Octavius's own corpus
+        self.svc_db = Path(self._tmp.name) / "svc.db"        # the memory service
+        history.init_db(self.local_db).close()
+        self._patches = [
+            patch.object(memory, "default_embed_fn", new=fake_embed),
+            patch.object(memory, "default_complete_fn", new=lambda s, u: "[]"),
+        ]
+        for p in self._patches:
+            p.start()
+        self._restore = _wire_memory_client(self.svc_db)
+        _seed_service_facts(self.svc_db, [
             ExtractedFact("Dave", "uses_tool", "uv", False, "asserted"),
             ExtractedFact("Dave", "researches", "multitaper method", False, "asserted"),
         ])
 
     def tearDown(self):
-        self._p.stop()
-        super().tearDown()
+        self._restore()
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
 
-    def test_block_has_profile_and_relevant_fact(self):
+    async def test_block_has_profile_and_relevant_fact(self):
         import agent
-        block = agent._build_memory_block(self.db_path, "what do I use uv for",
-                                          first_turn=False)
+        block = await agent._build_memory_block(
+            self.local_db, "what do I use uv for", first_turn=False)
         self.assertIn("long-term memory", block.lower())   # profile header
-        self.assertIn("uv", block)
+        self.assertIn("uv", block)                          # via the always-on profile
 
-    def test_first_turn_recall_surfaces_past_conversation(self):
+    async def test_first_turn_recall_surfaces_past_conversation(self):
         import agent
-        from unittest.mock import patch
         import history_store
-        # a prior, indexed conversation with a summary embedding (fake)
-        other = self.new_conv("past")
+        from db import connect
+        from unittest.mock import patch
+        # a prior, indexed conversation in the LOCAL corpus with a summary embedding
         summary = "Worked through the multitaper method derivation"
-        self.conn.execute("UPDATE conversations SET summary=? WHERE id=?", (summary, other))
-        self.conn.execute(
+        conn = connect(self.local_db)
+        other = conn.execute(
+            "INSERT INTO conversations (session_id, started_at, service, source, summary) "
+            "VALUES ('past', ?, 'octavius', 'matrix', ?)", (store.now_iso(), summary)).lastrowid
+        conn.execute(
             "INSERT INTO summary_embeddings (conversation_id, embedding) VALUES (?, ?)",
             (other, fake_embed(summary)))
-        self.conn.commit()
+        conn.commit()
+        conn.close()
         with patch.object(history_store, "embed_text", new=fake_embed):
-            block = agent._build_memory_block(
-                self.db_path, "remind me about the multitaper method",
-                first_turn=True, current_conv_id=self.conv_id)
+            block = await agent._build_memory_block(
+                self.local_db, "remind me about the multitaper method",
+                first_turn=True, current_conv_id=999)
         self.assertIn("discussed related topics", block.lower())
         self.assertIn("multitaper method", block)
 
 
 class _FakeSession:
-    def __init__(self, db_path, conv_id):
+    def __init__(self, db_path, conv_id, session_id="s"):
         self.db_path = db_path
         self.conv_id = conv_id
+        self.session_id = session_id
 
 
 class MemoryToolTests(unittest.IsolatedAsyncioTestCase):
-    """The registered local tools (Step 6) via tools.call_tool dispatch."""
+    """The registered local tools (Step 6) via tools.call_tool dispatch — now
+    forwarded over HTTP to an in-process memory service."""
 
     def setUp(self):
         from unittest.mock import patch
         self._tmp = tempfile.TemporaryDirectory()
-        self.db_path = Path(self._tmp.name) / "tools.db"
+        self.db_path = Path(self._tmp.name) / "tools.db"     # local session db
+        self.svc_db = Path(self._tmp.name) / "svc.db"        # the memory service
         history.init_db(self.db_path).close()
         self.conv_id = 1  # any conv row
         from db import connect
@@ -339,8 +391,10 @@ class MemoryToolTests(unittest.IsolatedAsyncioTestCase):
         ]
         for p in self._patches:
             p.start()
+        self._restore = _wire_memory_client(self.svc_db)
 
     def tearDown(self):
+        self._restore()
         for p in self._patches:
             p.stop()
         self._tmp.cleanup()
@@ -369,16 +423,19 @@ class MemoryToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WritePathIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    """Drive the real history.end_async write-path wiring (Step 3) with fakes."""
+    """Drive the real history.end_async write-path (Step 3): it now PUSHES the
+    conversation to the memory service over HTTP; facts land in the service DB and
+    the watermark advances locally."""
 
     def setUp(self):
         from unittest.mock import AsyncMock, patch
         from history_enrichment import SummaryResult
 
         self._tmp = tempfile.TemporaryDirectory()
-        self.db_path = Path(self._tmp.name) / "wp.db"
-        history.init_db(self.db_path).close()
-        self.recorder = history.HistoryRecorder(self.db_path)
+        self.local_db = Path(self._tmp.name) / "wp.db"       # Octavius's own db
+        self.svc_db = Path(self._tmp.name) / "svc.db"        # the memory service
+        history.init_db(self.local_db).close()
+        self.recorder = history.HistoryRecorder(self.local_db)
 
         canned = ('[{"subject":"Dave","predicate":"uses_tool","object":"uv",'
                   '"object_is_entity":false,"trust_tier":"asserted"}]')
@@ -392,13 +449,16 @@ class WritePathIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ]
         for p in self._patches:
             p.start()
+        self._restore = _wire_memory_client(self.svc_db)
 
     def tearDown(self):
+        self._restore()
         for p in self._patches:
             p.stop()
         self._tmp.cleanup()
 
-    async def test_end_async_extracts_facts_and_excludes_tool(self):
+    async def test_end_async_pushes_facts_and_excludes_tool(self):
+        import memory_service.db as msdb
         from db import connect
         session = self.recorder.resume_or_start_conversation("thread-x")
         conv_id = session.conv_id
@@ -407,14 +467,20 @@ class WritePathIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session.add_message("assistant", "Noted — uv it is.")
         await session.end_async()
 
-        conn = connect(self.db_path)
+        # facts landed in the SERVICE db, mined from user/assistant turns only
+        sconn = msdb.connect(self.svc_db)
         try:
-            objs = {f["object"] for f in memory.read.live_facts(conn)}
-            self.assertIn("uv", objs)            # mined from user/assistant turns
-            self.assertNotIn("Berlin", objs)     # tool content never became a fact
-            self.assertGreater(memory.store.get_watermark(conn, conv_id), 0)
+            objs = {f["object"] for f in memory.read.live_facts(sconn)}
+            self.assertIn("uv", objs)
+            self.assertNotIn("Berlin", objs)     # tool content never crossed the wire
         finally:
-            conn.close()
+            sconn.close()
+        # watermark advanced in the LOCAL db (only after a confirmed push)
+        lconn = connect(self.local_db)
+        try:
+            self.assertGreater(memory.store.get_watermark(lconn, conv_id), 0)
+        finally:
+            lconn.close()
 
 
 if __name__ == "__main__":

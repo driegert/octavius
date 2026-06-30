@@ -25,67 +25,68 @@ RECALL_DISTANCE_CUTOFF = 0.6
 RECALL_LIMIT = 2
 
 
-def _build_memory_block(db_path, user_text, *, first_turn=False,
-                        current_conv_id=None) -> str:
+async def _build_memory_block(db_path, user_text, *, first_turn=False,
+                              current_conv_id=None) -> str:
     """Assemble the per-turn long-term-memory text folded into messages[0].
 
-    Always-on profile (Block 1 live facts + Block 2 themes) + durable facts
-    retrieved for THIS message (deduped vs the profile) + first-turn episodic
-    recall. Best-effort: any failure returns "" and the turn proceeds memory-less.
-    Opens its own short-lived connection (runs in a worker thread; single-thread
-    sqlite + sync embed must stay off the event loop).
+    Always-on profile + per-turn facts come from the memory SERVICE over loopback
+    (deduped server-side against the profile). First-turn episodic recall stays
+    LOCAL (Octavius's own summary corpus). Best-effort: any failure returns "" and
+    the turn proceeds memory-less.
     """
+    from memory_client import memory_client
+
+    parts: list[str] = []
     try:
-        import memory
+        profile, fact_lines = await memory_client.fetch_injection(user_text)
+    except Exception:
+        log.warning("Memory fetch failed; turn proceeds without memory", exc_info=True)
+        profile, fact_lines = "", []
+    if profile:
+        parts.append(profile)
+    if fact_lines:
+        lines = "\n".join(f"- {line}" for line in fact_lines)
+        parts.append("Possibly relevant facts for this message:\n" + lines)
+
+    # First message of a thread: surface related past conversations (episodic,
+    # non-authoritative). Local summary-embedding search; embeds, so run off-loop.
+    if first_turn and db_path is not None:
+        try:
+            recall = await asyncio.to_thread(
+                _episodic_recall, db_path, user_text, current_conv_id)
+        except Exception:
+            recall = ""
+        if recall:
+            parts.append(recall)
+
+    return "\n\n".join(parts)
+
+
+def _episodic_recall(db_path, user_text, current_conv_id) -> str:
+    """First-turn episodic recall over Octavius's LOCAL summary corpus. Opens its
+    own short-lived connection (runs in a worker thread; sync embed stays off-loop)."""
+    try:
         from db import connect as _connect
         from history_store import search_conversations
     except Exception:
-        log.warning("Memory module unavailable; turn proceeds without memory", exc_info=True)
         return ""
-
     conn = None
     try:
         conn = _connect(db_path)
-        parts: list[str] = []
-
-        profile = memory.render_profile(conn)
-        if profile:
-            parts.append(profile)
-
-        # Durable facts relevant to this turn, deduped against the always-on
-        # profile so high-confidence identity facts aren't repeated.
-        profile_ids = {
-            f["id"] for f in memory.live_facts(
-                conn, confidence_floor=memory.config.PROFILE_CONFIDENCE_FLOOR)
-        }
-        facts = memory.retrieve_facts(
-            conn, user_text, embed_fn=memory.default_embed_fn, exclude_ids=profile_ids)
-        if facts:
-            lines = "\n".join(f"- {memory.read.format_fact_line(f)}" for f in facts)
-            parts.append("Possibly relevant facts for this message:\n" + lines)
-
-        # First message of a thread: surface related past conversations (episodic,
-        # non-authoritative — may be irrelevant). Reuses summary-embedding search.
-        if first_turn:
-            try:
-                convs = search_conversations(conn, user_text, service=None,
-                                             limit=RECALL_LIMIT + 3)
-            except Exception:
-                convs = []
-            related = [
-                c for c in convs
-                if c.get("conversation_id") != current_conv_id and c.get("summary")
-                and (c.get("distance") is None or c["distance"] < RECALL_DISTANCE_CUTOFF)
-            ][:RECALL_LIMIT]
-            if related:
-                lines = "\n".join(f"- {c['summary']}" for c in related)
-                parts.append(
-                    "You may have discussed related topics before "
+        convs = search_conversations(conn, user_text, service=None,
+                                     limit=RECALL_LIMIT + 3)
+        related = [
+            c for c in convs
+            if c.get("conversation_id") != current_conv_id and c.get("summary")
+            and (c.get("distance") is None or c["distance"] < RECALL_DISTANCE_CUTOFF)
+        ][:RECALL_LIMIT]
+        if related:
+            lines = "\n".join(f"- {c['summary']}" for c in related)
+            return ("You may have discussed related topics before "
                     "(context only, may be irrelevant):\n" + lines)
-
-        return "\n\n".join(parts)
+        return ""
     except Exception:
-        log.warning("Memory block build failed; turn proceeds without memory", exc_info=True)
+        log.warning("Episodic recall failed", exc_info=True)
         return ""
     finally:
         if conn is not None:
@@ -130,19 +131,18 @@ async def stream_agent_turn(
     # so it refreshes every turn and is immune to conversation.trim().
     memory_block = ""
     db_path = getattr(history_session, "db_path", None)
-    if db_path is not None:
-        ua_count = sum(
-            1 for m in conversation.get_messages() if m.get("role") in ("user", "assistant")
+    ua_count = sum(
+        1 for m in conversation.get_messages() if m.get("role") in ("user", "assistant")
+    )
+    try:
+        memory_block = await _build_memory_block(
+            db_path, user_text,
+            first_turn=(ua_count == 1),
+            current_conv_id=getattr(history_session, "conv_id", None),
         )
-        try:
-            memory_block = await asyncio.to_thread(
-                _build_memory_block, db_path, user_text,
-                first_turn=(ua_count == 1),
-                current_conv_id=getattr(history_session, "conv_id", None),
-            )
-        except Exception:
-            log.warning("Memory injection failed; turn proceeds without memory", exc_info=True)
-            memory_block = ""
+    except Exception:
+        log.warning("Memory injection failed; turn proceeds without memory", exc_info=True)
+        memory_block = ""
 
     for round_num in range(settings.max_tool_rounds):
         messages = conversation.get_messages()

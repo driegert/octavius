@@ -1,6 +1,5 @@
 """Octavius conversation history — SQLite + sqlite-vec storage."""
 
-import asyncio
 import json
 import logging
 import sqlite3
@@ -374,9 +373,9 @@ class ConversationSession:
         tags = generate_tags(self._messages_for_summary)
         self._store_tags(tags)
 
-        # Long-term memory: mine durable facts from this (salient) conversation.
+        # Long-term memory: push this (salient) conversation to the memory service.
         if result.index:
-            self._extract_memory(self.conv_id)
+            self._push_memory(self.conv_id)
 
         self.conn.close()
         self._closed = True
@@ -409,10 +408,9 @@ class ConversationSession:
         tags = await generate_tags_async(self._messages_for_summary)
         self._store_tags(tags)
 
-        # Long-term memory: mine durable facts from this (salient) conversation.
-        # Sync LLM/embedding + a single-thread sqlite conn, so run off the event loop.
+        # Long-term memory: push this (salient) conversation to the memory service.
         if result.index:
-            await asyncio.to_thread(self._extract_memory, self.conv_id)
+            await self._push_memory_async(self.conv_id)
 
         self.conn.close()
         self._closed = True
@@ -429,44 +427,93 @@ class ConversationSession:
         )
         self.conn.commit()
 
-    def _extract_memory(self, conv_id: int):
-        """Mine durable SPO facts from this conversation's user+assistant turns and
-        reconcile them into long-term memory. Off the critical path; failures are
-        swallowed (memory is best-effort, must never break a conversation close).
+    def _gather_unsent(self, conn, conv_id: int):
+        """Read the user+assistant turns past the local watermark, plus the
+        conversation's stable key and summary, for a push to the memory service.
 
-        Uses its OWN short-lived connection: this may run in a worker thread (sqlite
-        connections are single-thread), and it must not race the about-to-close
-        ``self.conn``. The watermark makes re-entered durable threads cheap + idempotent.
+        TRUST BOUNDARY: ``messages_after_watermark`` returns user+assistant turns
+        ONLY — tool/email content never crosses to the extractor. Returns
+        ``(transcript, max_id, watermark, conv_key, summary)``.
         """
+        import memory
+        watermark = memory.store.get_watermark(conn, conv_id)
+        msgs, max_id = memory.store.messages_after_watermark(conn, conv_id, watermark)
+        row = conn.execute(
+            "SELECT session_id, summary FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+        conv_key = row[0] if row else None
+        summary = row[1] if row else None
+        return msgs, max_id, watermark, conv_key, summary
+
+    async def _push_memory_async(self, conv_id: int):
+        """Push this conversation's new user+assistant turns to the memory service
+        and, only on a confirmed push, advance the local watermark. Best-effort:
+        a failure leaves the watermark put so the next close retries. Uses its OWN
+        short-lived connection (never races the about-to-close ``self.conn``)."""
         try:
-            import memory
+            import memory  # noqa: F401  (watermark helpers live here)
+            from memory_client import memory_client
         except Exception:
-            log.warning("Memory module unavailable; skipping extraction", exc_info=True)
+            log.warning("Memory client unavailable; skipping push", exc_info=True)
+            return
+        if not memory_client.enabled:
             return
         conn = None
         try:
             conn = _connect(self.db_path)
-            watermark = memory.store.get_watermark(conn, conv_id)
-            msgs, max_id = memory.store.messages_after_watermark(conn, conv_id, watermark)
-            if msgs:
-                res = memory.extract_and_reconcile(conn, msgs, conv_id)
-                memory.store.set_watermark(conn, conv_id, max_id)
-                conn.commit()
-                log.info(
-                    "Memory: conv %d facts +%d ~%d (mined msgs id>%d)",
-                    conv_id, res.added, res.reinforced, watermark,
-                )
-            # Salient close advances the synthesis cadence counter regardless of
-            # whether new facts were found, then rebuilds Block 2 if it crossed.
-            memory.bump_source_count(conn)
-            themes = memory.maybe_synthesize(conn, complete_fn=memory.default_complete_fn)
-            if themes is not None:
-                log.info("Memory: profile themes rebuilt (conv %d)", conv_id)
+            self._do_push(conn, conv_id, await self._maybe_push_async(conn, conv_id))
         except Exception:
-            log.warning("Memory extraction failed for conversation %d", conv_id, exc_info=True)
+            log.warning("Memory push failed for conversation %d", conv_id, exc_info=True)
         finally:
             if conn is not None:
                 conn.close()
+
+    async def _maybe_push_async(self, conn, conv_id):
+        from memory_client import memory_client
+        msgs, max_id, watermark, conv_key, summary = self._gather_unsent(conn, conv_id)
+        if conv_key is None:
+            return None
+        res = await memory_client.push_conversation(
+            conv_key, msgs, summary=summary, ended_at=_now(), index=True)
+        return (res, msgs, max_id, watermark, conv_id) if res is not None else None
+
+    def _push_memory(self, conv_id: int):
+        """Sync sibling of ``_push_memory_async`` for the legacy sync ``end()``."""
+        try:
+            import memory  # noqa: F401
+            from memory_client import memory_client
+        except Exception:
+            log.warning("Memory client unavailable; skipping push", exc_info=True)
+            return
+        if not memory_client.enabled:
+            return
+        conn = None
+        try:
+            conn = _connect(self.db_path)
+            msgs, max_id, watermark, conv_key, summary = self._gather_unsent(conn, conv_id)
+            if conv_key is None:
+                return
+            res = memory_client.push_conversation_sync(
+                conv_key, msgs, summary=summary, ended_at=_now(), index=True)
+            self._do_push(conn, conv_id,
+                          (res, msgs, max_id, watermark, conv_id) if res is not None else None)
+        except Exception:
+            log.warning("Memory push failed for conversation %d", conv_id, exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _do_push(self, conn, conv_id, pushed):
+        """Advance the watermark only when the service confirmed ingest of new turns."""
+        if pushed is None:
+            return
+        import memory
+        res, msgs, max_id, watermark, _ = pushed
+        if msgs:
+            memory.store.set_watermark(conn, conv_id, max_id)
+            conn.commit()
+            log.info("Memory: pushed conv %d (%d msgs id>%d) → +%s ~%s",
+                     conv_id, len(msgs), watermark, res.get("added"), res.get("reinforced"))
 
     def _store_tags(self, tags: list[str]):
         for tag_name in tags:

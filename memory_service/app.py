@@ -138,8 +138,15 @@ def create_app(db_path=None) -> FastAPI:
 
     @app.get("/facts")
     def get_facts(request: Request, q: str, k: int = memory.config.RETRIEVAL_K):
+        # Per-turn retrieval: facts relevant to THIS message, deduped against the
+        # always-on profile so high-confidence identity facts aren't repeated.
         with closing(_conn(request)) as conn:
-            facts = memory.retrieve_facts(conn, q, embed_fn=memory.default_embed_fn, k=k)
+            profile_ids = {
+                f["id"] for f in memory.live_facts(
+                    conn, confidence_floor=memory.config.PROFILE_CONFIDENCE_FLOOR)
+            }
+            facts = memory.retrieve_facts(conn, q, embed_fn=memory.default_embed_fn,
+                                          k=k, exclude_ids=profile_ids)
             return {"facts": [memory.read.format_fact_line(f) for f in facts], "raw": facts}
 
     @app.get("/facts/all")
