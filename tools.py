@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable
 from local_tool_downloads import download_file
 from local_tool_history import search_conversation_history
 from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
+from local_tool_memory import correct, forget, remember, what_do_you_know
 from local_tool_reader import list_reader_documents, process_pdf_background, read_document
 from local_tool_specs import TOOLS
 
@@ -64,6 +65,10 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
         "search_conversation_history": search_conversation_history,
+        "remember": remember,
+        "forget": forget,
+        "correct": correct,
+        "what_do_you_know": what_do_you_know,
         "consult_specialist": _consult_specialist,
         # The async delegation tools (delegate_task / cancel_delegation /
         # list_pending_delegations / pull_delegation) are intentionally NOT

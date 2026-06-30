@@ -1,5 +1,6 @@
 """Octavius conversation history — SQLite + sqlite-vec storage."""
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -47,9 +48,27 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = _connect(db_path)
     schema_sql = SCHEMA_PATH.read_text()
     conn.executescript(schema_sql)
+    _run_migrations(conn)
     conn.commit()
     log.info("History database ready at %s", db_path)
     return conn
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions that ``CREATE TABLE IF NOT EXISTS`` can't express.
+
+    ``ALTER TABLE ... ADD COLUMN`` errors if the column already exists, so it can't
+    live in schema.sql's executescript (which runs on every startup). Guard each
+    add with a PRAGMA table_info check instead.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    if "last_extracted_message_id" not in cols:
+        # Watermark for the memory write path: each extraction pass only mines
+        # messages.id > this value, so re-entered durable threads don't re-extract.
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN last_extracted_message_id INTEGER"
+        )
+        log.info("Migration: added conversations.last_extracted_message_id")
 
 
 # -- Core recording API --------------------------------------------------------
@@ -354,6 +373,11 @@ class ConversationSession:
         # Generate tags
         tags = generate_tags(self._messages_for_summary)
         self._store_tags(tags)
+
+        # Long-term memory: mine durable facts from this (salient) conversation.
+        if result.index:
+            self._extract_memory(self.conv_id)
+
         self.conn.close()
         self._closed = True
 
@@ -384,6 +408,12 @@ class ConversationSession:
 
         tags = await generate_tags_async(self._messages_for_summary)
         self._store_tags(tags)
+
+        # Long-term memory: mine durable facts from this (salient) conversation.
+        # Sync LLM/embedding + a single-thread sqlite conn, so run off the event loop.
+        if result.index:
+            await asyncio.to_thread(self._extract_memory, self.conv_id)
+
         self.conn.close()
         self._closed = True
 
@@ -398,6 +428,45 @@ class ConversationSession:
             (now, elapsed_ms, self.conv_id),
         )
         self.conn.commit()
+
+    def _extract_memory(self, conv_id: int):
+        """Mine durable SPO facts from this conversation's user+assistant turns and
+        reconcile them into long-term memory. Off the critical path; failures are
+        swallowed (memory is best-effort, must never break a conversation close).
+
+        Uses its OWN short-lived connection: this may run in a worker thread (sqlite
+        connections are single-thread), and it must not race the about-to-close
+        ``self.conn``. The watermark makes re-entered durable threads cheap + idempotent.
+        """
+        try:
+            import memory
+        except Exception:
+            log.warning("Memory module unavailable; skipping extraction", exc_info=True)
+            return
+        conn = None
+        try:
+            conn = _connect(self.db_path)
+            watermark = memory.store.get_watermark(conn, conv_id)
+            msgs, max_id = memory.store.messages_after_watermark(conn, conv_id, watermark)
+            if msgs:
+                res = memory.extract_and_reconcile(conn, msgs, conv_id)
+                memory.store.set_watermark(conn, conv_id, max_id)
+                conn.commit()
+                log.info(
+                    "Memory: conv %d facts +%d ~%d (mined msgs id>%d)",
+                    conv_id, res.added, res.reinforced, watermark,
+                )
+            # Salient close advances the synthesis cadence counter regardless of
+            # whether new facts were found, then rebuilds Block 2 if it crossed.
+            memory.bump_source_count(conn)
+            themes = memory.maybe_synthesize(conn, complete_fn=memory.default_complete_fn)
+            if themes is not None:
+                log.info("Memory: profile themes rebuilt (conv %d)", conv_id)
+        except Exception:
+            log.warning("Memory extraction failed for conversation %d", conv_id, exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _store_tags(self, tags: list[str]):
         for tag_name in tags:

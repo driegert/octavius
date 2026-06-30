@@ -148,3 +148,95 @@ CREATE TABLE IF NOT EXISTS reader_documents (
 
 CREATE INDEX IF NOT EXISTS idx_reader_documents_status
     ON reader_documents(status, created_at);
+
+-- ============================================================================
+-- Long-term memory (v1) — graph-lite SPO facts + maintained profile doc.
+-- See DESIGN-octavius-memory.md. All additive; the only non-idempotent change
+-- (ALTER conversations) is applied by init_db's migration guard, not here.
+-- ============================================================================
+
+-- Durable facts: a temporal/provenance-tagged Subject-Predicate-Object row.
+-- A row whose object is an entity (object_is_entity=1) IS a graph edge.
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject         TEXT    NOT NULL,              -- canonical entity string (alias-resolved at write)
+    predicate       TEXT    NOT NULL REFERENCES predicates(name),
+    object          TEXT    NOT NULL,              -- canonical entity string, or a literal
+    object_is_entity INTEGER NOT NULL DEFAULT 0,   -- 1 => object is an entity node (edge), 0 => literal
+    confidence      REAL    NOT NULL DEFAULT 0.7,  -- DERIVED: f(trust_tier, #distinct source convs, recency)
+    trust_tier      TEXT    NOT NULL DEFAULT 'derived',  -- 'asserted' | 'derived' | 'untrusted' (untrusted empty in v1)
+    valid_from      TEXT    NOT NULL,              -- transaction time: when learned (ISO 8601)
+    valid_until     TEXT,                          -- set on supersession/forget; NULL => currently live
+    superseded_by   INTEGER REFERENCES memory_facts(id),
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT
+);
+
+-- Live-fact lookups (profile render, per-turn retrieval) filter on valid_until IS NULL.
+CREATE INDEX IF NOT EXISTS idx_memory_facts_live
+    ON memory_facts(valid_until, trust_tier, confidence);
+CREATE INDEX IF NOT EXISTS idx_memory_facts_spo
+    ON memory_facts(subject, predicate);
+
+-- Predicate registry. cardinality drives reconciliation:
+--   'functional' => a new object for the same (subject,predicate) SUPERSEDES the old.
+--   'multi'      => co-true; a new object just INSERTS another row.
+CREATE TABLE IF NOT EXISTS predicates (
+    name        TEXT PRIMARY KEY,
+    cardinality TEXT NOT NULL,                     -- 'functional' | 'multi'
+    description TEXT
+);
+
+-- Starter predicate registry (idempotent seed; editable later, cardinality is the key knob).
+-- Conservative: only genuinely single-valued relations are 'functional'; co-true ones are 'multi'.
+INSERT OR IGNORE INTO predicates (name, cardinality, description) VALUES
+    ('lives_in',      'functional', 'Where the subject currently resides'),
+    ('has_role',      'multi',      'A role/title the subject holds (can hold several)'),
+    ('works_at',      'multi',      'An organization the subject works at'),
+    ('studies_at',    'multi',      'An institution the subject studies at'),
+    ('researches',    'multi',      'A research area/topic of the subject'),
+    ('teaches',       'multi',      'A subject/course the subject teaches'),
+    ('works_on',      'multi',      'A project/effort the subject is working on'),
+    ('uses_tool',     'multi',      'A tool/technology the subject uses'),
+    ('prefers',       'multi',      'A stated preference (co-true across topics)'),
+    ('avoids',        'multi',      'Something the subject avoids/dislikes'),
+    ('owns',          'multi',      'A machine/asset the subject owns'),
+    ('current_focus', 'functional', 'The subject''s single current primary focus'),
+    ('has_name',      'functional', 'The canonical name of the subject');
+
+-- Alias -> canonical entity string, resolved at write time.
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    alias     TEXT PRIMARY KEY,
+    canonical TEXT NOT NULL
+);
+
+-- Many-to-one provenance: which conversations asserted a fact. The count of
+-- distinct conversations is the reinforcement/trust signal (Model A: 1 thread = 1 conv).
+CREATE TABLE IF NOT EXISTS memory_fact_sources (
+    fact_id         INTEGER NOT NULL REFERENCES memory_facts(id),
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    asserted_at     TEXT    NOT NULL,
+    PRIMARY KEY (fact_id, conversation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_fact_sources_conv
+    ON memory_fact_sources(conversation_id);
+
+-- Embeddings (sqlite-vec) — fact-level: write-time near-dup merge + read-time retrieval.
+CREATE VIRTUAL TABLE IF NOT EXISTS fact_embeddings USING vec0(
+    fact_id   INTEGER PRIMARY KEY,
+    embedding float[1024]
+);
+
+-- Maintained profile doc (global synthesis). Single row (id=1):
+--   Block 1 (identity) is re-rendered deterministically from live facts at injection time;
+--   Block 2 (themes) is the LLM rollup, regenerated on the event counter.
+CREATE TABLE IF NOT EXISTS memory_profile (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    content      TEXT,                             -- Block 2 prose (themes/direction); Block 1 rendered live
+    generated_at TEXT,
+    source_count INTEGER NOT NULL DEFAULT 0        -- salient convs closed since last Block-2 synthesis
+);
+
+INSERT OR IGNORE INTO memory_profile (id, content, generated_at, source_count)
+    VALUES (1, NULL, NULL, 0);

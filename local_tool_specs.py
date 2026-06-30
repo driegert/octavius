@@ -267,4 +267,94 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Durably remember a fact Dave states about himself, his work, "
+                "preferences, projects, or the people/tools/places in his life. "
+                "Use when he says things like 'remember that...', 'note that I...', "
+                "or states a stable preference you should keep across conversations. "
+                "Do NOT use for one-off task details or transient state."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "statement": {
+                        "type": "string",
+                        "description": "The fact to remember, as a plain statement.",
+                    },
+                },
+                "required": ["statement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": (
+                "Forget a previously remembered fact. Use when Dave says 'forget "
+                "that...', 'that's no longer true', or asks you to drop something "
+                "from memory. Soft-deletes; it won't be re-learned automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "Description of the fact to forget.",
+                    },
+                },
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "correct",
+            "description": (
+                "Replace a remembered fact with an updated one. Use when Dave "
+                "corrects something you know ('actually I now use X, not Y', "
+                "'I moved to Z'). The old fact is retired and the new one stored."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old": {
+                        "type": "string",
+                        "description": "The outdated fact to replace.",
+                    },
+                    "new": {
+                        "type": "string",
+                        "description": "The corrected fact, as a plain statement.",
+                    },
+                },
+                "required": ["old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "what_do_you_know",
+            "description": (
+                "List the durable facts you've stored about Dave. Use when he asks "
+                "'what do you know about me?' or 'what do you remember about X?'. "
+                "Optionally scope to a topic with 'about'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "about": {
+                        "type": "string",
+                        "description": "Optional topic/entity to filter by.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
