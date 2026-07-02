@@ -12,6 +12,11 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw is not None else default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return float(raw) if raw is not None else default
+
+
 def _env_json(name: str, default):
     raw = os.getenv(name)
     return json.loads(raw) if raw else default
@@ -49,6 +54,7 @@ class Settings:
     stt_url: str
     llm_chain: list[dict]
     subagent_llm_chain: list[dict]
+    vision_llm_chain: list[dict]
     tts: TTSSettings
     reader: ReaderSettings
     agent_port: int
@@ -69,6 +75,15 @@ class Settings:
     memory_service_url: str
     memory_read_timeout: int
     memory_write_timeout: int
+    # docproc web queue (PDF -> markdown), talked to over loopback HTTP only —
+    # Octavius never imports the docproc package, keeping the repos decoupled.
+    docproc_url: str
+    docproc_poll_interval: float
+    docproc_poll_timeout: float
+    # Char budget for inlining converted markdown directly into an agent turn
+    # vs. handing the model a path + head excerpt instead.
+    docproc_inline_char_budget: int
+    docproc_excerpt_chars: int
 
 
 DEFAULT_VOXTRAL_VOICES = [
@@ -358,6 +373,16 @@ def load_settings() -> Settings:
             {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general", "role": "fallback"},
         ],
     )
+    # Vision-capable chain for turns carrying image content (image_input WS
+    # frames from the Matrix sidecar). Separate from llm_chain because most
+    # of the default chain's endpoints don't have image input enabled — only
+    # lilripper:8010 (qwen3.6-35b-a3b-general) currently does.
+    vision_llm_chain = _env_json(
+        "OCTAVIUS_VISION_LLM_CHAIN",
+        [
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general"},
+        ],
+    )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
     kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
     voxtral_enabled = _env_str("OCTAVIUS_TTS_VOXTRAL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -383,6 +408,7 @@ def load_settings() -> Settings:
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
         llm_chain=llm_chain,
         subagent_llm_chain=subagent_llm_chain,
+        vision_llm_chain=vision_llm_chain,
         tts=tts,
         reader=reader,
         agent_port=_env_int("OCTAVIUS_AGENT_PORT", 8030),
@@ -420,6 +446,11 @@ def load_settings() -> Settings:
         memory_read_timeout=_env_int("OCTAVIUS_MEMORY_READ_TIMEOUT", 10),
         # Writes run the extractor LLM + synthesis on the service synchronously.
         memory_write_timeout=_env_int("OCTAVIUS_MEMORY_WRITE_TIMEOUT", 120),
+        docproc_url=_env_str("OCTAVIUS_DOCPROC_URL", "http://127.0.0.1:8210"),
+        docproc_poll_interval=_env_float("OCTAVIUS_DOCPROC_POLL_INTERVAL", 3.0),
+        docproc_poll_timeout=_env_float("OCTAVIUS_DOCPROC_POLL_TIMEOUT", 300.0),
+        docproc_inline_char_budget=_env_int("OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET", 20000),
+        docproc_excerpt_chars=_env_int("OCTAVIUS_DOCPROC_EXCERPT_CHARS", 3000),
     )
 
 

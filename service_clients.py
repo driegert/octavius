@@ -633,5 +633,9 @@ tts_client = TTSClient(
 )
 llm_client = LLMChainClient(settings.llm_chain)
 subagent_llm_client = LLMChainClient(settings.subagent_llm_chain)
+# Vision-capable chain for turns whose current message carries an OpenAI-style
+# multimodal content array (image_input WS frames). See agent.py's use_vision
+# routing in stream_agent_turn.
+vision_llm_client = LLMChainClient(settings.vision_llm_chain)
 summary_client = SummaryClient(settings.summary_url, settings.summary_fallback_url)
 embedding_client = EmbeddingClient(settings.embedding_chain)
