@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 
 from conversation import Conversation
 from mcp_manager import MCPManager
-from service_clients import llm_client
+from service_clients import llm_client, vision_llm_client
 from settings import settings
 from subagent import _unwrap_double_encoded_args, parse_xml_tool_calls
 import tools as local_tools
@@ -100,11 +100,13 @@ async def run_agent_turn(
     status_callback=None,
     history_session=None,
     session=None,
+    user_content: list[dict] | None = None,
 ) -> str:
     """Run one user turn (non-streaming). Returns full assistant text."""
     result_parts = []
     async for chunk in stream_agent_turn(
         conversation, mcp, user_text, status_callback, history_session, session,
+        user_content=user_content,
     ):
         result_parts.append(chunk)
     return "".join(result_parts)
@@ -117,14 +119,30 @@ async def stream_agent_turn(
     status_callback=None,
     history_session=None,
     session=None,
+    user_content: list[dict] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Run one user turn, yielding sentence chunks as the LLM streams them.
 
     Tool call rounds are handled internally (non-streaming). Only the final
     text response is streamed sentence-by-sentence.
+
+    ``user_content``, when provided, is an OpenAI-style multimodal content
+    array (text + image_url parts) that becomes THIS turn's actual message
+    content, and routes the whole turn through ``settings.vision_llm_chain``
+    instead of the default chain. ``user_text`` still carries the turn's
+    plain-text representation throughout (memory queries, status labels,
+    persisted history) and is swapped back in as the message content once
+    the turn finishes — see ``Conversation.replace_last_user_content``.
+    Text-only turns (the overwhelming majority) are unaffected: with
+    ``user_content=None`` this function's behavior is unchanged from before.
     """
-    conversation.add_user(user_text)
+    use_vision = user_content is not None
+    conversation.add_user(user_content if use_vision else user_text)
     conversation.trim()
+
+    def _downgrade():
+        if use_vision:
+            conversation.replace_last_user_content(user_text)
 
     # --- Long-term memory injection (Step 4) ---------------------------------
     # Built once per turn, folded into messages[0] ONLY below — never persisted,
@@ -164,8 +182,10 @@ async def stream_agent_turn(
                 "content": "[System note: You have used many tool calls. Summarize what you've found so far and respond to the user now. Do not make more tool calls.]",
             }]
 
+        chain = settings.vision_llm_chain if use_vision else settings.llm_chain
+        client = vision_llm_client if use_vision else llm_client
         payload = {
-            "model": settings.llm_chain[0]["model"],
+            "model": chain[0]["model"],
             "messages": messages,
             "stream": True,
         }
@@ -179,15 +199,16 @@ async def stream_agent_turn(
         payload_chars = sum(len(json.dumps(m)) for m in messages)
         tool_chars = sum(len(json.dumps(t)) for t in all_tools) if all_tools else 0
         log.debug(
-            "LLM request: round %d/%d, %d messages (%d chars), %d tools (%d chars)",
+            "LLM request: round %d/%d, %d messages (%d chars), %d tools (%d chars)%s",
             round_num + 1, settings.max_tool_rounds,
             len(messages), payload_chars,
             len(all_tools) if all_tools else 0, tool_chars,
+            " [vision chain]" if use_vision else "",
         )
 
         # --- Streaming request ---
         try:
-            async with llm_client.stream_chat(payload) as resp:
+            async with client.stream_chat(payload) as resp:
                 full_content = ""
                 tool_calls_acc: dict[int, dict] = {}
                 in_think = False
@@ -256,6 +277,7 @@ async def stream_agent_turn(
 
         except Exception as e:
             log.exception("LLM request failed")
+            _downgrade()
             yield f"I'm having trouble reaching my brain right now. Error: {e}"
             return
 
@@ -356,9 +378,11 @@ async def stream_agent_turn(
             yield clean
 
         conversation.add_assistant(clean)
+        _downgrade()
         return
 
     # Safety limit reached (shouldn't happen since last round has no tools)
     fallback = "I ran into a limit on how many tool calls I can make. Could you try rephrasing your request?"
     conversation.add_assistant(fallback)
+    _downgrade()
     yield fallback

@@ -12,8 +12,31 @@ class Conversation:
     def __init__(self):
         self._messages: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
 
-    def add_user(self, text: str):
-        self._messages.append({"role": "user", "content": text})
+    def add_user(self, content: str | list[dict]):
+        """Add a user turn. ``content`` is normally plain text, but may be an
+        OpenAI-style content array (``[{"type": "text", ...}, {"type":
+        "image_url", ...}]``) for a multimodal (image) turn. Multimodal
+        content is expected to be downgraded back to text via
+        ``replace_last_user_content`` once the turn completes — see
+        agent.py's ``use_vision`` handling in ``stream_agent_turn``.
+        """
+        self._messages.append({"role": "user", "content": content})
+
+    def replace_last_user_content(self, text: str) -> None:
+        """Downgrade the most recent user message's content to plain text.
+
+        Used after a multimodal (image) turn finishes: the content array
+        (which holds a base64 data URL) is swapped for a short text
+        placeholder. This keeps later turns on the default text-only chain
+        (the simpler of the two documented options — see agent.py), keeps
+        conversation payloads from growing unbounded with inline image
+        bytes, and ensures only text ever reaches persisted history / the
+        memory extractor's trust boundary.
+        """
+        for message in reversed(self._messages):
+            if message.get("role") == "user":
+                message["content"] = text
+                return
 
     def add_assistant(self, text: str):
         self._messages.append({"role": "assistant", "content": text})
