@@ -66,6 +66,9 @@ class Settings:
     embedding_timeout: int
     result_summary_max_chars: int
     tag_generation_min_messages: int
+    memory_service_url: str
+    memory_read_timeout: int
+    memory_write_timeout: int
 
 
 DEFAULT_VOXTRAL_VOICES = [
@@ -411,6 +414,12 @@ def load_settings() -> Settings:
         embedding_timeout=_env_int("OCTAVIUS_EMBEDDING_TIMEOUT", 5),
         result_summary_max_chars=_env_int("OCTAVIUS_RESULT_SUMMARY_MAX_CHARS", 500),
         tag_generation_min_messages=_env_int("OCTAVIUS_TAG_GENERATION_MIN_MESSAGES", 4),
+        # Shared memory service (v2): Octavius is a loopback HTTP client of the
+        # memory brain. Empty url => memory disabled (degrades to memory-less).
+        memory_service_url=_env_str("OCTAVIUS_MEMORY_URL", "http://127.0.0.1:8031"),
+        memory_read_timeout=_env_int("OCTAVIUS_MEMORY_READ_TIMEOUT", 10),
+        # Writes run the extractor LLM + synthesis on the service synchronously.
+        memory_write_timeout=_env_int("OCTAVIUS_MEMORY_WRITE_TIMEOUT", 120),
     )
 
 

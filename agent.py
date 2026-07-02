@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import time
@@ -18,6 +19,78 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 # Sentence-ending punctuation followed by space or end-of-string
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
+# Thread-start episodic recall (Q1): non-authoritative "related past discussions".
+RECALL_DISTANCE_CUTOFF = 0.6
+RECALL_LIMIT = 2
+
+
+async def _build_memory_block(db_path, user_text, *, first_turn=False,
+                              current_conv_id=None) -> str:
+    """Assemble the per-turn long-term-memory text folded into messages[0].
+
+    Always-on profile + per-turn facts come from the memory SERVICE over loopback
+    (deduped server-side against the profile). First-turn episodic recall stays
+    LOCAL (Octavius's own summary corpus). Best-effort: any failure returns "" and
+    the turn proceeds memory-less.
+    """
+    from memory_client import memory_client
+
+    parts: list[str] = []
+    try:
+        profile, fact_lines = await memory_client.fetch_injection(user_text)
+    except Exception:
+        log.warning("Memory fetch failed; turn proceeds without memory", exc_info=True)
+        profile, fact_lines = "", []
+    if profile:
+        parts.append(profile)
+    if fact_lines:
+        lines = "\n".join(f"- {line}" for line in fact_lines)
+        parts.append("Possibly relevant facts for this message:\n" + lines)
+
+    # First message of a thread: surface related past conversations (episodic,
+    # non-authoritative). Local summary-embedding search; embeds, so run off-loop.
+    if first_turn and db_path is not None:
+        try:
+            recall = await asyncio.to_thread(
+                _episodic_recall, db_path, user_text, current_conv_id)
+        except Exception:
+            recall = ""
+        if recall:
+            parts.append(recall)
+
+    return "\n\n".join(parts)
+
+
+def _episodic_recall(db_path, user_text, current_conv_id) -> str:
+    """First-turn episodic recall over Octavius's LOCAL summary corpus. Opens its
+    own short-lived connection (runs in a worker thread; sync embed stays off-loop)."""
+    try:
+        from db import connect as _connect
+        from history_store import search_conversations
+    except Exception:
+        return ""
+    conn = None
+    try:
+        conn = _connect(db_path)
+        convs = search_conversations(conn, user_text, service=None,
+                                     limit=RECALL_LIMIT + 3)
+        related = [
+            c for c in convs
+            if c.get("conversation_id") != current_conv_id and c.get("summary")
+            and (c.get("distance") is None or c["distance"] < RECALL_DISTANCE_CUTOFF)
+        ][:RECALL_LIMIT]
+        if related:
+            lines = "\n".join(f"- {c['summary']}" for c in related)
+            return ("You may have discussed related topics before "
+                    "(context only, may be irrelevant):\n" + lines)
+        return ""
+    except Exception:
+        log.warning("Episodic recall failed", exc_info=True)
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 async def run_agent_turn(
@@ -53,8 +126,34 @@ async def stream_agent_turn(
     conversation.add_user(user_text)
     conversation.trim()
 
+    # --- Long-term memory injection (Step 4) ---------------------------------
+    # Built once per turn, folded into messages[0] ONLY below — never persisted,
+    # so it refreshes every turn and is immune to conversation.trim().
+    memory_block = ""
+    db_path = getattr(history_session, "db_path", None)
+    ua_count = sum(
+        1 for m in conversation.get_messages() if m.get("role") in ("user", "assistant")
+    )
+    try:
+        memory_block = await _build_memory_block(
+            db_path, user_text,
+            first_turn=(ua_count == 1),
+            current_conv_id=getattr(history_session, "conv_id", None),
+        )
+    except Exception:
+        log.warning("Memory injection failed; turn proceeds without memory", exc_info=True)
+        memory_block = ""
+
     for round_num in range(settings.max_tool_rounds):
         messages = conversation.get_messages()
+
+        # Fold memory into the system message (index 0). Qwen requires system only
+        # at the start, so we rebuild messages[0] rather than insert mid-list.
+        if memory_block and messages and messages[0].get("role") == "system":
+            messages = [
+                {"role": "system",
+                 "content": messages[0]["content"] + "\n\n" + memory_block}
+            ] + messages[1:]
 
         # On later rounds, nudge the LLM to wrap up instead of spiraling.
         # Must NOT use role=system here — Qwen's chat template requires

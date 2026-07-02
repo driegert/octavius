@@ -121,11 +121,11 @@ External services currently expected:
   - first fallback: `127.0.0.1:8001/v1/chat/completions` on lilbuddy
   - second fallback: `triplestuffed:8010/v1/chat/completions`
 - **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
-  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b` (capacity 1; runs serially)
-  - secondary: `lilbuddy:8010/v1/chat/completions` running `qwen3.6-35b-a3b`
-  - fallback: `triplestuffed:8010/v1/chat/completions` running `qwen3.6-35b-a3b`
-  - The dispatcher routes by role; per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
-  - Note: `lilripper:8010` is shared with the reader LLM (different model alias). The host is a llama-swap so the model loaded swaps when calls hit different aliases — back-to-back reader and subagent calls will pay a swap cost.
+  - primary: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b` — the main agent's dedicated, always-warm 35B. Inline consults block the main loop, so there's no real contention, and this avoids a cold-load/swap on the first consult.
+  - fallback: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-general` — HTTP-level failover only.
+  - The dispatcher (`subagent_dispatcher.py`) routes by `role`. Only two roles matter per call: `primary` (first-try / concurrency routing, with `secondary` as an optional concurrency-overflow tier) and `fallback` (the single per-call HTTP-failover target passed alongside the assigned URL). Per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
+  - **Model-alias gotcha**: `lilripper:8010` is a llama-swap that serves `qwen3.6-35b-a3b-general` / `-code` and the reader's `qwen3.5-9b` — **not** the bare `qwen3.6-35b-a3b` alias (that alias only exists on `lilripper:8020`, `triplestuffed:8010`, and `lilbuddy:8010`). `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so a wrong alias hard-400s and silently costs a failover hop. `lilripper:8010` is also shared with the reader, so interleaving document reading and email/task consults pays a llama-swap cost.
+  - **KNOWN LIMITATION (handle later):** both tiers now live on `lilripper` (`:8020` primary, `:8010` fallback), so there is **no cross-host failover** — if `lilripper` is fully down, `consult_specialist` has nowhere to go. `lilbuddy:8010` / `triplestuffed:8010` were dropped from the subagent chain. Because the dispatcher only tries `[assigned_url, fallback_url]` per call, restoring cross-host resilience means putting a remote host (e.g. `triplestuffed:8010`, local; or `lilbuddy:8010`) in the **`fallback`** slot — a `secondary` entry only absorbs concurrency overflow, not error-failover. See `docs/status.md`.
 - **TTS**: Voxtral 4B at `triplestuffed:8020/v1/audio/speech`
 - **TTS fallback**: Kokoro at `lilbuddy:8880`
 - **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions`

@@ -47,9 +47,27 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = _connect(db_path)
     schema_sql = SCHEMA_PATH.read_text()
     conn.executescript(schema_sql)
+    _run_migrations(conn)
     conn.commit()
     log.info("History database ready at %s", db_path)
     return conn
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions that ``CREATE TABLE IF NOT EXISTS`` can't express.
+
+    ``ALTER TABLE ... ADD COLUMN`` errors if the column already exists, so it can't
+    live in schema.sql's executescript (which runs on every startup). Guard each
+    add with a PRAGMA table_info check instead.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    if "last_extracted_message_id" not in cols:
+        # Watermark for the memory write path: each extraction pass only mines
+        # messages.id > this value, so re-entered durable threads don't re-extract.
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN last_extracted_message_id INTEGER"
+        )
+        log.info("Migration: added conversations.last_extracted_message_id")
 
 
 # -- Core recording API --------------------------------------------------------
@@ -354,6 +372,11 @@ class ConversationSession:
         # Generate tags
         tags = generate_tags(self._messages_for_summary)
         self._store_tags(tags)
+
+        # Long-term memory: push this (salient) conversation to the memory service.
+        if result.index:
+            self._push_memory(self.conv_id)
+
         self.conn.close()
         self._closed = True
 
@@ -384,6 +407,11 @@ class ConversationSession:
 
         tags = await generate_tags_async(self._messages_for_summary)
         self._store_tags(tags)
+
+        # Long-term memory: push this (salient) conversation to the memory service.
+        if result.index:
+            await self._push_memory_async(self.conv_id)
+
         self.conn.close()
         self._closed = True
 
@@ -398,6 +426,94 @@ class ConversationSession:
             (now, elapsed_ms, self.conv_id),
         )
         self.conn.commit()
+
+    def _gather_unsent(self, conn, conv_id: int):
+        """Read the user+assistant turns past the local watermark, plus the
+        conversation's stable key and summary, for a push to the memory service.
+
+        TRUST BOUNDARY: ``messages_after_watermark`` returns user+assistant turns
+        ONLY — tool/email content never crosses to the extractor. Returns
+        ``(transcript, max_id, watermark, conv_key, summary)``.
+        """
+        import memory
+        watermark = memory.store.get_watermark(conn, conv_id)
+        msgs, max_id = memory.store.messages_after_watermark(conn, conv_id, watermark)
+        row = conn.execute(
+            "SELECT session_id, summary FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+        conv_key = row[0] if row else None
+        summary = row[1] if row else None
+        return msgs, max_id, watermark, conv_key, summary
+
+    async def _push_memory_async(self, conv_id: int):
+        """Push this conversation's new user+assistant turns to the memory service
+        and, only on a confirmed push, advance the local watermark. Best-effort:
+        a failure leaves the watermark put so the next close retries. Uses its OWN
+        short-lived connection (never races the about-to-close ``self.conn``)."""
+        try:
+            import memory  # noqa: F401  (watermark helpers live here)
+            from memory_client import memory_client
+        except Exception:
+            log.warning("Memory client unavailable; skipping push", exc_info=True)
+            return
+        if not memory_client.enabled:
+            return
+        conn = None
+        try:
+            conn = _connect(self.db_path)
+            self._do_push(conn, conv_id, await self._maybe_push_async(conn, conv_id))
+        except Exception:
+            log.warning("Memory push failed for conversation %d", conv_id, exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    async def _maybe_push_async(self, conn, conv_id):
+        from memory_client import memory_client
+        msgs, max_id, watermark, conv_key, summary = self._gather_unsent(conn, conv_id)
+        if conv_key is None:
+            return None
+        res = await memory_client.push_conversation(
+            conv_key, msgs, summary=summary, ended_at=_now(), index=True)
+        return (res, msgs, max_id, watermark, conv_id) if res is not None else None
+
+    def _push_memory(self, conv_id: int):
+        """Sync sibling of ``_push_memory_async`` for the legacy sync ``end()``."""
+        try:
+            import memory  # noqa: F401
+            from memory_client import memory_client
+        except Exception:
+            log.warning("Memory client unavailable; skipping push", exc_info=True)
+            return
+        if not memory_client.enabled:
+            return
+        conn = None
+        try:
+            conn = _connect(self.db_path)
+            msgs, max_id, watermark, conv_key, summary = self._gather_unsent(conn, conv_id)
+            if conv_key is None:
+                return
+            res = memory_client.push_conversation_sync(
+                conv_key, msgs, summary=summary, ended_at=_now(), index=True)
+            self._do_push(conn, conv_id,
+                          (res, msgs, max_id, watermark, conv_id) if res is not None else None)
+        except Exception:
+            log.warning("Memory push failed for conversation %d", conv_id, exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _do_push(self, conn, conv_id, pushed):
+        """Advance the watermark only when the service confirmed ingest of new turns."""
+        if pushed is None:
+            return
+        import memory
+        res, msgs, max_id, watermark, _ = pushed
+        if msgs:
+            memory.store.set_watermark(conn, conv_id, max_id)
+            conn.commit()
+            log.info("Memory: pushed conv %d (%d msgs id>%d) → +%s ~%s",
+                     conv_id, len(msgs), watermark, res.get("added"), res.get("reinforced"))
 
     def _store_tags(self, tags: list[str]):
         for tag_name in tags:

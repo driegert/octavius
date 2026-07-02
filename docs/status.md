@@ -76,6 +76,7 @@ Operational assumptions worth keeping in mind during debugging:
 - the browser UIs are less script-heavy than before, but layout and markup are still concentrated in large static HTML files
 - Silero VAD requires `models/silero_vad.onnx` to be present; if the file is missing, VAD is skipped and auto-stop will not work
 - STT failover (lilripper primary, lilbuddy fallback) is not yet implemented — switching requires a settings change
+- **Subagent chain has no cross-host failover.** `consult_specialist` now routes primary `lilripper:8020` (`qwen3.6-35b-a3b`, warm) → fallback `lilripper:8010` (`qwen3.6-35b-a3b-general`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`. Watch the model alias: `lilripper:8010` serves `-general`/`-code`, not the bare `qwen3.6-35b-a3b` (see CLAUDE.md "Subagent LLM chain"). To handle later.
 
 ## Near-Term Work
 
@@ -84,6 +85,7 @@ Likely refactor targets, in rough priority order:
 1. Further narrow `main.py` so it remains a routing layer rather than a coordination module.
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
+4. Restore cross-host failover for the subagent chain (see Stability Notes): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive.
 
 ## Migration Note
 
