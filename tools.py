@@ -6,6 +6,7 @@ import inspect
 import json
 from typing import TYPE_CHECKING, Callable
 
+from local_tool_documents import check_document_status
 from local_tool_downloads import download_file
 from local_tool_history import search_conversation_history
 from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
@@ -64,6 +65,7 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "read_document": read_document,
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,
+        "check_document_status": check_document_status,
         "search_conversation_history": search_conversation_history,
         "remember": remember,
         "forget": forget,

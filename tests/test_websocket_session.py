@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,8 @@ class _FakeHistorySession:
         self.conv_id = conv_id
         self.ended = False
         self.messages = []
+        self.attachments = []
+        self._next_msg_id = 1000
 
     async def end_async(self):
         self.ended = True
@@ -21,6 +24,15 @@ class _FakeHistorySession:
         entry = {"role": role, "content": content, "model": model}
         entry.update(kwargs)
         self.messages.append(entry)
+        msg_id = self._next_msg_id
+        self._next_msg_id += 1
+        return msg_id
+
+    def add_attachment(self, message_id, type, reference, title=None):
+        self.attachments.append(
+            {"message_id": message_id, "type": type, "reference": reference, "title": title}
+        )
+        return len(self.attachments)
 
 
 class _FakeHistory:
@@ -698,6 +710,415 @@ class DelegationToolTests(unittest.TestCase):
             msg = await pull_delegation({"domain": "email"}, session=handler)
             self.assertIn("No ready email delegation", msg)
             self.assertIn(r.handle, handler.state.delegations)
+
+        asyncio.run(run())
+
+
+class UnknownFrameTests(unittest.TestCase):
+    """The dispatch dict is keyed on 'type'; anything not in it is a silent
+    no-op. This is the safety net for 'ignore unknown frame fields/types
+    gracefully' from the frozen media contract."""
+
+    def test_unknown_frame_type_is_ignored(self):
+        async def run():
+            handler = WebSocketSessionHandler(_FakeWS())
+            await handler.handle_text_message(json.dumps({"type": "some_future_frame", "text": "x"}))
+            self.assertEqual(handler.ws.sent, [])
+
+        asyncio.run(run())
+
+    def test_known_frame_with_unexpected_extra_fields_does_not_crash(self):
+        async def run():
+            handler = WebSocketSessionHandler(_FakeWS())
+            handler._spawn_turn = lambda *a, **kw: None
+            await handler.handle_text_message(
+                json.dumps({"type": "image_input", "text": "", "path": "/nonexistent",
+                            "mime": "image/jpeg", "filename": "x.jpg", "size_bytes": 5,
+                            "future_field": {"nested": True}})
+            )
+            # Path doesn't exist -> handled via the "couldn't find the file" branch,
+            # not a crash.
+            statuses = [json.loads(t)["text"] for t in handler.ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("couldn't find" in s for s in statuses))
+
+        asyncio.run(run())
+
+
+class ImageInputTests(unittest.TestCase):
+    def _make_handler(self):
+        ws = _FakeWS()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=1)
+        return handler, ws
+
+    def test_missing_path_sends_status_and_does_not_spawn_turn(self):
+        async def run():
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            await handler.handle_image_input({"text": "", "path": "", "mime": "image/png", "filename": "a.png"})
+            handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("couldn't find" in s for s in statuses))
+
+        asyncio.run(run())
+
+    def test_non_image_mime_sends_status_and_does_not_spawn_turn(self):
+        async def run():
+            import tempfile
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+                f.write(b"not an image")
+                f.flush()
+                await handler.handle_image_input(
+                    {"text": "", "path": f.name, "mime": "application/octet-stream", "filename": "a.bin"}
+                )
+            handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("isn't an image" in s for s in statuses))
+
+        asyncio.run(run())
+
+    def test_valid_image_spawns_turn_with_vision_content_array(self):
+        async def run():
+            import base64
+            import tempfile
+            handler, ws = self._make_handler()
+            captured = {}
+
+            def fake_spawn(user_text, source, user_content=None, attachment=None):
+                captured["user_text"] = user_text
+                captured["source"] = source
+                captured["user_content"] = user_content
+                captured["attachment"] = attachment
+
+            handler._spawn_turn = fake_spawn
+            with tempfile.NamedTemporaryFile(suffix=".png") as f:
+                f.write(b"\x89PNG\r\n\x1a\nfakepngbytes")
+                f.flush()
+                await handler.handle_image_input(
+                    {"text": "what is this", "path": f.name, "mime": "image/png", "filename": "cat.png", "size_bytes": 20}
+                )
+                expected_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\nfakepngbytes").decode("ascii")
+
+            self.assertEqual(captured["source"], "image")
+            self.assertEqual(captured["user_text"], "[image: cat.png] what is this")
+            self.assertEqual(captured["user_content"][0], {"type": "text", "text": "what is this"})
+            self.assertEqual(
+                captured["user_content"][1],
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{expected_b64}"}},
+            )
+            self.assertEqual(captured["attachment"]["type"], "image")
+            self.assertEqual(captured["attachment"]["title"], "cat.png")
+
+            transcripts = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "transcript"]
+            self.assertEqual(transcripts, ["[image: cat.png] what is this"])
+
+        asyncio.run(run())
+
+    def test_no_caption_uses_default_vision_text(self):
+        async def run():
+            import tempfile
+            handler, ws = self._make_handler()
+            captured = {}
+            handler._spawn_turn = lambda user_text, source, user_content=None, attachment=None: captured.update(
+                user_text=user_text, user_content=user_content
+            )
+            with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
+                f.write(b"fakejpgbytes")
+                f.flush()
+                await handler.handle_image_input(
+                    {"text": "", "path": f.name, "mime": "image/jpeg", "filename": "photo.jpg"}
+                )
+            self.assertEqual(captured["user_text"], "[image: photo.jpg]")
+            self.assertEqual(
+                captured["user_content"][0],
+                {"type": "text", "text": "The user sent an image: photo.jpg"},
+            )
+
+        asyncio.run(run())
+
+
+class FileInputTests(unittest.TestCase):
+    def _make_handler(self):
+        ws = _FakeWS()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=1)
+        return handler, ws
+
+    def test_missing_path_sends_status_only(self):
+        async def run():
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            await handler.handle_file_input({"text": "", "path": "", "mime": "application/pdf", "filename": "a.pdf"})
+            handler._spawn_turn.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_non_pdf_acknowledges_without_docproc_call(self):
+        async def run():
+            import tempfile
+            handler, ws = self._make_handler()
+            captured = {}
+            handler._spawn_turn = lambda instruction, source, user_content=None, attachment=None: captured.update(
+                instruction=instruction, source=source, attachment=attachment
+            )
+            with tempfile.NamedTemporaryFile(suffix=".docx") as f:
+                f.write(b"not a pdf")
+                f.flush()
+                with patch("websocket_session.docproc_client.submit_job") as submit:
+                    await handler.handle_file_input(
+                        {"text": "", "path": f.name, "mime": "application/vnd.openxmlformats", "filename": "notes.docx"}
+                    )
+                    submit.assert_not_called()
+
+            self.assertIn("only process PDFs", captured["instruction"])
+            self.assertEqual(captured["source"], "file")
+            self.assertEqual(captured["attachment"]["type"], "file")
+
+        asyncio.run(run())
+
+    def test_pdf_without_caption_submits_and_acks_immediately(self):
+        async def run():
+            import tempfile
+            from unittest.mock import AsyncMock
+            handler, ws = self._make_handler()
+            captured = {}
+            handler._spawn_turn = lambda instruction, source, user_content=None, attachment=None: captured.update(
+                instruction=instruction, source=source, attachment=attachment
+            )
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+                f.write(b"%PDF-1.4 fake")
+                f.flush()
+                with patch(
+                    "websocket_session.docproc_client.submit_job",
+                    new=AsyncMock(return_value={"id": "job-123", "status": "queued"}),
+                ) as submit:
+                    await handler.handle_file_input(
+                        {"text": "", "path": f.name, "mime": "application/pdf", "filename": "paper.pdf"}
+                    )
+                    submit.assert_called_once_with(f.name)
+
+            self.assertIn("job-123", captured["instruction"])
+            self.assertIn("paper.pdf", captured["instruction"])
+            self.assertEqual(captured["source"], "file")
+
+        asyncio.run(run())
+
+    def test_pdf_with_caption_schedules_background_poll_not_spawn_turn(self):
+        async def run():
+            import tempfile
+            from unittest.mock import AsyncMock
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            created_tasks = []
+
+            def fake_create_task(coro):
+                created_tasks.append(coro)
+                coro.close()
+                return None
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+                f.write(b"%PDF-1.4 fake")
+                f.flush()
+                with (
+                    patch(
+                        "websocket_session.docproc_client.submit_job",
+                        new=AsyncMock(return_value={"id": "job-456", "status": "queued"}),
+                    ),
+                    patch("websocket_session.asyncio.create_task", side_effect=fake_create_task),
+                ):
+                    await handler.handle_file_input(
+                        {"text": "summarize this", "path": f.name, "mime": "application/pdf", "filename": "paper.pdf"}
+                    )
+
+            handler._spawn_turn.assert_not_called()
+            self.assertEqual(len(created_tasks), 1)
+
+        asyncio.run(run())
+
+    def test_docproc_submit_failure_acknowledges_error(self):
+        async def run():
+            import tempfile
+            handler, ws = self._make_handler()
+            captured = {}
+            handler._spawn_turn = lambda instruction, source, user_content=None, attachment=None: captured.update(
+                instruction=instruction
+            )
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+                f.write(b"%PDF-1.4 fake")
+                f.flush()
+                with patch(
+                    "websocket_session.docproc_client.submit_job",
+                    side_effect=RuntimeError("queue unreachable"),
+                ):
+                    await handler.handle_file_input(
+                        {"text": "", "path": f.name, "mime": "application/pdf", "filename": "paper.pdf"}
+                    )
+            self.assertIn("failed", captured["instruction"])
+            self.assertIn("queue unreachable", captured["instruction"])
+
+        asyncio.run(run())
+
+
+class AwaitPdfAndRunTests(unittest.TestCase):
+    def _make_handler(self):
+        ws = _FakeWS()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=1)
+        return handler, ws
+
+    def test_success_inlines_short_document_content(self):
+        async def run():
+            import tempfile
+            from unittest.mock import AsyncMock
+            handler, ws = self._make_handler()
+            with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False) as f:
+                f.write("# Paper\n\nShort body.")
+                md_path = f.name
+            try:
+                with (
+                    patch(
+                        "websocket_session.docproc_client.poll_job",
+                        new=AsyncMock(return_value={"status": "done", "result_md_path": md_path}),
+                    ),
+                    patch.object(handler, "run_turn", new=AsyncMock()) as run_turn,
+                ):
+                    await handler._await_pdf_and_run("job-1", "paper.pdf", "summarize this")
+                run_turn.assert_called_once()
+                instruction, kwargs = run_turn.call_args.args[0], run_turn.call_args.kwargs
+                self.assertIn("summarize this", instruction)
+                self.assertIn("Short body.", instruction)
+                self.assertIn("job-1", instruction)
+                self.assertEqual(kwargs.get("source"), "file")
+            finally:
+                import os
+                os.unlink(md_path)
+
+        asyncio.run(run())
+
+    def test_long_document_uses_excerpt_instead_of_full_inline(self):
+        async def run():
+            import tempfile
+            from dataclasses import replace
+            from unittest.mock import AsyncMock
+            handler, ws = self._make_handler()
+            long_text = "word " * 5000  # well over a tiny inline budget
+            with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False) as f:
+                f.write(long_text)
+                md_path = f.name
+            try:
+                with (
+                    patch(
+                        "websocket_session.docproc_client.poll_job",
+                        new=AsyncMock(return_value={"status": "done", "result_md_path": md_path}),
+                    ),
+                    patch.object(handler, "run_turn", new=AsyncMock()) as run_turn,
+                    patch(
+                        "websocket_session.settings",
+                        replace(settings, docproc_inline_char_budget=100, docproc_excerpt_chars=20),
+                    ),
+                ):
+                    await handler._await_pdf_and_run("job-2", "big.pdf", "read it")
+                instruction = run_turn.call_args.args[0]
+                self.assertIn("is long", instruction)
+                self.assertIn(md_path, instruction)
+            finally:
+                import os
+                os.unlink(md_path)
+
+        asyncio.run(run())
+
+    def test_poll_failure_still_runs_a_turn_reporting_the_error(self):
+        async def run():
+            from unittest.mock import AsyncMock
+            import docproc_client
+            handler, ws = self._make_handler()
+            with (
+                patch(
+                    "websocket_session.docproc_client.poll_job",
+                    new=AsyncMock(side_effect=docproc_client.DocprocError("timed out after 300s")),
+                ),
+                patch.object(handler, "run_turn", new=AsyncMock()) as run_turn,
+            ):
+                await handler._await_pdf_and_run("job-3", "paper.pdf", "summarize")
+            run_turn.assert_called_once()
+            instruction = run_turn.call_args.args[0]
+            self.assertIn("failed to convert or timed out", instruction)
+            self.assertIn("timed out after 300s", instruction)
+
+    def test_disconnect_mid_poll_is_swallowed_not_raised(self):
+        """A client that disconnects during the (potentially minutes-long)
+        poll must not blow up the background task — mirrors
+        _run_turn_guarded's handling of the same exceptions."""
+        async def run():
+            from unittest.mock import AsyncMock
+            handler, ws = self._make_handler()
+            with (
+                patch(
+                    "websocket_session.docproc_client.poll_job",
+                    new=AsyncMock(return_value={"status": "done", "result_md_path": None}),
+                ),
+                patch.object(handler, "run_turn", new=AsyncMock(side_effect=WebSocketDisconnect())),
+            ):
+                # Must not raise.
+                await handler._await_pdf_and_run("job-4", "paper.pdf", "summarize")
+
+        asyncio.run(run())
+
+        asyncio.run(run())
+
+
+class RunTurnMediaTests(unittest.TestCase):
+    def _make_handler(self):
+        ws = _FakeWS()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=1)
+        handler.state.tts_enabled = False
+        return handler, ws
+
+    def test_image_turn_records_attachment_and_uses_vision_model(self):
+        async def run():
+            handler, ws = self._make_handler()
+            captured = {}
+
+            async def fake_stream(conversation, mcp, user_text, status_callback=None,
+                                   history_session=None, session=None, user_content=None):
+                captured["user_content"] = user_content
+                yield "It's a cat."
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                await handler.run_turn(
+                    "[image: cat.png]", source="image",
+                    user_content=[{"type": "text", "text": "x"}],
+                    attachment={"type": "image", "reference": "/tmp/cat.png", "title": "cat.png"},
+                )
+
+            self.assertIsNotNone(captured["user_content"])
+            hs = handler.state.history_session
+            self.assertEqual(len(hs.attachments), 1)
+            self.assertEqual(hs.attachments[0], {
+                "message_id": 1000, "type": "image", "reference": "/tmp/cat.png", "title": "cat.png",
+            })
+            assistant_entries = [m for m in hs.messages if m["role"] == "assistant"]
+            self.assertEqual(assistant_entries[-1]["model"], settings.vision_llm_chain[0]["model"])
+
+        asyncio.run(run())
+
+    def test_text_turn_unaffected_no_attachment_default_model(self):
+        async def run():
+            handler, ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                yield "Hi."
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                await handler.run_turn("hello", source="text")
+
+            hs = handler.state.history_session
+            self.assertEqual(hs.attachments, [])
+            assistant_entries = [m for m in hs.messages if m["role"] == "assistant"]
+            self.assertEqual(assistant_entries[-1]["model"], settings.llm_chain[0]["model"])
 
         asyncio.run(run())
 

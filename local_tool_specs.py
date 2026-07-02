@@ -270,6 +270,30 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "check_document_status",
+            "description": (
+                "Check the conversion status of a PDF submitted to the docproc "
+                "queue — e.g. one Dave sent as a document over Matrix. Use when "
+                "he asks things like 'is that PDF ready?', 'what happened to "
+                "that document I sent?', or asks for the converted markdown of "
+                "a document you previously mentioned. Pass the job_id that was "
+                "given when the PDF was received."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The docproc job id mentioned when the PDF was received.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "remember",
             "description": (
                 "Durably remember a fact Dave states about himself, his work, "

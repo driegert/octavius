@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 try:
@@ -16,6 +18,7 @@ except ModuleNotFoundError:
 
     class WebSocketDisconnect(RuntimeError):
         pass
+import docproc_client
 from conversation import Conversation
 from reader_playback import stream_reader_audio
 from settings import settings
@@ -211,6 +214,8 @@ class WebSocketSessionHandler:
             "load_conversation": self.handle_load_conversation,
             "settings": self.handle_settings,
             "text_input": self.handle_text_input,
+            "image_input": self.handle_image_input,
+            "file_input": self.handle_file_input,
             "reader_play": self.handle_reader_play,
             "reader_pause": self.handle_reader_pause,
             "reader_stop": self.handle_reader_stop,
@@ -345,6 +350,208 @@ class WebSocketSessionHandler:
             return
         await self.send_json("transcript", user_text)
         self._spawn_turn(user_text, source="text")
+
+    async def handle_image_input(self, data: dict):
+        """Handle the frozen WS media contract's `image_input` frame.
+
+        See docs/ws-media-contract.md. The sidecar has already spooled the
+        file to disk and enforced the size cap — we only validate the path
+        exists and the mime looks like an image, then build an OpenAI-style
+        multimodal content array and route this turn through the vision
+        chain (agent.py's `use_vision` handling in `stream_agent_turn`).
+        Unknown/extra frame fields are ignored by construction (we only read
+        the keys we know about).
+        """
+        path = data.get("path", "")
+        mime = data.get("mime", "") or ""
+        filename = data.get("filename") or (Path(path).name if path else "image")
+        caption = (data.get("text") or "").strip()
+
+        if not path or not Path(path).exists():
+            log.warning("image_input with missing/nonexistent path: %r", path)
+            await self.send_json("status", "I got notified about an image but couldn't find the file.")
+            return
+        if not mime.startswith("image/"):
+            log.warning("image_input with non-image mime %r for %s", mime, path)
+            await self.send_json(
+                "status", f"Received '{filename}' but its type ({mime or 'unknown'}) isn't an image I can view."
+            )
+            return
+
+        try:
+            image_bytes = Path(path).read_bytes()
+        except OSError:
+            log.exception("Failed to read spooled image at %s", path)
+            await self.send_json("status", "Received an image but couldn't read the file.")
+            return
+
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        # Text part sent to the vision model for THIS turn.
+        vision_text = caption or f"The user sent an image: {filename}"
+        # Text representation used everywhere else: transcript display,
+        # persisted history, memory queries, and what the in-memory
+        # conversation downgrades back to once the turn completes. Never
+        # base64 — see agent.py's stream_agent_turn / memory trust boundary.
+        placeholder_text = f"[image: {filename}]" + (f" {caption}" if caption else "")
+        content = [
+            {"type": "text", "text": vision_text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ]
+
+        await self.send_json("transcript", placeholder_text)
+        self._spawn_turn(
+            placeholder_text,
+            source="image",
+            user_content=content,
+            attachment={"type": "image", "reference": path, "title": filename},
+        )
+
+    async def handle_file_input(self, data: dict):
+        """Handle the frozen WS media contract's `file_input` frame.
+
+        See docs/ws-media-contract.md. PDFs are submitted to the docproc
+        queue DETERMINISTICALLY (plain code — not an LLM tool-call decision);
+        non-PDF files just get a brief acknowledgement since Octavius can't
+        process them yet. Unknown/extra frame fields are ignored by
+        construction.
+        """
+        path = data.get("path", "")
+        mime = data.get("mime", "") or ""
+        filename = data.get("filename") or (Path(path).name if path else "file")
+        caption = (data.get("text") or "").strip()
+
+        if not path or not Path(path).exists():
+            log.warning("file_input with missing/nonexistent path: %r", path)
+            await self.send_json("status", "I got notified about a file but couldn't find it on disk.")
+            return
+
+        if mime != "application/pdf":
+            await self.send_json("transcript", f"[file: {filename}]")
+            instruction = (
+                f"[Dave just sent a file named '{filename}' (stored at {path}). "
+                "Octavius can only process PDFs into readable text so far. Briefly "
+                "acknowledge receipt, mention PDFs are the only file type handled "
+                "right now, and note where it's stored.]"
+            )
+            self._spawn_turn(
+                instruction, source="file",
+                attachment={"type": "file", "reference": path, "title": filename},
+            )
+            return
+
+        await self.send_json("transcript", f"[file: {filename}]" + (f" {caption}" if caption else ""))
+        await self._handle_pdf_file_input(path, filename, caption)
+
+    async def _handle_pdf_file_input(self, path: str, filename: str, caption: str) -> None:
+        """Deterministically submit a PDF to the docproc queue, then either
+        acknowledge immediately (no caption) or poll in the background and
+        run the caption as instructions once conversion completes.
+        """
+        try:
+            job = await docproc_client.submit_job(path)
+        except Exception as exc:
+            log.exception("docproc submission failed for %s", path)
+            instruction = (
+                f"[Dave sent a PDF named '{filename}' but submitting it for "
+                f"conversion failed: {exc}. Let him know something went wrong "
+                "and he may need to resend it.]"
+            )
+            self._spawn_turn(
+                instruction, source="file",
+                attachment={"type": "file", "reference": path, "title": filename},
+            )
+            return
+
+        job_id = job.get("id")
+        log.info("Submitted PDF %s to docproc: job %s (caption=%r)", path, job_id, bool(caption))
+
+        if caption:
+            # Caption = instructions. Poll in the background (bounded,
+            # doesn't block the WS loop or other sessions) and run the turn
+            # once conversion lands.
+            asyncio.create_task(self._await_pdf_and_run(job_id, filename, caption))
+            return
+
+        # No caption: acknowledge right away rather than making Dave wait on
+        # the conversion.
+        instruction = (
+            f"[Dave just sent a PDF named '{filename}' for conversion (docproc "
+            f"job {job_id}). Briefly acknowledge receipt, mention it's "
+            "converting to markdown in the background, and ask what he'd like "
+            "done with it once it's ready.]"
+        )
+        self._spawn_turn(
+            instruction, source="file",
+            attachment={"type": "file", "reference": path, "title": filename},
+        )
+
+    async def _await_pdf_and_run(self, job_id: str, filename: str, caption: str) -> None:
+        """Background task: poll a docproc job to completion, then run the
+        agent turn with the caption as instructions plus the converted
+        document (inlined if it fits the char budget, else path + excerpt).
+
+        Runs off the WS receive loop (spawned via asyncio.create_task) and
+        calls run_turn directly rather than _spawn_turn: unlike a fresh WS
+        frame, dropping this turn on overlap would silently lose Dave's
+        instructions, so it queues behind turn_lock instead. Wrapped like
+        _run_turn_guarded so a client disconnect mid-poll (this can run for
+        several minutes) doesn't surface as an unretrieved task exception.
+        """
+        try:
+            await self._await_pdf_and_run_unguarded(job_id, filename, caption)
+        except (WebSocketDisconnect, RuntimeError):
+            log.info("PDF-turn aborted: client disconnected mid-conversion (job %s)", job_id)
+        except Exception:
+            log.exception("PDF-turn task crashed (job %s)", job_id)
+
+    async def _await_pdf_and_run_unguarded(self, job_id: str, filename: str, caption: str) -> None:
+        try:
+            row = await docproc_client.poll_job(job_id)
+        except docproc_client.DocprocError as exc:
+            log.warning("docproc job %s did not complete: %s", job_id, exc)
+            instruction = (
+                f"[The PDF '{filename}' Dave sent (docproc job {job_id}) failed "
+                f"to convert or timed out: {exc}. Let him know and ask if he'd "
+                "like to try again.]"
+            )
+            await self.run_turn(instruction, source="file")
+            return
+        except Exception as exc:
+            log.exception("Unexpected error polling docproc job %s", job_id)
+            instruction = (
+                f"[Something went wrong checking on the PDF '{filename}' Dave "
+                f"sent (docproc job {job_id}): {exc}. Let him know.]"
+            )
+            await self.run_turn(instruction, source="file")
+            return
+
+        md_path = row.get("result_md_path")
+        doc_text = ""
+        if md_path:
+            try:
+                doc_text = Path(md_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                log.warning("Could not read converted markdown at %s", md_path)
+
+        if doc_text and len(doc_text) <= settings.docproc_inline_char_budget:
+            body = f"Converted document content:\n\n{doc_text}"
+        elif doc_text:
+            head = doc_text[: settings.docproc_excerpt_chars]
+            body = (
+                f"The converted document is long ({len(doc_text)} chars); here is "
+                f"the markdown path and a head excerpt (use check_document_status "
+                f"with job_id {job_id} to fetch more).\nMarkdown file: {md_path}\n\n"
+                f"Excerpt:\n{head}"
+            )
+        else:
+            body = f"Markdown file: {md_path or '(unknown — use check_document_status)'}"
+
+        instruction = (
+            f"[Dave sent a PDF named '{filename}' with instructions: \"{caption}\". "
+            f"It has finished converting (docproc job {job_id}).\n{body}\n\n"
+            "Follow Dave's instructions using this document content.]"
+        )
+        await self.run_turn(instruction, source="file")
 
     async def handle_reader_play(self, data: dict):
         await self.cancel_reader_task()
@@ -665,7 +872,13 @@ class WebSocketSessionHandler:
         await self.send_json("transcript", last_text)
         self._spawn_turn(last_text, source="voice")
 
-    def _spawn_turn(self, user_text: str, source: str) -> None:
+    def _spawn_turn(
+        self,
+        user_text: str,
+        source: str,
+        user_content: list[dict] | None = None,
+        attachment: dict | None = None,
+    ) -> None:
         """Run a turn as a background task.
 
         The WebSocket receive loop is single-threaded: awaiting a turn
@@ -677,34 +890,69 @@ class WebSocketSessionHandler:
         The client UI disables input until a turn finishes, so overlapping
         turns shouldn't happen; if one slips through we drop it rather than
         queue, since stale voice input is not worth replaying.
+
+        ``user_content``: OpenAI-style multimodal content array for an
+        image turn (see handle_image_input) — routes this turn through the
+        vision chain. ``attachment``: optional ``{"type", "reference",
+        "title"}`` recorded against the persisted user message via the
+        ``attachments`` table (image_input / file_input turns only).
         """
         if self.state.turn_task and not self.state.turn_task.done():
             log.warning("Turn already in flight; dropping new turn request")
             return
         self.state.turn_task = asyncio.create_task(
-            self._run_turn_guarded(user_text, source)
+            self._run_turn_guarded(user_text, source, user_content, attachment)
         )
 
-    async def _run_turn_guarded(self, user_text: str, source: str) -> None:
+    async def _run_turn_guarded(
+        self,
+        user_text: str,
+        source: str,
+        user_content: list[dict] | None = None,
+        attachment: dict | None = None,
+    ) -> None:
         try:
-            await self.run_turn(user_text, source)
+            await self.run_turn(user_text, source, user_content, attachment)
         except (WebSocketDisconnect, RuntimeError):
             log.info("Turn aborted: client disconnected mid-turn")
         except Exception:
             log.exception("Turn task crashed")
 
-    async def run_turn(self, user_text: str, source: str):
+    async def run_turn(
+        self,
+        user_text: str,
+        source: str,
+        user_content: list[dict] | None = None,
+        attachment: dict | None = None,
+    ):
         from agent import stream_agent_turn
         from tts import synthesize
         async with self.state.turn_lock:
             turn_start = time.monotonic()
             await self.send_json("status", "Thinking...")
 
+            # Image turns route through the vision chain; everything else
+            # (including file_input's synthetic instruction turns) uses the
+            # default text chain unchanged.
+            turn_model = (
+                settings.vision_llm_chain[0]["model"] if user_content is not None
+                else settings.llm_chain[0]["model"]
+            )
+
             if self.state.history_session:
                 user_kwargs = {}
                 if source == "voice":
                     user_kwargs["stt_model"] = "whisper"
-                await self.state.history_session.add_message_async(role="user", content=user_text, **user_kwargs)
+                user_msg_id = await self.state.history_session.add_message_async(
+                    role="user", content=user_text, **user_kwargs
+                )
+                if attachment:
+                    self.state.history_session.add_attachment(
+                        message_id=user_msg_id,
+                        type=attachment["type"],
+                        reference=attachment["reference"],
+                        title=attachment.get("title"),
+                    )
 
             async def status_cb(text: str):
                 await self.send_json("status", text)
@@ -720,6 +968,7 @@ class WebSocketSessionHandler:
                     status_callback=status_cb,
                     history_session=self.state.history_session,
                     session=self,
+                    user_content=user_content,
                 ):
                     full_reply_parts.append(sentence)
                     if self.state.tts_enabled:
@@ -757,7 +1006,7 @@ class WebSocketSessionHandler:
                         await self.state.history_session.add_message_async(
                             role="assistant",
                             content=full_reply,
-                            model=settings.llm_chain[0]["model"],
+                            model=turn_model,
                             latency_ms=latency_ms,
                             tts_model=settings.tts.model if self.state.tts_enabled else None,
                         )
