@@ -30,7 +30,9 @@ SYSTEM_PROMPT = (
     '"object_is_entity": bool, "trust_tier": "asserted"|"derived"}.\n\n'
     "Rules:\n"
     "- Emit ONLY durable facts about stable entities, identities, relationships, "
-    "preferences, or long-running projects. NEVER task-specific or ephemeral detail "
+    "preferences, long-running projects, or possessions the user owns or operates "
+    "(computers/devices/hardware, infrastructure, tools). Treat each named "
+    "machine/device as an entity. NEVER task-specific or ephemeral detail "
     "(today's todo, a one-off question, transient state).\n"
     "- Prefer reusing an existing predicate and an existing entity name (given below).\n"
     "- subject/object are canonical entity names ('Dave', 'Trent University') or, for "
