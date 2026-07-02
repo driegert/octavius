@@ -133,6 +133,8 @@ External services currently expected:
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
   - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
+- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-general`) — the only chain endpoint with image input enabled. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`.
+- **docproc web queue**: PDF → markdown conversion, HTTP-only over loopback via `OCTAVIUS_DOCPROC_URL` (default `127.0.0.1:8210`). Octavius never imports the `docproc` package (see the sibling `docproc` repo) — `docproc_client.py` talks to `POST /api/jobs` / `GET /api/jobs/lookup`, mirroring the same queue `mcp-tools/server_documents.py` uses. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
 Configured MCP servers:
 
@@ -158,6 +160,7 @@ Configured MCP servers:
 WebSocket message families:
 
 - Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
+- Matrix media (client→server, same session/threading semantics as `text_input`): `image_input`, `file_input` — frozen contract, see `docs/ws-media-contract.md`. Both repos (`octavius`, `matrix-agent-sidecar`) implement against that doc.
 - Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
 - Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
@@ -193,6 +196,8 @@ Conversation and tool loop:
 - `local_tool_downloads.py` - local download filename logic and download tool execution
 - `local_tool_inbox.py` - local inbox save/read helpers used by tool handlers
 - `local_tool_reader.py` - local reader handoff and background PDF-processing helpers
+- `local_tool_documents.py` - `check_document_status` local tool (polls a docproc job by id)
+- `docproc_client.py` - loopback HTTP client for the docproc web queue (submit/poll a PDF conversion job); Octavius never imports the `docproc` package
 
 Reader pipeline:
 
@@ -239,6 +244,9 @@ Tests:
 - `tests/test_local_tool_registry.py`
 - `tests/test_local_tool_inbox.py`
 - `tests/test_subagent.py`
+- `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
+- `tests/test_docproc_client.py`
+- `tests/test_local_tool_documents.py`
 
 ## Feature Notes
 
@@ -301,6 +309,37 @@ Reader storage:
 
 - speech-ready JSON files: `/home/dave/octavius-reader/`
 - metadata: `reader_documents` table
+
+### Matrix media (image / PDF turns)
+
+The Matrix sidecar (`../matrix-agent-sidecar`) spools attachments to
+`/media/extra_stuff/octavius/matrix_media/` and sends `image_input` /
+`file_input` WS frames — see `docs/ws-media-contract.md` for the frozen
+wire contract both repos implement against.
+
+- **Images** (`image_input`): `websocket_session.handle_image_input`
+  base64-reads the spool file and builds an OpenAI-style multimodal content
+  array. The turn routes through `settings.vision_llm_chain` instead of the
+  default chain (see `agent.py`'s `use_vision` handling in
+  `stream_agent_turn`). Once the turn completes, the in-memory conversation's
+  image content is downgraded back to a text placeholder
+  (`Conversation.replace_last_user_content`) — later turns go back to the
+  default text chain. Persisted history and the memory extractor only ever
+  see the placeholder/caption text, never base64.
+- **PDFs** (`file_input`, `mime=application/pdf`): submitted to the docproc
+  web queue deterministically (plain code, not an LLM tool call) via
+  `docproc_client.py`. A non-empty caption is treated as instructions —
+  Octavius polls the job in a background task (bounded, doesn't block the WS
+  loop or other sessions) and then runs an agent turn with the instructions
+  plus the converted markdown (inlined under
+  `OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET`, else path + head excerpt). An empty
+  caption gets an immediate acknowledgement mentioning the docproc job id.
+  The `check_document_status` local tool lets the model check status / fetch
+  the markdown path for a job id later in the conversation.
+- **Non-PDF files** (`file_input`, other `mime`): a brief acknowledgement
+  turn only — Octavius can't process other file types yet.
+- Both flows record an `attachments` row (`type` `image`/`file`) against the
+  persisted user message.
 
 ### Conversation History
 
@@ -393,6 +432,7 @@ For current refactor notes, recent fixes, and change-oriented status, see `docs/
 
 - `README.md` - short setup and development commands
 - `docs/status.md` - current refactor notes, recent fixes, and active hotspots
+- `docs/ws-media-contract.md` - frozen WS media contract (`image_input`/`file_input`) shared with `matrix-agent-sidecar`
 - `octavius-prd.md` - broader product/design document
 - `octavius-android-design.md` - Android companion app design exploration
 
