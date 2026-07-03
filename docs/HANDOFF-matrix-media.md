@@ -1,7 +1,7 @@
 # HANDOFF — Matrix media (images + PDFs) for Octavius
 
-_Last updated 2026-07-02. Resume point for the media work spanning octavius +
-matrix-agent-sidecar. Contract: `docs/ws-media-contract.md`._
+_Last updated 2026-07-02 (evening). Resume point for the media work spanning
+octavius + matrix-agent-sidecar. Contract: `docs/ws-media-contract.md`._
 
 ## Where we are (all code DONE, nothing deployed yet)
 
@@ -33,36 +33,49 @@ frame fields cross-checked against octavius's parser.
   local tool; caption = instructions (bounded poll ~5 min) vs no caption = ack +
   ask what next.
 
-## Two design changes AGREED, not yet implemented
+## Two design changes — IMPLEMENTED 2026-07-02 evening (uncommitted; suite 267 green)
 
-1. **PDF transport swap (docproc REST client is a dead end).** Discovery:
-   `:8201/:8251` hosts DIFFERENT MCP servers per machine — triplestuffed = evangeline
-   (email), **lilripper = Document Processing** (`http://lilripper:8251/mcp`, live,
-   tailnet-reachable via Caddy). The `:8210` docproc-web REST API octavius targets is
-   loopback-only on lilripper AND takes lilripper-local `source_path` (no upload) —
-   unusable from triplestuffed. **Fix:** use
-   `mcp-tools/server_documents_wrapper.py` (stdio MCP, built for exactly this):
-   scp-uploads PDF to lilripper, calls `convert_pdf_to_md` at lilripper:8251,
-   downloads .md/meta back to LOCAL paths. Async: `convert_pdf_to_md` → job id,
-   `get_conversion_result(job_id)` polls. Octavius's `mcp_manager` already supports
-   stdio + programmatic `call_tool`. Plan: register wrapper in `.mcp.json`
-   (command = `mcp-tools/.venv/bin/python server_documents_wrapper.py`, cwd
-   mcp-tools), rewrite `docproc_client.py` to those two calls, repoint
-   `check_document_status`, drop/repurpose `OCTAVIUS_DOCPROC_URL`, update tests.
+1. **PDF transport swap — DONE.** Discovery that simplified the plan: octavius
+   ALREADY registers the mcp-tools documents wrapper as its stdio MCP server
+   `document-processing` (`settings.py` `DEFAULT_MCP_SERVERS` →
+   `server_documents_voice_wrapper.py`; scp to lilripper → convert at
+   `lilripper:8251/mcp` → download .md/meta back to LOCAL paths). No new
+   registration needed. `docproc_client.py` rewritten (Codex lane): drives
+   `convert_pdf_to_md` / `get_conversion_result` via `MCPManager.call_tool`;
+   parses job id / md+meta paths / stage / failure texts; caches terminal
+   outcomes (the wrapper deletes a job record on first terminal retrieval) —
+   but deliberately does NOT cache poll timeouts or transport-error strings
+   (possibly transient), and `submit_job` evicts a stale cache entry when the
+   wrapper's per-process id counter reuses an id after a restart. New
+   signatures take the MCP manager: `submit_job(mcp, path) -> job_id: str`,
+   `poll_job(mcp, job_id) -> dict`, `get_job_status(mcp, job_id) -> dict`.
+   `check_document_status` now uses its `_mcp_manager` arg;
+   `websocket_session.py` call sites pass `self.state.mcp_manager`.
+   `docproc_url`/`OCTAVIUS_DOCPROC_URL` removed; poll/inline/excerpt knobs
+   stay. Smoke-verified: MCPManager spawns the wrapper and registers both
+   tools. NOTE: the voice wrapper locks conversion to *reading* mode (no
+   images/tables in the .md); point the registration at
+   `server_documents_wrapper.py` instead if full mode is ever wanted.
 
-2. **Vision-chain stickiness per thread (Dave's ask).** Current: only the
-   image-bearing turn uses 8010; conversation reverts to 8020 after. Wanted: once a
-   thread receives an image, the REST OF THAT THREAD stays on the vision chain and
-   keeps the image content-array in the in-memory conversation so follow-up turns
-   can reference the image. Design sketch: conversation-level `has_images` flag →
-   chain selection; keep content arrays in memory (llama.cpp prefix cache absorbs
-   re-sent image tokens); persisted history still stores placeholders (trust
-   boundary unchanged). Wrinkle to decide at implementation: after idle-drop +
-   thread re-attach, history reload yields placeholders only — optionally
-   re-hydrate the content array from the spool path (file persists on disk;
-   store path in the attachments table or parse from placeholder), else the
-   reloaded thread degrades to text + placeholder. Recommend: re-hydrate if the
-   spool file still exists, silently degrade otherwise.
+2. **Vision-chain stickiness per thread — DONE (Sonnet lane).**
+   `Conversation.has_images` (set by `add_user` on list content, cleared by
+   `reset()`); `stream_agent_turn` routes on `conversation.has_images`, so
+   after the first image the WHOLE thread stays on the vision chain; the
+   post-turn `_downgrade()` mechanism is removed — content arrays stay in the
+   in-memory conversation (bounded by `trim()`; llama.cpp prefix cache
+   absorbs re-sent image tokens). Re-attach re-hydration:
+   `history_store.get_conversation_messages` now returns
+   `message["attachments"]`; `Conversation.load_from_history` re-hydrates the
+   **3 most recent** image attachments (`MAX_REHYDRATED_IMAGES`) from the
+   spool file when it still exists (base64, mime from extension), silently
+   degrades to the placeholder otherwise, and sets `has_images` only on a
+   successful rehydrate. Persisted history / memory extractor still only ever
+   see text placeholders — trust boundary unchanged.
+
+Also fixed in passing: `tests/test_websocket_session.py`'s
+`test_poll_failure_still_runs_a_turn_reporting_the_error` never executed its
+coroutine (missing `asyncio.run`), and its neighbour ran twice. Docs updated:
+`CLAUDE.md` (vision + PDF bullets), `docs/ws-media-contract.md` impl notes.
 
 ## Deployment checklist (Dave, mostly root)
 

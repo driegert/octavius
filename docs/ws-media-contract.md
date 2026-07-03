@@ -34,16 +34,24 @@ recorded here for context)
   `image/`, base64-reads the spool file, and builds an OpenAI-style
   multimodal content array for the turn. The turn is routed through
   `settings.vision_llm_chain` (see `agent.py`'s `use_vision` handling in
-  `stream_agent_turn`) instead of the default `llm_chain`. Once the turn
-  completes, the in-memory conversation's image content is downgraded back
-  to a text placeholder (`Conversation.replace_last_user_content`) — see the
-  history-representation note in the `feat/matrix-media` commit history for
-  why. Persisted history and the memory extractor only ever see the
-  placeholder/caption text, never base64.
+  `stream_agent_turn`) instead of the default `llm_chain`. Vision routing is
+  STICKY per thread: once a conversation has carried an image
+  (`Conversation.has_images`), the rest of that thread stays on the vision
+  chain and the image content array stays in the in-memory conversation so
+  follow-up turns can still reference the image (payload growth bounded by
+  the normal trim window; llama.cpp's prefix cache absorbs re-sent image
+  tokens). On thread re-attach after an idle drop, image turns are
+  re-hydrated from the spool file recorded in the `attachments` table when
+  the file still exists (most recent few only), else they silently degrade
+  to the text placeholder. Persisted history and the memory extractor only
+  ever see the placeholder/caption text, never base64.
 - `file_input` with `mime=application/pdf` -> `WebSocketSessionHandler.handle_file_input`
-  deterministically (plain code, not an LLM tool call) submits the PDF to
-  the docproc queue over loopback HTTP (`docproc_client.py`, see
-  `OCTAVIUS_DOCPROC_URL`). If the caption is non-empty it's treated as
+  deterministically (plain code, not an LLM tool call) submits the PDF via
+  the already-registered `document-processing` MCP server (`docproc_client.py`
+  drives `convert_pdf_to_md` / `get_conversion_result` through
+  `MCPManager.call_tool`; the mcp-tools wrapper scp-uploads to lilripper,
+  converts remotely, and downloads the .md back to local paths). If the
+  caption is non-empty it's treated as
   instructions: Octavius polls for completion in a background task (bounded,
   does not block the WS loop or other sessions) and then runs an agent turn
   with the instructions plus the converted markdown (inlined if it fits

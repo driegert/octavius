@@ -44,6 +44,22 @@ class _FakeChainClient:
         yield _FakeResp(self._lines)
 
 
+class _FakeMultiReplyChainClient:
+    """Like _FakeChainClient, but returns a different canned reply (a list of
+    SSE lines) on each successive call — for tests that drive multiple turns
+    through the same client and need distinguishable responses."""
+
+    def __init__(self, reply_lines_sequence: list[list[str]]):
+        self._replies = list(reply_lines_sequence)
+        self.payloads = []
+
+    @asynccontextmanager
+    async def stream_chat(self, payload):
+        self.payloads.append(copy.deepcopy(payload))
+        lines = self._replies.pop(0)
+        yield _FakeResp(lines)
+
+
 def _text_reply_lines(text: str) -> list[str]:
     import json
     return [
@@ -106,10 +122,10 @@ class ImageTurnUsesVisionChainTests(unittest.IsolatedAsyncioTestCase):
         sent_user_msg = next(m for m in sent_messages if m["role"] == "user")
         self.assertEqual(sent_user_msg["content"], content)
 
-    async def test_image_turn_downgrades_history_after_completion(self):
-        """History-representation choice: after the turn completes, the
-        in-memory conversation's image content array is swapped back for the
-        plain-text placeholder — see agent.py docstring / commit message."""
+    async def test_image_turn_content_array_persists_after_completion(self):
+        """Stickiness: after the turn completes, the in-memory conversation
+        keeps the image content array (no more downgrade-to-text) so a
+        follow-up turn can still see the image — see agent.py docstring."""
         vision_client = _FakeChainClient(_text_reply_lines("It's a cat."))
 
         conversation = Conversation()
@@ -123,14 +139,13 @@ class ImageTurnUsesVisionChainTests(unittest.IsolatedAsyncioTestCase):
 
         messages = conversation.get_messages()
         user_msg = next(m for m in messages if m["role"] == "user")
-        self.assertEqual(user_msg["content"], "[image: cat.png]")
-        self.assertIsInstance(user_msg["content"], str)
-        # No base64 leaks into what's left in conversation state.
-        self.assertNotIn("AAAA", str(messages))
+        self.assertEqual(user_msg["content"], content)
+        self.assertIsInstance(user_msg["content"], list)
+        self.assertTrue(conversation.has_images)
 
-    async def test_image_turn_downgrades_history_even_on_llm_failure(self):
-        """A failed vision call must not leave a base64 blob stuck in the
-        in-memory conversation for later turns."""
+    async def test_image_turn_content_array_persists_even_on_llm_failure(self):
+        """A failed vision call must not lose the image content array — the
+        turn still failed, but the thread should stay vision-sticky."""
         class _BoomClient:
             @asynccontextmanager
             async def stream_chat(self, payload):
@@ -148,7 +163,82 @@ class ImageTurnUsesVisionChainTests(unittest.IsolatedAsyncioTestCase):
 
         messages = conversation.get_messages()
         user_msg = next(m for m in messages if m["role"] == "user")
-        self.assertEqual(user_msg["content"], "[image: cat.png]")
+        self.assertEqual(user_msg["content"], content)
+        self.assertTrue(conversation.has_images)
+
+    async def test_followup_text_turn_after_image_stays_on_vision_chain(self):
+        """Once a thread has seen an image, a SUBSEQUENT text-only turn (no
+        ``user_content``) still routes through the vision chain and still
+        carries the earlier image content array in the outgoing payload."""
+        vision_client = _FakeMultiReplyChainClient([
+            _text_reply_lines("It's a cat."),
+            _text_reply_lines("The cat is orange."),
+        ])
+        text_client = _FakeChainClient([])
+
+        conversation = Conversation()
+        content = self._content()
+        with patch.object(agent, "llm_client", text_client), \
+             patch.object(agent, "vision_llm_client", vision_client):
+            async for _ in agent.stream_agent_turn(
+                conversation, _FakeMCP(), "[image: cat.png]", user_content=content,
+            ):
+                pass
+
+            chunks = []
+            async for chunk in agent.stream_agent_turn(
+                conversation, _FakeMCP(), "what color is it?",
+            ):
+                chunks.append(chunk)
+
+        self.assertEqual("".join(chunks).strip(), "The cat is orange.")
+        # Both turns went to the vision client; none to the text client.
+        self.assertEqual(len(vision_client.payloads), 2)
+        self.assertEqual(text_client.payloads, [])
+        self.assertEqual(
+            vision_client.payloads[1]["model"], settings.vision_llm_chain[0]["model"]
+        )
+
+        # The second request still carried the original image content array.
+        sent_messages = vision_client.payloads[1]["messages"]
+        user_msgs = [m for m in sent_messages if m["role"] == "user"]
+        self.assertEqual(user_msgs[0]["content"], content)
+        self.assertEqual(user_msgs[-1]["content"], "what color is it?")
+
+
+class _RecordingMCP(_FakeMCP):
+    """Captures the server-name sets the agent asks for tools from."""
+
+    def __init__(self):
+        self.requested_servers: list[list[str]] = []
+
+    def get_tools_for_servers(self, server_names):
+        self.requested_servers.append(list(server_names))
+        return []
+
+
+class MainAgentToolScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_main_agent_offers_web_reader_alongside_search(self):
+        text_client = _FakeChainClient(_text_reply_lines("Done."))
+        vision_client = _FakeChainClient([])
+        mcp = _RecordingMCP()
+
+        conversation = Conversation()
+        with patch.object(agent, "llm_client", text_client), \
+             patch.object(agent, "vision_llm_client", vision_client):
+            async for _ in agent.stream_agent_turn(conversation, mcp, "hello"):
+                pass
+
+        # The main agent scopes MCP tools to the web search/read + docproc
+        # servers; the specialist domains (email/research/tasks) stay behind
+        # consult_specialist and must not be offered directly.
+        self.assertTrue(mcp.requested_servers)
+        requested = mcp.requested_servers[0]
+        self.assertIn("web-reader", requested)
+        self.assertIn("searxng", requested)
+        self.assertIn("document-processing", requested)
+        for hidden in ("evangeline-email", "openalex", "vikunja-tasks"):
+            self.assertNotIn(hidden, requested)
 
 
 if __name__ == "__main__":

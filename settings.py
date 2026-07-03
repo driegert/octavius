@@ -75,9 +75,10 @@ class Settings:
     memory_service_url: str
     memory_read_timeout: int
     memory_write_timeout: int
-    # docproc web queue (PDF -> markdown), talked to over loopback HTTP only —
-    # Octavius never imports the docproc package, keeping the repos decoupled.
-    docproc_url: str
+    # PDF -> markdown conversion, driven through the already-registered
+    # "document-processing" MCP server (mcp-tools' documents wrapper: scp to
+    # lilripper, convert remotely, download the .md back to local paths).
+    # See docproc_client.py. Poll knobs pace docproc_client.poll_job.
     docproc_poll_interval: float
     docproc_poll_timeout: float
     # Char budget for inlining converted markdown directly into an agent turn
@@ -184,6 +185,7 @@ DEFAULT_TOOL_LABELS = {
     "process_pdf": "Processing PDF",
     "consult_specialist": "Consulting Specialist",
     "hybrid_search": "Email Search",
+    "read_url": "Reading Web Page",
 }
 
 
@@ -212,6 +214,18 @@ DEFAULT_MCP_SERVERS = {
             "how-to, definitions, current events). Do NOT use for academic "
             "papers, journal articles, citations, authors, or scholarly "
             "research — those ALWAYS go to consult_specialist(domain=\"research\")."
+        ),
+    },
+    "web-reader": {
+        "transport": "http",
+        # Crawl4AI markdown reader (mcp-tools' server_reader.py) — the "read"
+        # half of the search -> read -> reason pipeline. Same deployed instance
+        # the pi agents use (Caddy on lilripper -> localhost Crawl4AI).
+        "url": "http://lilripper:8254/mcp",
+        "tool_description_suffix": (
+            " | Use AFTER a web search to read the full content of a specific "
+            "result URL, or whenever a search snippet isn't enough. Read one "
+            "page at a time; don't bulk-read results."
         ),
     },
     "openalex": {
@@ -295,6 +309,10 @@ You have access to tools:
   product info, how-to, definitions, current events. NEVER use web search
   for academic papers, journal articles, citations, authors, or scholarly
   research; those ALWAYS go through consult_specialist(domain="research").
+- Web page reading via read_url — fetch a specific URL and get its clean
+  content. Use this AFTER a web search to read a promising result, or when
+  Dave gives you a URL, whenever a search snippet isn't enough to answer.
+  Read one page at a time; don't bulk-read every result.
 - consult_specialist for email, research, and task management. This hands off
   to a scoped specialist assistant and returns its answer to you in the SAME
   turn. Use it when Dave asks about:
@@ -446,7 +464,6 @@ def load_settings() -> Settings:
         memory_read_timeout=_env_int("OCTAVIUS_MEMORY_READ_TIMEOUT", 10),
         # Writes run the extractor LLM + synthesis on the service synchronously.
         memory_write_timeout=_env_int("OCTAVIUS_MEMORY_WRITE_TIMEOUT", 120),
-        docproc_url=_env_str("OCTAVIUS_DOCPROC_URL", "http://127.0.0.1:8210"),
         docproc_poll_interval=_env_float("OCTAVIUS_DOCPROC_POLL_INTERVAL", 3.0),
         docproc_poll_timeout=_env_float("OCTAVIUS_DOCPROC_POLL_TIMEOUT", 300.0),
         docproc_inline_char_budget=_env_int("OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET", 20000),

@@ -1,6 +1,18 @@
+import base64
+import logging
+import mimetypes
 from datetime import datetime
+from pathlib import Path
 
 from settings import settings
+
+log = logging.getLogger(__name__)
+
+# Cap on how many of the most recent image attachments get rehydrated back
+# into base64 content arrays when restoring a conversation from history (see
+# load_from_history). Keeps the first payload of a re-attached, image-heavy
+# thread bounded; older images stay as plain-text placeholders.
+MAX_REHYDRATED_IMAGES = 3
 
 
 def _build_system_prompt() -> str:
@@ -11,27 +23,29 @@ def _build_system_prompt() -> str:
 class Conversation:
     def __init__(self):
         self._messages: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
+        self.has_images = False
 
     def add_user(self, content: str | list[dict]):
         """Add a user turn. ``content`` is normally plain text, but may be an
         OpenAI-style content array (``[{"type": "text", ...}, {"type":
-        "image_url", ...}]``) for a multimodal (image) turn. Multimodal
-        content is expected to be downgraded back to text via
-        ``replace_last_user_content`` once the turn completes — see
-        agent.py's ``use_vision`` handling in ``stream_agent_turn``.
+        "image_url", ...}]``) for a multimodal (image) turn. When ``content``
+        is a list, ``has_images`` is set True and stays True for the rest of
+        the thread (until ``reset()``): once a thread has seen an image, it
+        stays on the vision chain and keeps the image content array in
+        memory — see agent.py's ``use_vision`` handling in
+        ``stream_agent_turn``.
         """
+        if isinstance(content, list):
+            self.has_images = True
         self._messages.append({"role": "user", "content": content})
 
     def replace_last_user_content(self, text: str) -> None:
-        """Downgrade the most recent user message's content to plain text.
+        """Replace the most recent user message's content with plain text.
 
-        Used after a multimodal (image) turn finishes: the content array
-        (which holds a base64 data URL) is swapped for a short text
-        placeholder. This keeps later turns on the default text-only chain
-        (the simpler of the two documented options — see agent.py), keeps
-        conversation payloads from growing unbounded with inline image
-        bytes, and ensures only text ever reaches persisted history / the
-        memory extractor's trust boundary.
+        Not called automatically anymore — image-bearing turns now keep
+        their content array in memory for the life of the thread (see
+        ``add_user``). Kept as a utility for callers that need to swap a
+        message's content out explicitly (e.g. a rollback path).
         """
         for message in reversed(self._messages):
             if message.get("role") == "user":
@@ -76,18 +90,75 @@ class Conversation:
 
     def reset(self):
         self._messages = [{"role": "system", "content": _build_system_prompt()}]
+        self.has_images = False
 
     def load_from_history(self, messages: list[dict]):
         """Restore conversation state from history DB messages.
 
-        Accepts the format returned by history.get_conversation_messages().
+        Accepts the format returned by history_store.get_conversation_messages().
         Skips tool-role messages (they were part of the agent loop, the LLM
         doesn't need them to continue the conversation).
+
+        User messages carrying an image attachment (``message["attachments"]``,
+        see history_store.get_conversation_messages) are rehydrated back into
+        an OpenAI-style multimodal content array by reading the spooled image
+        file off disk and base64-encoding it, so a re-attached thread doesn't
+        forget an image it already saw. Only the ``MAX_REHYDRATED_IMAGES``
+        most recent image attachments in the window are rehydrated — older
+        ones stay as their plain-text placeholder. A missing file, read
+        error, or non-image mime type degrades silently back to the
+        placeholder text (logged at debug level only; message bodies/captions
+        are never logged). ``has_images`` is set True only when at least one
+        rehydration actually succeeds.
         """
         self._messages = [{"role": "system", "content": _build_system_prompt()}]
-        for msg in messages:
+        self.has_images = False
+
+        image_message_indices = [
+            i for i, msg in enumerate(messages)
+            if msg.get("role") == "user"
+            and any(a.get("type") == "image" for a in (msg.get("attachments") or []))
+        ]
+        rehydrate_indices = set(image_message_indices[-MAX_REHYDRATED_IMAGES:])
+
+        for i, msg in enumerate(messages):
             role = msg.get("role")
             content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                self._messages.append({"role": role, "content": content})
+            if role not in ("user", "assistant") or not content:
+                continue
+            if role == "user" and i in rehydrate_indices:
+                content = self._rehydrate_image_content(content, msg.get("attachments") or [])
+            self._messages.append({"role": role, "content": content})
         self.trim()
+
+    def _rehydrate_image_content(self, text: str, attachments: list[dict]):
+        """Best-effort: turn a text placeholder + image attachment row back
+        into a multimodal content array. Returns ``text`` unchanged on any
+        failure (missing file, unreadable, non-image mime)."""
+        image_attachment = next(
+            (a for a in attachments if a.get("type") == "image"), None
+        )
+        if image_attachment is None:
+            return text
+        reference = image_attachment.get("reference")
+        try:
+            path = Path(reference)
+            mime, _ = mimetypes.guess_type(reference)
+            if not mime or not mime.startswith("image/"):
+                return text
+            if not path.exists():
+                return text
+            data = path.read_bytes()
+        except (OSError, TypeError, ValueError):
+            log.debug(
+                "Failed to rehydrate image attachment during history re-attach",
+                exc_info=True,
+            )
+            return text
+
+        b64 = base64.b64encode(data).decode("ascii")
+        self.has_images = True
+        return [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ]

@@ -892,12 +892,12 @@ class FileInputTests(unittest.TestCase):
                 f.flush()
                 with patch(
                     "websocket_session.docproc_client.submit_job",
-                    new=AsyncMock(return_value={"id": "job-123", "status": "queued"}),
+                    new=AsyncMock(return_value="job-123"),
                 ) as submit:
                     await handler.handle_file_input(
                         {"text": "", "path": f.name, "mime": "application/pdf", "filename": "paper.pdf"}
                     )
-                    submit.assert_called_once_with(f.name)
+                    submit.assert_called_once_with(handler.state.mcp_manager, f.name)
 
             self.assertIn("job-123", captured["instruction"])
             self.assertIn("paper.pdf", captured["instruction"])
@@ -924,7 +924,7 @@ class FileInputTests(unittest.TestCase):
                 with (
                     patch(
                         "websocket_session.docproc_client.submit_job",
-                        new=AsyncMock(return_value={"id": "job-456", "status": "queued"}),
+                        new=AsyncMock(return_value="job-456"),
                     ),
                     patch("websocket_session.asyncio.create_task", side_effect=fake_create_task),
                 ):
@@ -1047,6 +1047,8 @@ class AwaitPdfAndRunTests(unittest.TestCase):
             self.assertIn("failed to convert or timed out", instruction)
             self.assertIn("timed out after 300s", instruction)
 
+        asyncio.run(run())
+
     def test_disconnect_mid_poll_is_swallowed_not_raised(self):
         """A client that disconnects during the (potentially minutes-long)
         poll must not blow up the background task — mirrors
@@ -1063,8 +1065,6 @@ class AwaitPdfAndRunTests(unittest.TestCase):
             ):
                 # Must not raise.
                 await handler._await_pdf_and_run("job-4", "paper.pdf", "summarize")
-
-        asyncio.run(run())
 
         asyncio.run(run())
 

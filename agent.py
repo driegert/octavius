@@ -128,21 +128,23 @@ async def stream_agent_turn(
 
     ``user_content``, when provided, is an OpenAI-style multimodal content
     array (text + image_url parts) that becomes THIS turn's actual message
-    content, and routes the whole turn through ``settings.vision_llm_chain``
-    instead of the default chain. ``user_text`` still carries the turn's
+    content. Once a conversation has carried an image (this turn's
+    ``user_content``, or a prior turn's — see ``Conversation.has_images``),
+    the WHOLE thread stays routed through ``settings.vision_llm_chain`` /
+    ``vision_llm_client`` instead of the default chain, and the image
+    content array is kept in memory (not downgraded back to text) so
+    follow-up turns still see it — llama.cpp's prefix cache absorbs the
+    re-sent image tokens, and payload growth stays bounded by
+    ``Conversation.trim()``. ``user_text`` still carries the turn's
     plain-text representation throughout (memory queries, status labels,
-    persisted history) and is swapped back in as the message content once
-    the turn finishes — see ``Conversation.replace_last_user_content``.
-    Text-only turns (the overwhelming majority) are unaffected: with
-    ``user_content=None`` this function's behavior is unchanged from before.
+    persisted history) regardless of routing — content arrays are never
+    threaded into those paths. Threads that never see an image are
+    unaffected: with ``user_content=None`` and no prior image, behavior is
+    unchanged from before.
     """
-    use_vision = user_content is not None
-    conversation.add_user(user_content if use_vision else user_text)
+    conversation.add_user(user_content if user_content is not None else user_text)
+    use_vision = conversation.has_images
     conversation.trim()
-
-    def _downgrade():
-        if use_vision:
-            conversation.replace_last_user_content(user_text)
 
     # --- Long-term memory injection (Step 4) ---------------------------------
     # Built once per turn, folded into messages[0] ONLY below — never persisted,
@@ -192,7 +194,7 @@ async def stream_agent_turn(
         # Only offer core MCP tools + local tools. Specialist domains (email,
         # research, tasks) are handled by the scoped subagent, invoked inline
         # via the consult_specialist local tool.
-        all_tools = mcp.get_tools_for_servers(["searxng", "document-processing"]) + local_tools.TOOLS
+        all_tools = mcp.get_tools_for_servers(["searxng", "web-reader", "document-processing"]) + local_tools.TOOLS
         if all_tools:
             payload["tools"] = all_tools
 
@@ -277,7 +279,6 @@ async def stream_agent_turn(
 
         except Exception as e:
             log.exception("LLM request failed")
-            _downgrade()
             yield f"I'm having trouble reaching my brain right now. Error: {e}"
             return
 
@@ -378,11 +379,9 @@ async def stream_agent_turn(
             yield clean
 
         conversation.add_assistant(clean)
-        _downgrade()
         return
 
     # Safety limit reached (shouldn't happen since last round has no tools)
     fallback = "I ran into a limit on how many tool calls I can make. Could you try rephrasing your request?"
     conversation.add_assistant(fallback)
-    _downgrade()
     yield fallback

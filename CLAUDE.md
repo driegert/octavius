@@ -73,7 +73,7 @@ High-level path:
 ```text
 Browser (WebSocket) -> FastAPI app -> main agent (streaming, ~11 core tools)
                                         │
-                                        ├─ direct: web search, stash, reader, PDF, download
+                                        ├─ direct: web search, web page read, stash, reader, PDF, download
                                         │
                                         └─ consult_specialist(domain, task) → subagent
                                              (non-streaming, scoped tools, runs INLINE)
@@ -133,13 +133,14 @@ External services currently expected:
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
   - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
-- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-general`) — the only chain endpoint with image input enabled. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`.
-- **docproc web queue**: PDF → markdown conversion, HTTP-only over loopback via `OCTAVIUS_DOCPROC_URL` (default `127.0.0.1:8210`). Octavius never imports the `docproc` package (see the sibling `docproc` repo) — `docproc_client.py` talks to `POST /api/jobs` / `GET /api/jobs/lookup`, mirroring the same queue `mcp-tools/server_documents.py` uses. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
+- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-general`) — the only chain endpoint with image input enabled. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
+- **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
 Configured MCP servers:
 
 - `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
 - `searxng`: stdio subprocess via `uv`
+- `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `searxng`), not behind a specialist.
 - `openalex`: stdio subprocess via `npm`
 - `vikunja-tasks`: streamable HTTP at `triplestuffed:8252/mcp`
 - `document-processing`: local stdio wrapper around remote processing on `lilripper:8251/mcp`

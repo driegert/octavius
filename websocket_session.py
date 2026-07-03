@@ -357,8 +357,11 @@ class WebSocketSessionHandler:
         See docs/ws-media-contract.md. The sidecar has already spooled the
         file to disk and enforced the size cap — we only validate the path
         exists and the mime looks like an image, then build an OpenAI-style
-        multimodal content array and route this turn through the vision
+        multimodal content array and route the turn through the vision
         chain (agent.py's `use_vision` handling in `stream_agent_turn`).
+        Vision routing is sticky: once a thread has carried an image
+        (`Conversation.has_images`), its follow-up turns stay on the vision
+        chain and the content array stays in the in-memory conversation.
         Unknown/extra frame fields are ignored by construction (we only read
         the keys we know about).
         """
@@ -389,9 +392,9 @@ class WebSocketSessionHandler:
         # Text part sent to the vision model for THIS turn.
         vision_text = caption or f"The user sent an image: {filename}"
         # Text representation used everywhere else: transcript display,
-        # persisted history, memory queries, and what the in-memory
-        # conversation downgrades back to once the turn completes. Never
-        # base64 — see agent.py's stream_agent_turn / memory trust boundary.
+        # persisted history, and memory queries. Never base64 — the content
+        # array lives only in the in-memory conversation (see agent.py's
+        # stream_agent_turn / memory trust boundary).
         placeholder_text = f"[image: {filename}]" + (f" {caption}" if caption else "")
         content = [
             {"type": "text", "text": vision_text},
@@ -448,7 +451,7 @@ class WebSocketSessionHandler:
         run the caption as instructions once conversion completes.
         """
         try:
-            job = await docproc_client.submit_job(path)
+            job_id = await docproc_client.submit_job(self.state.mcp_manager, path)
         except Exception as exc:
             log.exception("docproc submission failed for %s", path)
             instruction = (
@@ -462,7 +465,6 @@ class WebSocketSessionHandler:
             )
             return
 
-        job_id = job.get("id")
         log.info("Submitted PDF %s to docproc: job %s (caption=%r)", path, job_id, bool(caption))
 
         if caption:
@@ -506,7 +508,7 @@ class WebSocketSessionHandler:
 
     async def _await_pdf_and_run_unguarded(self, job_id: str, filename: str, caption: str) -> None:
         try:
-            row = await docproc_client.poll_job(job_id)
+            row = await docproc_client.poll_job(self.state.mcp_manager, job_id)
         except docproc_client.DocprocError as exc:
             log.warning("docproc job %s did not complete: %s", job_id, exc)
             instruction = (

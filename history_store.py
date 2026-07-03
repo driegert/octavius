@@ -170,6 +170,22 @@ def get_conversation_messages(conn: sqlite3.Connection, conversation_id: int) ->
                 }
                 for tool_row in tool_rows
             ]
+
+        attachment_rows = conn.execute(
+            """SELECT type, reference, title
+               FROM attachments WHERE message_id = ?""",
+            (row[0],),
+        ).fetchall()
+        if attachment_rows:
+            message["attachments"] = [
+                {
+                    "type": att_row[0],
+                    "reference": att_row[1],
+                    "title": att_row[2],
+                }
+                for att_row in attachment_rows
+            ]
+
         messages.append(message)
     return messages
 

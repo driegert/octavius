@@ -1,6 +1,6 @@
-"""Local tool: check on a PDF submitted to the docproc queue.
+"""Local tool: check on a PDF submitted for document processing.
 
-Companion to the deterministic file_input -> docproc submission handled in
+Companion to the deterministic file_input -> MCP submission handled in
 websocket_session.py (see docs/ws-media-contract.md). That handler always
 mentions the docproc job_id in the turn it generates, so the model can pass
 it back here later when Dave asks "is that PDF ready yet?" or similar.
@@ -22,9 +22,11 @@ async def check_document_status(args: dict, _session=None, _mcp_manager=None) ->
     job_id = (args.get("job_id") or "").strip()
     if not job_id:
         return "Error: job_id is required."
+    if _mcp_manager is None:
+        return "Error checking document status: document-processing MCP manager is unavailable."
 
     try:
-        row = await docproc_client.get_job_status(job_id)
+        row = await docproc_client.get_job_status(_mcp_manager, job_id)
     except Exception as exc:
         log.exception("check_document_status failed for job %s", job_id)
         return f"Error checking document status: {exc}"
@@ -47,8 +49,13 @@ async def check_document_status(args: dict, _session=None, _mcp_manager=None) ->
                 lines.append(f"Excerpt:\n{excerpt}")
         return "\n".join(lines)
 
-    if status in ("error", "canceled"):
-        return f"Document conversion {status} (job {job_id}): {row.get('error_msg') or 'no error message'}"
+    if status == "error":
+        return f"Document conversion failed (job {job_id}): {row.get('error_msg') or 'no error message'}"
 
-    # 'queued' or 'running'
+    if status == "running":
+        stage = row.get("stage")
+        if stage:
+            return f"Document conversion still in progress (job {job_id}; stage: {stage})."
+        return f"Document conversion still in progress (job {job_id})."
+
     return f"Document conversion still {status} (job {job_id})."

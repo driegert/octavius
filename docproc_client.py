@@ -1,96 +1,132 @@
-"""HTTP client for the docproc web queue (PDF -> markdown conversion).
+"""MCP client for PDF -> markdown conversion.
 
-Octavius talks to docproc purely over loopback HTTP (POST /api/jobs, GET
-/api/jobs/lookup) and never imports the docproc package — the two repos stay
-decoupled. The wire shape mirrors what docproc's own MCP wrapper
-(mcp-tools/server_documents.py, `_convert_via_queue` / `submit_pdf_batch` /
-`get_jobs_status`) already speaks against the same queue, so this client is a
-minimal reimplementation of that same contract for Octavius's own use. See
-docs/ws-media-contract.md for the WS side that triggers this.
+Octavius submits PDFs through its configured ``document-processing`` MCP server,
+whose stdio wrapper lives at
+``/home/dave/git_repos/mcp-tools/.venv/bin/python server_documents_voice_wrapper.py``.
+That wrapper uploads PDFs to lilripper for conversion and returns LOCAL markdown
+and metadata paths back to Octavius when conversion completes.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
+import re
 import time
-
-import httpx
 
 from settings import settings
 
-log = logging.getLogger(__name__)
+_JOB_ID_RE = re.compile(r"Job ID:\s*(\S+)")
+_TEXT_FILE_RE = re.compile(r"Text file:\s*(.+)")
+_META_FILE_RE = re.compile(r"Metadata \(JSON\):\s*(.+)")
+_STAGE_RE = re.compile(r"still in progress\. Current stage:\s*(.+?)\.", re.IGNORECASE | re.DOTALL)
 
-_TERMINAL_FAILED = ("error", "canceled")
+_completed: dict[str, dict] = {}
 
 
 class DocprocError(RuntimeError):
-    """Raised when a docproc submission or poll fails terminally (error,
-    canceled, unknown job id, or timeout)."""
+    """Terminal failure: submission rejected, conversion failed, unknown job, or timeout."""
 
 
-async def submit_job(source_path: str, mode: str = "full", caller: str = "octavius") -> dict:
-    """POST /api/jobs — submit a PDF for conversion.
-
-    Returns the job dict as created (has at least ``id`` and ``status``).
-    Raises on connection failure or a non-2xx response.
-    """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(
-            f"{settings.docproc_url}/api/jobs",
-            json={"source_path": source_path, "mode": mode, "caller": caller},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def get_job_status(job_id: str) -> dict:
-    """GET /api/jobs/lookup?ids=<job_id> — fetch current status for one job.
-
-    Returns ``{"id": job_id, "status": "unknown"}`` if the queue has no
-    record of it (typo'd id, expired data) rather than raising, mirroring
-    docproc's own `get_jobs_status` MCP tool behavior for unknown ids.
-    """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            f"{settings.docproc_url}/api/jobs/lookup",
-            params={"ids": job_id},
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows:
-            return {"id": job_id, "status": "unknown"}
-        return rows[0]
+async def submit_job(mcp, source_path: str) -> str:
+    """Start a conversion and return the parsed MCP job id."""
+    text = await mcp.call_tool("convert_pdf_to_md", {"file_path": source_path})
+    match = _JOB_ID_RE.search(str(text))
+    if not match:
+        raise DocprocError(str(text))
+    job_id = match.group(1)
+    # The wrapper's job ids are a per-process counter; if its stdio process
+    # restarted, a fresh job can reuse an id we already cached a terminal
+    # outcome for. Evict so status probes reflect the new job.
+    _completed.pop(job_id, None)
+    return job_id
 
 
-async def poll_job(job_id: str, *, interval: float | None = None, timeout: float | None = None) -> dict:
-    """Poll a docproc job until it reaches 'done' or the timeout elapses.
-
-    Async (uses asyncio.sleep via caller's event loop is NOT required here —
-    we sleep with time.sleep-free asyncio.sleep) and safe to run as a
-    background task without blocking the WS event loop or other sessions.
-
-    Returns the final job dict on 'done'. Raises DocprocError on 'error',
-    'canceled', 'unknown', or timeout.
-    """
+async def poll_job(
+    mcp,
+    job_id: str,
+    *,
+    interval: float | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """Poll get_conversion_result until terminal success/failure or timeout."""
     interval = settings.docproc_poll_interval if interval is None else interval
     timeout = settings.docproc_poll_timeout if timeout is None else timeout
-    deadline = time.monotonic() + timeout
+    start = time.monotonic()
 
     while True:
-        row = await get_job_status(job_id)
-        status = row.get("status")
+        text = str(await mcp.call_tool("get_conversion_result", {"job_id": job_id}))
+        row = _classify_result_text(job_id, text, cache_terminal=True)
+        status = row["status"]
+
         if status == "done":
             return row
-        if status in _TERMINAL_FAILED:
-            raise DocprocError(
-                f"docproc job {job_id} ended in status {status}: "
-                f"{row.get('error_msg') or '(no error message)'}"
-            )
-        if status == "unknown":
-            raise DocprocError(f"docproc job {job_id} not found (status=unknown)")
-        if time.monotonic() > deadline:
-            raise DocprocError(
-                f"docproc job {job_id} timed out after {timeout:.0f}s (status={status})"
-            )
+        if status in ("error", "unknown"):
+            raise DocprocError(row.get("error_msg") or text)
+
+        if time.monotonic() - start >= timeout:
+            # Deliberately NOT cached: the wrapper may still finish the job,
+            # so a later get_job_status probe should ask it live.
+            raise DocprocError(f"docproc job {job_id} timed out after {timeout:.0f}s")
+
         await asyncio.sleep(interval)
+
+
+async def get_job_status(mcp, job_id: str) -> dict:
+    """Probe one conversion job, using cached terminal outcomes when available."""
+    if job_id in _completed:
+        return _completed[job_id]
+
+    text = str(await mcp.call_tool("get_conversion_result", {"job_id": job_id}))
+    return _classify_result_text(job_id, text, cache_terminal=True)
+
+
+def _classify_result_text(job_id: str, text: str, *, cache_terminal: bool) -> dict:
+    if _is_done(text):
+        row = {
+            "id": job_id,
+            "status": "done",
+            "result_md_path": _first_match(_TEXT_FILE_RE, text),
+            "result_meta_path": _first_match(_META_FILE_RE, text),
+            "result_text": text,
+        }
+        if cache_terminal:
+            _completed[job_id] = row
+        return row
+
+    if text.startswith("Conversion failed:"):
+        return _cache_error(job_id, text, cache_terminal=cache_terminal)
+
+    if text.startswith("Unknown job ID"):
+        row = {"id": job_id, "status": "unknown"}
+        if cache_terminal:
+            _completed[job_id] = row
+        return row
+
+    if text.startswith("Error"):
+        # Transport/server trouble (call_tool never raises — it returns
+        # "Error calling ..." / "Error: server ... not connected"). Possibly
+        # transient, so never cached: the job may still be alive.
+        return {"id": job_id, "status": "error", "error_msg": text}
+
+    stage_match = _STAGE_RE.search(text)
+    if stage_match:
+        return {"id": job_id, "status": "running", "stage": stage_match.group(1).strip()}
+
+    # Unrecognized text — report as an error but don't cache it as terminal.
+    return {"id": job_id, "status": "error", "error_msg": text}
+
+
+def _is_done(text: str) -> bool:
+    return "converted to markdown successfully" in text
+
+
+def _first_match(pattern: re.Pattern[str], text: str) -> str | None:
+    match = pattern.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _cache_error(job_id: str, text: str, *, cache_terminal: bool) -> dict:
+    row = {"id": job_id, "status": "error", "error_msg": text}
+    if cache_terminal:
+        _completed[job_id] = row
+    return row
