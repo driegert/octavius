@@ -207,7 +207,10 @@ DEFAULT_MCP_SERVERS = {
         ],
         "env": {
             "SEARX_HOST": "https://searxng.riegert.xyz",
-            "SSL_CERT_FILE": "/etc/ssl/cert.pem",
+            # Debian/Ubuntu system bundle (includes Caddy's local CA root).
+            # NOT /etc/ssl/cert.pem — that BSD/macOS path doesn't exist here,
+            # so it silently loaded no CA and every search failed TLS verify.
+            "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
         },
         "tool_description_suffix": (
             " | SCOPE: general web lookups only (news, recipes, product info, "
