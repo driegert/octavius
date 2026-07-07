@@ -20,6 +20,32 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Sentence-ending punctuation followed by space or end-of-string
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
+# Per-turn response-style directive, folded into the system message based on the
+# channel the turn arrived on (see `stream_agent_turn`'s `source`). The base
+# system prompt is channel-neutral; these tune length + formatting per turn.
+VOICE_STYLE = (
+    "[Channel: VOICE] Dave is speaking to you and your reply is read back aloud by "
+    "text-to-speech. Keep it short and conversational: lead with the direct answer in "
+    "a sentence or two and stop there. Only expand into detail, steps, or lists if Dave "
+    "explicitly asks for them. Never use markdown, bullet points, numbered lists, "
+    "headings, or code blocks — they get read out literally and sound wrong."
+)
+TEXT_STYLE = (
+    "[Channel: TEXT] Dave is typing to you (browser or Matrix) and reads your reply as "
+    "text on a screen. You may use light markdown (bold, short lists) where it genuinely "
+    "aids readability, and you can give a complete answer — but stay focused and skip "
+    "filler and needless preamble."
+)
+
+
+def _style_directive(source: str) -> str:
+    """Return the per-turn style directive for a turn's originating channel.
+
+    Only ``source == "voice"`` is spoken; every other channel (text, matrix,
+    image, file, inbox_chat) is read as text.
+    """
+    return VOICE_STYLE if source == "voice" else TEXT_STYLE
+
 # Thread-start episodic recall (Q1): non-authoritative "related past discussions".
 RECALL_DISTANCE_CUTOFF = 0.6
 RECALL_LIMIT = 2
@@ -101,12 +127,13 @@ async def run_agent_turn(
     history_session=None,
     session=None,
     user_content: list[dict] | None = None,
+    source: str = "voice",
 ) -> str:
     """Run one user turn (non-streaming). Returns full assistant text."""
     result_parts = []
     async for chunk in stream_agent_turn(
         conversation, mcp, user_text, status_callback, history_session, session,
-        user_content=user_content,
+        user_content=user_content, source=source,
     ):
         result_parts.append(chunk)
     return "".join(result_parts)
@@ -120,6 +147,7 @@ async def stream_agent_turn(
     history_session=None,
     session=None,
     user_content: list[dict] | None = None,
+    source: str = "voice",
 ) -> AsyncGenerator[str, None]:
     """Run one user turn, yielding sentence chunks as the LLM streams them.
 
@@ -167,12 +195,16 @@ async def stream_agent_turn(
     for round_num in range(settings.max_tool_rounds):
         messages = conversation.get_messages()
 
-        # Fold memory into the system message (index 0). Qwen requires system only
-        # at the start, so we rebuild messages[0] rather than insert mid-list.
-        if memory_block and messages and messages[0].get("role") == "system":
+        # Fold the per-turn style directive (channel-dependent) and any memory
+        # into the system message (index 0). Qwen requires system only at the
+        # start, so we rebuild messages[0] rather than insert mid-list.
+        suffix = _style_directive(source)
+        if memory_block:
+            suffix += "\n\n" + memory_block
+        if messages and messages[0].get("role") == "system":
             messages = [
                 {"role": "system",
-                 "content": messages[0]["content"] + "\n\n" + memory_block}
+                 "content": messages[0]["content"] + "\n\n" + suffix}
             ] + messages[1:]
 
         # On later rounds, nudge the LLM to wrap up instead of spiraling.

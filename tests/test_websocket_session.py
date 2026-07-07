@@ -1083,8 +1083,10 @@ class RunTurnMediaTests(unittest.TestCase):
             captured = {}
 
             async def fake_stream(conversation, mcp, user_text, status_callback=None,
-                                   history_session=None, session=None, user_content=None):
+                                   history_session=None, session=None, user_content=None,
+                                   source="voice"):
                 captured["user_content"] = user_content
+                captured["source"] = source
                 yield "It's a cat."
 
             with patch("agent.stream_agent_turn", side_effect=fake_stream):
@@ -1095,6 +1097,7 @@ class RunTurnMediaTests(unittest.TestCase):
                 )
 
             self.assertIsNotNone(captured["user_content"])
+            self.assertEqual(captured["source"], "image")
             hs = handler.state.history_session
             self.assertEqual(len(hs.attachments), 1)
             self.assertEqual(hs.attachments[0], {

@@ -39,6 +39,21 @@ class SpeechifyTests(unittest.TestCase):
         self.assertEqual(speechify("that is *really* important"), "that is really important")
         self.assertEqual(speechify("that is _really_ important"), "that is really important")
 
+    def test_strips_orphan_bold_from_split_span(self):
+        # A bold span split across streamed sentences leaves a dangling "**".
+        self.assertEqual(speechify("**Here is a summary"), "Here is a summary")
+        self.assertEqual(speechify("** More details follow."), "More details follow.")
+        self.assertEqual(speechify("the end is **"), "the end is")
+
+    def test_strips_orphan_single_asterisk_at_word_edge(self):
+        self.assertEqual(speechify("*first point"), "first point")
+        self.assertEqual(speechify("last point*"), "last point")
+
+    def test_preserves_multiplication_asterisks(self):
+        # Lone asterisks that don't hug a word edge are arithmetic, not markup.
+        self.assertEqual(speechify("compute 3 * 4 exactly"), "compute 3 * 4 exactly")
+        self.assertEqual(speechify("compute 2*3 exactly"), "compute 2*3 exactly")
+
     def test_preserves_meaning_bearing_characters(self):
         # Snake_case identifiers and lone asterisks (e.g. multiplication) must survive.
         self.assertEqual(speechify("call foo_bar_baz please"), "call foo_bar_baz please")

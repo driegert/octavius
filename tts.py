@@ -21,6 +21,13 @@ _MD_ITALIC = re.compile(r'(?<!\w)([*_])(?=\S)(.+?)(?<=\S)\1(?!\w)')  # *x* / _x_
 _MD_CODE = re.compile(r'`+\s*([^`]+?)\s*`+')               # `code` -> code
 _MD_HEADING = re.compile(r'^\s*#{1,6}\s+', re.MULTILINE)   # ## Heading -> Heading
 _MD_LIST = re.compile(r'^[ \t]*(?:[-*+]|\d+[.)])\s+', re.MULTILINE)  # -, *, 1., 1) markers
+# Orphan emphasis: a bold/italic span can be split across streamed sentences
+# (agent.py yields sentence-by-sentence), leaving a dangling "**" or a lone "*"
+# with no matching partner in this chunk. A run of 2+ asterisks is always
+# markup; a single "*" is stripped only when it hugs a word edge, so
+# multiplication ("3 * 4", "2*3") survives.
+_MD_ORPHAN_BOLD = re.compile(r'\*{2,}')
+_MD_ORPHAN_EMPH = re.compile(r'(?<!\S)\*(?=\S)|(?<=\S)\*(?!\S)')
 _WS = re.compile(r'[ \t]{2,}')
 
 
@@ -36,6 +43,8 @@ def speechify(text: str) -> str:
     cleaned = _MD_LINK.sub(r'\1', cleaned)
     cleaned = _MD_BOLD.sub(r'\2', cleaned)     # bold before italic: ** contains *
     cleaned = _MD_ITALIC.sub(r'\2', cleaned)
+    cleaned = _MD_ORPHAN_BOLD.sub('', cleaned)  # dangling ** from a split/unclosed span
+    cleaned = _MD_ORPHAN_EMPH.sub('', cleaned)  # lone * hugging a word edge
     cleaned = _MD_CODE.sub(r'\1', cleaned)
     cleaned = _MD_HEADING.sub('', cleaned)
     cleaned = _MD_LIST.sub('', cleaned)        # only line-leading markers (real lists)

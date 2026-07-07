@@ -665,6 +665,7 @@ class WebSocketSessionHandler:
                 status_callback=item_status_cb,
                 history_session=history_session,
                 session=self,
+                source="inbox_chat",
             ):
                 full_parts.append(sentence)
         except Exception as exc:
@@ -971,6 +972,7 @@ class WebSocketSessionHandler:
                     history_session=self.state.history_session,
                     session=self,
                     user_content=user_content,
+                    source=source,
                 ):
                     full_reply_parts.append(sentence)
                     if self.state.tts_enabled:

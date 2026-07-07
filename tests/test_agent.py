@@ -241,5 +241,45 @@ class MainAgentToolScopeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(hidden, requested)
 
 
+class StyleDirectiveTests(unittest.IsolatedAsyncioTestCase):
+    def test_voice_source_selects_voice_directive(self):
+        self.assertEqual(agent._style_directive("voice"), agent.VOICE_STYLE)
+
+    def test_non_voice_sources_select_text_directive(self):
+        for src in ("text", "matrix", "image", "file", "inbox_chat"):
+            self.assertEqual(agent._style_directive(src), agent.TEXT_STYLE)
+
+    async def _system_message_for(self, source: str) -> str:
+        client = _FakeChainClient(_text_reply_lines("ok"))
+        conversation = Conversation()
+        with patch.object(agent, "llm_client", client), \
+             patch.object(agent, "vision_llm_client", _FakeChainClient([])):
+            async for _ in agent.stream_agent_turn(
+                conversation, _FakeMCP(), "hello", source=source,
+            ):
+                pass
+        return client.payloads[0]["messages"][0]["content"]
+
+    async def test_voice_turn_injects_voice_directive_into_system_message(self):
+        system = await self._system_message_for("voice")
+        self.assertIn("[Channel: VOICE]", system)
+        self.assertNotIn("[Channel: TEXT]", system)
+
+    async def test_matrix_turn_injects_text_directive_into_system_message(self):
+        system = await self._system_message_for("matrix")
+        self.assertIn("[Channel: TEXT]", system)
+        self.assertNotIn("[Channel: VOICE]", system)
+
+    async def test_default_source_is_voice(self):
+        # stream_agent_turn defaults source to "voice" when omitted.
+        client = _FakeChainClient(_text_reply_lines("ok"))
+        conversation = Conversation()
+        with patch.object(agent, "llm_client", client), \
+             patch.object(agent, "vision_llm_client", _FakeChainClient([])):
+            async for _ in agent.stream_agent_turn(conversation, _FakeMCP(), "hello"):
+                pass
+        self.assertIn("[Channel: VOICE]", client.payloads[0]["messages"][0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()
