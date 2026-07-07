@@ -42,7 +42,14 @@ async def reader_get(doc_id: int, request: Request):
             if speech:
                 doc["total_sentences"] = speech.get("total_sentences", 0)
                 doc["sections"] = [
-                    {"index": c["index"], "heading": c["heading"], "sentence_count": len(c["sentences"])}
+                    {
+                        "index": c["index"],
+                        "heading": c["heading"],
+                        "sentence_count": len(c["sentences"]),
+                        # Full sentence text so clients can render a tappable read-along and
+                        # seek to any sentence. Additive; the PWA ignores the extra field.
+                        "sentences": c["sentences"],
+                    }
                     for c in speech["chunks"]
                 ]
     return JSONResponse({"document": doc})
