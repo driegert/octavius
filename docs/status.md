@@ -64,6 +64,20 @@ These behaviors were fixed recently and should not regress:
 - post-conversion markdown lookup is resilient to mismatched output filenames from the remote processor
 - failed or interrupted reader documents can now be requeued from stored source metadata through the retry API/UI
 
+## Voice / TTS Fixes
+
+These behaviors were fixed recently and should not regress:
+
+- spoken text is markdown-normalized before TTS via `speechify` in `tts.py`,
+  applied at the shared `synthesize` choke point (main voice, proactive,
+  item-chat, reader playback). It strips conversational markdown AND orphan
+  emphasis left when a bold/italic span is split across streamed sentences (the
+  cause of TTS reading "asterisk asterisk"), while preserving `3 * 4` / `foo_bar`.
+- response style is channel-aware: `stream_agent_turn(source=...)` injects a
+  per-turn directive (`VOICE_STYLE`/`TEXT_STYLE`), so voice replies are short and
+  markdown-free while typed/Matrix replies may use light markdown and be fuller.
+  Note: this needs the service restarted to take effect (in-memory prompt).
+
 ## Stability Notes
 
 Operational assumptions worth keeping in mind during debugging:

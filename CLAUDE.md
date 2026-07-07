@@ -154,6 +154,21 @@ Configured MCP servers:
 - Tool-call rounds are capped and nudged to stop around rounds 5-6 of 7.
 - Tool results are truncated to 4000 characters to protect context budget.
 - Qwen `<think>...</think>` output is stripped before user-visible text or TTS.
+- Response style is channel-aware. `stream_agent_turn` takes a `source` and
+  folds a per-turn style directive into `messages[0]` (same mechanism as the
+  memory block): `source="voice"` → short/spoken/no-markdown; every other
+  source (`text`/`matrix`/`image`/`file`/`inbox_chat`) → may use light markdown
+  and give a complete answer. The base `settings.system_prompt` is
+  channel-neutral; the directive (`VOICE_STYLE`/`TEXT_STYLE` in `agent.py`) is
+  the tuning knob. Defaults to `"voice"` if a caller omits it.
+- Spoken text is markdown-normalized before TTS. `tts.synthesize` runs every
+  string through `speechify` (the single choke point all TTS callers share),
+  stripping `**bold**`/`*italic*`/`` `code` ``/links/headings and line-leading
+  list markers so the engine doesn't verbalize "asterisk asterisk". It also
+  strips ORPHAN emphasis left when a bold/italic span is split across streamed
+  sentences, while preserving meaningful characters (`3 * 4`, `foo_bar`). It is
+  deliberately lighter than `reader_text.clean_for_speech` (which also strips
+  citations/LaTeX for converted journal PDFs).
 - Conversation history trims automatically to 40 messages.
 - `/health` distinguishes `alive`, `ready`, and `degraded` states.
 - `/health` exposes per-server MCP connection status plus `llm_chain` observability including configured endpoints, failover count, terminal failures, and the last successful endpoint.
@@ -175,7 +190,7 @@ Core runtime:
 - `settings.py` - env-backed runtime settings and defaults
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
 - `stt.py` - thin STT wrapper
-- `tts.py` - thin TTS wrapper
+- `tts.py` - thin TTS wrapper; `speechify` markdown→speech normalization applied at the `synthesize` choke point
 - `vad.py` - Silero VAD ONNX wrapper for server-side voice activity detection
 
 Route modules:
