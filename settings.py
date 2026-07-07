@@ -123,7 +123,7 @@ DEFAULT_KOKORO_VOICES = [
 
 
 DEFAULT_TOOL_LABELS = {
-    "search": "Web Search",
+    "web_search": "Web Search",
     "search_emails": "Email Search",
     "semantic_search": "Email Search",
     "get_email": "Reading Email",
@@ -194,24 +194,22 @@ DEFAULT_MCP_SERVERS = {
         "transport": "http",
         "url": "http://triplestuffed:8251/mcp",
     },
-    "searxng": {
+    "web-search": {
         "transport": "stdio",
-        "command": "/usr/bin/uv",
+        # mcp-tools' server_serper.py exposes a single `web_search` tool that
+        # tries self-hosted SearXNG first (free/private) and falls back to the
+        # Serper.dev Google API when SearXNG is unreachable, rate-limited, or
+        # returns nothing. It reads SERPER_API_KEY from mcp-tools/.env
+        # (load_dotenv) and trusts the system CA bundle for SearXNG's Caddy
+        # cert on its own (honors SSL_CERT_FILE, else /etc/ssl/certs/
+        # ca-certificates.crt), so no env is needed here. SEARX_HOST defaults
+        # to https://searxng.riegert.xyz. Reading pages stays on web-reader
+        # (Crawl4AI). Replaced the old varlabz searxng-mcp (`search` tool,
+        # SearXNG-only, no fallback).
+        "command": "/home/dave/git_repos/mcp-tools/.venv/bin/python",
         "args": [
-            "tool",
-            "run",
-            "--from",
-            # Pinned to commit; update deliberately by bumping this ref.
-            "git+https://github.com/varlabz/searxng-mcp@f9797b7db6593082a331e02d852029f8ebbe6a9d",
-            "mcp-server",
+            "/home/dave/git_repos/mcp-tools/server_serper.py",
         ],
-        "env": {
-            "SEARX_HOST": "https://searxng.riegert.xyz",
-            # Debian/Ubuntu system bundle (includes Caddy's local CA root).
-            # NOT /etc/ssl/cert.pem — that BSD/macOS path doesn't exist here,
-            # so it silently loaded no CA and every search failed TLS verify.
-            "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
-        },
         "tool_description_suffix": (
             " | SCOPE: general web lookups only (news, recipes, product info, "
             "how-to, definitions, current events). Do NOT use for academic "

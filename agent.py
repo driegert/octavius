@@ -226,7 +226,7 @@ async def stream_agent_turn(
         # Only offer core MCP tools + local tools. Specialist domains (email,
         # research, tasks) are handled by the scoped subagent, invoked inline
         # via the consult_specialist local tool.
-        all_tools = mcp.get_tools_for_servers(["searxng", "web-reader", "document-processing"]) + local_tools.TOOLS
+        all_tools = mcp.get_tools_for_servers(["web-search", "web-reader", "document-processing"]) + local_tools.TOOLS
         if all_tools:
             payload["tools"] = all_tools
 

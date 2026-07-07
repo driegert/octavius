@@ -78,6 +78,25 @@ These behaviors were fixed recently and should not regress:
   markdown-free while typed/Matrix replies may use light markdown and be fuller.
   Note: this needs the service restarted to take effect (in-memory prompt).
 
+## Web Search
+
+- The main-agent web search moved from the varlabz `searxng-mcp` (`search` tool,
+  SearXNG-only, no fallback) to mcp-tools' `server_serper.py`, registered as the
+  `web-search` MCP server exposing `web_search` (SearXNG-first → Serper.dev
+  fallback; page reading stays on Crawl4AI via `web-reader`). The agent scopes it
+  by the `web-search` server key in `agent.py`. See CLAUDE.md "Configured MCP
+  servers".
+- The Serper fallback needs `SERPER_API_KEY` in `mcp-tools/.env`; without it,
+  `web_search` degrades to SearXNG-only. The stdio subprocess reads `.env` at
+  spawn, so a service restart is required to pick up a newly-added key.
+- **Cert gotcha (should not regress):** SearXNG is fronted by Caddy's internal CA,
+  which Python's bundled certifi does not trust. The SearXNG client must point at
+  the system CA bundle (`/etc/ssl/certs/ca-certificates.crt`), NOT
+  `/etc/ssl/cert.pem` (absent on this Ubuntu host) — a wrong path silently fails
+  every SearXNG call with `CERTIFICATE_VERIFY_FAILED`. `server_serper.py` handles
+  this itself (honors `SSL_CERT_FILE`, else the system bundle). This was the cause
+  of the post-triplestuffed-migration "web search returns nothing" outage.
+
 ## Stability Notes
 
 Operational assumptions worth keeping in mind during debugging:

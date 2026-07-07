@@ -126,8 +126,12 @@ External services currently expected:
   - The dispatcher (`subagent_dispatcher.py`) routes by `role`. Only two roles matter per call: `primary` (first-try / concurrency routing, with `secondary` as an optional concurrency-overflow tier) and `fallback` (the single per-call HTTP-failover target passed alongside the assigned URL). Per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
   - **Model-alias gotcha**: `lilripper:8010` is a llama-swap that serves `qwen3.6-35b-a3b-general` / `-code` and the reader's `qwen3.5-9b` — **not** the bare `qwen3.6-35b-a3b` alias (that alias only exists on `lilripper:8020`, `triplestuffed:8010`, and `lilbuddy:8010`). `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so a wrong alias hard-400s and silently costs a failover hop. `lilripper:8010` is also shared with the reader, so interleaving document reading and email/task consults pays a llama-swap cost.
   - **KNOWN LIMITATION (handle later):** both tiers now live on `lilripper` (`:8020` primary, `:8010` fallback), so there is **no cross-host failover** — if `lilripper` is fully down, `consult_specialist` has nowhere to go. `lilbuddy:8010` / `triplestuffed:8010` were dropped from the subagent chain. Because the dispatcher only tries `[assigned_url, fallback_url]` per call, restoring cross-host resilience means putting a remote host (e.g. `triplestuffed:8010`, local; or `lilbuddy:8010`) in the **`fallback`** slot — a `secondary` entry only absorbs concurrency overflow, not error-failover. See `docs/status.md`.
-- **TTS**: Voxtral 4B at `triplestuffed:8020/v1/audio/speech`
-- **TTS fallback**: Kokoro at `lilbuddy:8880`
+- **TTS**: Kokoro at `lilbuddy:8880/v1/audio/speech` (voice `bm_lewis`) — the live
+  default. `TTSSettings.voxtral_enabled` is **False**, so every synth call goes
+  straight to Kokoro (Voxtral-only voices remap to the fallback voice). Voxtral 4B
+  (`OCTAVIUS_TTS_URL`) is wired but disabled — its inconsistent output levels make
+  it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` to restore
+  the Voxtral-primary → Kokoro-fallback path (with circuit breaker).
 - **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions`
 - **Summary/tag generation**: summary chain defaults to `127.0.0.1:8001/v1/chat/completions` with fallback `triplestuffed:8010/v1/chat/completions`
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
@@ -139,8 +143,8 @@ External services currently expected:
 Configured MCP servers:
 
 - `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
-- `searxng`: stdio subprocess via `uv`
-- `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `searxng`), not behind a specialist.
+- `web-search`: stdio subprocess (mcp-tools' `server_serper.py`, run via its own venv). Exposes a single `web_search` tool — the "search" half of the search → read → reason pipeline — that tries self-hosted SearXNG first (`searxng.riegert.xyz`, free/private) and falls back to the **Serper.dev** Google API when SearXNG is unreachable, rate-limited, or returns nothing. Surfaced directly to the main agent, not behind a specialist. `server_serper.py` reads `SERPER_API_KEY` from `mcp-tools/.env` and trusts the system CA bundle for SearXNG's Caddy cert on its own (no env needed in the server config). **Without `SERPER_API_KEY` the fallback arm is inert — web search is SearXNG-only until a key is added.** Replaced the old varlabz `searxng-mcp` (`search` tool, SearXNG-only, no fallback).
+- `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `web-search`), not behind a specialist.
 - `openalex`: stdio subprocess via `npm`
 - `vikunja-tasks`: streamable HTTP at `triplestuffed:8252/mcp`
 - `document-processing`: local stdio wrapper around remote processing on `lilripper:8251/mcp`

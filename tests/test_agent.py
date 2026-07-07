@@ -235,7 +235,7 @@ class MainAgentToolScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(mcp.requested_servers)
         requested = mcp.requested_servers[0]
         self.assertIn("web-reader", requested)
-        self.assertIn("searxng", requested)
+        self.assertIn("web-search", requested)
         self.assertIn("document-processing", requested)
         for hidden in ("evangeline-email", "openalex", "vikunja-tasks"):
             self.assertNotIn(hidden, requested)

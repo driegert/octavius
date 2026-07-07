@@ -71,7 +71,7 @@ The value of thinking tracks two things: how multi-step the tool work is,
 and how much the path can hide latency.
 
 - **Web search (main agent)** — low benefit. Shallow loop: form a query,
-  call searxng, summarize. It is also the streaming, live, latency-critical
+  call web_search, summarize. It is also the streaming, live, latency-critical
   path. Recommendation: thinking **off**.
 - **Email / task search (subagent)** — better case for keeping it on. The
   subagent does genuine multi-step tool work (choosing between

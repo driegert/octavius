@@ -32,7 +32,7 @@ replaces the browser-based UI with a native Android experience.
 ### 2. Phone MCP Server (device actions)
 
 A lightweight HTTP server running inside the app, accessible over Tailscale. Octavius
-registers it as just another MCP server — same pattern as evangeline-email or searxng.
+registers it as just another MCP server — same pattern as evangeline-email or web-search.
 
 **Why this architecture:**
 - Zero changes to Octavius server-side code beyond adding a config entry
@@ -241,7 +241,7 @@ sufficient for initial release.
 |  | You: What's the weather like?        | |
 |  |                                      | |
 |  | Octavius: Let me check that for you. | |
-|  | [tool: searxng/search_web]           | |
+|  | [tool: web_search]                   | |
 |  | It's currently 12 degrees and sunny  | |
 |  | in Peterborough.                     | |
 |  |                                      | |
