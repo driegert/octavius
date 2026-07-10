@@ -177,11 +177,13 @@ DEFAULT_TOOL_LABELS = {
     "convert_pdf_to_md": "Converting PDF",
     "get_conversion_result": "Checking PDF Conversion",
     "download_file": "Downloading File",
-    "save_to_stash": "Saving to Stash",
-    "list_stash_items": "Listing Stash",
+    "save_note": "Saving Note",
+    "read_note": "Reading Note",
+    "edit_note": "Editing Note",
+    "commit_edit": "Saving Edit",
+    "search_vault": "Searching Vault",
     "read_document": "Preparing Document",
     "list_reader_documents": "Listing Reader Docs",
-    "read_item_content": "Reading Item Content",
     "process_pdf": "Processing PDF",
     "consult_specialist": "Consulting Specialist",
     "hybrid_search": "Email Search",
@@ -227,6 +229,20 @@ DEFAULT_MCP_SERVERS = {
             " | Use AFTER a web search to read the full content of a specific "
             "result URL, or whenever a search snippet isn't enough. Read one "
             "page at a time; don't bulk-read results."
+        ),
+    },
+    "vault-search": {
+        "transport": "http",
+        # Vault search (mcp-tools' server_vault.py) — sqlite-vec + FTS5 BM25
+        # over the Obsidian vault, RRF-fused. Local client, co-located with the
+        # vault on triplestuffed. Exposes a single `search_vault` tool; the
+        # 03-personal/Journaling/ subtree is excluded server-side.
+        "url": "http://triplestuffed:8254/mcp",
+        "tool_description_suffix": (
+            " | Search Dave's Obsidian vault (his personal notes and captured "
+            "thoughts). Use for 'what did I note about X', 'find my note on Y', "
+            "or recalling past ideas. Returns note paths — read one with "
+            "read_note. NOT for web or academic search."
         ),
     },
     "openalex": {
@@ -354,16 +370,20 @@ Important guidelines for your responses:
   in silence (e.g., "Let me look that up." or "Checking your email now.").
 - If a search returns results, summarize the key findings conversationally.
   Don't read out URLs.
-- Stash via save_to_stash for saving content Dave wants to review later. The
-  stash is Dave's personal capture area — it is NOT his email inbox. When Dave
-  says "save this", "remember that", "draft a reply", "add this to my stash",
-  or similar, use save_to_stash. For search results, save your summary (not raw
-  results). For notes, save his words verbatim. For email drafts, set item_type
-  to "email_draft" and include recipient and subject in metadata. Always give a
-  clear, descriptive title.
-- list_stash_items to browse the stash (defaults to pending items). Use when
-  Dave asks "what's in my stash", "what did I save", or "what's still pending
-  to review". Do NOT use this for email — email lives in Evangeline.
+- Vault notes via save_note for saving content Dave wants to keep or review
+  later. The vault is Dave's personal note store (his Obsidian notes) — it is
+  NOT his email inbox. When Dave says "save this", "make a note", "jot that
+  down", or similar, use save_note. For search results, save your summary (not
+  raw results). For notes, save his words verbatim. Always give a clear,
+  descriptive title.
+- search_vault to find Dave's existing notes. Use when he asks "what did I note
+  about X", "find my note on Y", or "did I write anything about Z". It returns
+  note paths — read one with read_note. Do NOT use this for email (that lives
+  in Evangeline) or web/academic lookups.
+- read_note / edit_note to read or revise a note. edit_note writes directly for
+  inbox notes; for notes elsewhere it returns a preview to confirm with Dave,
+  then commit_edit saves it. Never rename or move notes — Dave files them in
+  Obsidian himself.
 - Dave is a statistics instructor and researcher at Trent University. He runs
   a homelab with multiple machines. He prefers concise, technically precise
   responses and will correct you if you're wrong. Don't over-explain."""

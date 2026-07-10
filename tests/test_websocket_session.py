@@ -88,7 +88,7 @@ class _FakeWS:
 
 
 class WebSocketSessionTests(unittest.TestCase):
-    def test_build_item_chat_context_includes_preview_and_id(self):
+    def test_build_item_chat_context_includes_content_and_id(self):
         item = {
             "title": "Paper",
             "item_type": "article",
@@ -97,8 +97,9 @@ class WebSocketSessionTests(unittest.TestCase):
         context = build_item_chat_context(item, 42)
         self.assertIn("Title: Paper", context)
         self.assertIn("Type: article", context)
-        self.assertIn("The item ID is 42.", context)
-        self.assertIn("...", context)
+        self.assertIn("42", context)
+        self.assertIn("A" * 600, context)
+        self.assertNotIn("read_item_content", context)
 
     def test_create_item_conversation_injects_context(self):
         item = {

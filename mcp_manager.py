@@ -157,7 +157,7 @@ class MCPManager:
             if self._tool_route.get(t["function"]["name"]) in names
         ]
 
-    async def call_tool(self, name: str, arguments: dict) -> str:
+    async def call_tool(self, name: str, arguments: dict, max_chars: int | None = 4000) -> str:
         server_name = self._tool_route.get(name)
         if not server_name:
             return f"Error: unknown tool '{name}'"
@@ -175,8 +175,8 @@ class MCPManager:
                     if hasattr(block, "text"):
                         parts.append(block.text)
                 text = "\n".join(parts)
-                if len(text) > 4000:
-                    text = text[:4000] + "\n... (truncated)"
+                if max_chars is not None and len(text) > max_chars:
+                    text = text[:max_chars] + "\n... (truncated)"
                 self._server_status[server_name]["connected"] = True
                 self._server_status[server_name]["error"] = None
                 return text

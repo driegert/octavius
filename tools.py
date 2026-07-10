@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Callable
 from local_tool_documents import check_document_status
 from local_tool_downloads import download_file
 from local_tool_history import search_conversation_history
-from local_tool_inbox import list_stash_items, read_item_content, save_to_stash
 from local_tool_memory import correct, forget, remember, what_do_you_know
+from local_tool_vault import commit_edit, edit_note, read_note, save_note
 from local_tool_reader import list_reader_documents, process_pdf_background, read_document
 from local_tool_specs import TOOLS
 
@@ -59,9 +59,10 @@ async def _cancel_delegation(args: dict, history_session=None, mcp_manager=None,
 def get_local_tool_handlers() -> dict[str, Callable]:
     return {
         "download_file": download_file,
-        "save_to_stash": save_to_stash,
-        "list_stash_items": list_stash_items,
-        "read_item_content": read_item_content,
+        "save_note": save_note,
+        "read_note": read_note,
+        "edit_note": edit_note,
+        "commit_edit": commit_edit,
         "read_document": read_document,
         "list_reader_documents": list_reader_documents,
         "process_pdf": process_pdf_background,

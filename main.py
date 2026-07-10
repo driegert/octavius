@@ -12,6 +12,7 @@ from settings import settings
 from routes.conversations import router as conversations_router
 from routes.inbox import router as inbox_router
 from routes.reader_api import router as reader_router
+from routes.vault import router as vault_router
 from reader_store import fail_stale_processing_documents
 from service_clients import llm_client
 from subagent_dispatcher import SubagentDispatcher
@@ -65,6 +66,7 @@ def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAU
     app.include_router(inbox_router)
     app.include_router(conversations_router)
     app.include_router(reader_router)
+    app.include_router(vault_router)
     app.state.mcp_manager_factory = mcp_manager_factory
     app.state.db_init = db_init
     app.state.db_path = db_path

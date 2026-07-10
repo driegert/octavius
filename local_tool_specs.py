@@ -28,39 +28,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "save_to_stash",
+            "name": "save_note",
             "description": (
-                "Save content to Dave's stash for later review. "
-                "Use for: saving search summaries, article content, freeform notes, "
-                "or email drafts that Dave wants to review or act on later. "
-                "(The stash is Dave's personal capture area — distinct from his email inbox.)"
+                "Create a note in Dave's vault (the 01-Inbox capture area). "
+                "Use for saving search summaries, article content, or freeform "
+                "notes Dave wants to keep or act on later. Writes a markdown file "
+                "with frontmatter and returns its vault path. New notes always go "
+                "to the inbox; Dave files them in Obsidian himself."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "Short descriptive title for the saved item.",
+                        "description": "Short descriptive title (becomes the filename and frontmatter title).",
                     },
                     "content": {
                         "type": "string",
-                        "description": "Full content to save.",
+                        "description": "Note body in markdown (no frontmatter — the server adds it).",
                     },
-                    "item_type": {
-                        "type": "string",
-                        "enum": ["note", "search_summary", "article", "email_draft"],
-                        "description": "Type of content being saved.",
-                    },
-                    "source_url": {
-                        "type": "string",
-                        "description": "Source URL if applicable.",
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "description": "Type-specific data. For email_draft: {to, subject, in_reply_to}.",
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional 1-2 lowercase topic tags (a 'fleeting' tag is always added).",
                     },
                 },
-                "required": ["title", "content", "item_type"],
+                "required": ["title", "content"],
             },
         },
     },
@@ -92,29 +85,84 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_item_content",
+            "name": "read_note",
             "description": (
-                "Read a chunk of content from a saved stash item. Use this to access "
-                "the full content of an item you're discussing with Dave. Returns the "
-                "content from the given offset with the specified character limit."
+                "Read a note from Dave's vault by its path (as returned by "
+                "save_note or search_vault). Returns the note's title, full "
+                "content, and a base_hash you pass back when editing it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "item_id": {
-                        "type": "integer",
-                        "description": "The stash item ID to read from.",
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Character offset to start reading from. Default 0.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum characters to return. Default 4000.",
+                    "path": {
+                        "type": "string",
+                        "description": "Vault-relative path of the note, e.g. '01-Inbox/2026-07-08 my note.md'.",
                     },
                 },
-                "required": ["item_id"],
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_note",
+            "description": (
+                "Edit the full content of an existing vault note. ALWAYS call "
+                "read_note first to get the note's current base_hash, then pass "
+                "it here. For notes in 01-Inbox this writes immediately (guarded "
+                "by base_hash — a mismatch means it changed under you; re-read "
+                "and retry). For notes ANYWHERE ELSE it does NOT write — it "
+                "returns a preview plus base_hash; confirm with Dave, then call "
+                "commit_edit to save it. Never renames or moves a note; pass the "
+                "note's exact path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Vault-relative path of the note to edit.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The complete new file text (frontmatter + body).",
+                    },
+                    "base_hash": {
+                        "type": "string",
+                        "description": "The base_hash from read_note (optimistic-concurrency guard).",
+                    },
+                },
+                "required": ["path", "content", "base_hash"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "commit_edit",
+            "description": (
+                "Commit an edit previewed by edit_note for a note outside "
+                "01-Inbox. Writes only if base_hash still matches the note on "
+                "disk (optimistic concurrency); on mismatch, re-read and retry."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Vault-relative path of the note (unchanged from edit_note).",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The complete new file text to write.",
+                    },
+                    "base_hash": {
+                        "type": "string",
+                        "description": "The base_hash returned by edit_note / read_note.",
+                    },
+                },
+                "required": ["path", "content", "base_hash"],
             },
         },
     },
@@ -141,37 +189,6 @@ TOOLS = [
                     },
                 },
                 "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_stash_items",
-            "description": (
-                "List items in Dave's stash (the personal capture area for notes, "
-                "search summaries, articles, and email drafts). Defaults to pending "
-                "items only. Use when Dave asks things like 'what's in my stash', "
-                "'what did I save', or 'what's still pending to review'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["pending", "done", "dismissed", "all"],
-                        "description": "Filter by status. Defaults to 'pending'. Use 'all' for no filter.",
-                    },
-                    "item_type": {
-                        "type": "string",
-                        "enum": ["note", "search_summary", "article", "email_draft"],
-                        "description": "Optional filter by item type.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max items to return (1-50, default 20).",
-                    },
-                },
             },
         },
     },

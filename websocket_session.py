@@ -28,14 +28,21 @@ from subagent_dispatcher import SubagentTicket
 log = logging.getLogger(__name__)
 
 
+_ITEM_CHAT_MAX_CHARS = 6000
+
+
 def build_item_chat_context(item: dict, item_id: int) -> str:
-    preview = item["content"][:500] + ("..." if len(item["content"]) > 500 else "")
+    # The saved_items stack is retiring and this legacy "chat about a saved item"
+    # flow no longer has a fetch tool, so inline the (capped) content directly.
+    content = item.get("content") or ""
+    if len(content) > _ITEM_CHAT_MAX_CHARS:
+        body = content[:_ITEM_CHAT_MAX_CHARS] + "\n\n...(content truncated)"
+    else:
+        body = content
     return (
-        "\n\nYou are discussing a saved inbox item with Dave.\n"
-        f"Title: {item['title']}\nType: {item['item_type']}\n"
-        f"Preview: {preview}\n\n"
-        "Use the read_item_content tool to fetch the full content "
-        f"or specific sections when you need more detail. The item ID is {item_id}."
+        f"\n\nYou are discussing saved item #{item_id} with Dave.\n"
+        f"Title: {item['title']}\nType: {item['item_type']}\n\n"
+        f"Content:\n{body}"
     )
 
 
