@@ -490,8 +490,9 @@ side by side with no server change. It speaks the exact `static/index-app.js` pr
 **Before changing the WS protocol or STT/VAD/audio_done behavior, know the app depends on:**
 the server VAD only auto-stops *after* speech (pure silence never auto-stops), and an empty
 transcription sends **no `audio_done`** (just a "Couldn't hear anything" status). The app's
-wake-word conversation loop and silence watchdog are built around exactly this. If you change
-it, the PWA *and* the Android client change together.
+continuous-conversation loop and silence watchdog are built around exactly this (its wake
+word is shelved as of 2026-07-11; the app only holds a mic during a capture or an active
+conversation). If you change it, the PWA *and* the Android client change together.
 
 **Barge-in:** `handle_stt_start` now cancels any in-flight `turn_task` — starting a new
 capture means the user is talking, so the current reply (LLM stream + TTS) is stopped. This
