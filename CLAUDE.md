@@ -42,7 +42,7 @@ Service endpoint:
 Primary UI routes:
 
 - `/` main voice UI
-- `/inbox` stash (route still named `/inbox` — see "Stash rename" TODO below)
+- `/inbox` legacy stash review UI (see "Stash (legacy, retiring)" below)
 - `/reader` document reader
 
 ## Validation Workflow
@@ -71,9 +71,9 @@ When touching external-service boundaries, verify the configured endpoints are r
 High-level path:
 
 ```text
-Browser (WebSocket) -> FastAPI app -> main agent (streaming, ~11 core tools)
+Browser (WebSocket) -> FastAPI app -> main agent (streaming, ~20 core tools)
                                         │
-                                        ├─ direct: web search, web page read, stash, reader, PDF, download
+                                        ├─ direct: web search, web page read, vault (notes), reader, PDF, download, memory
                                         │
                                         └─ consult_specialist(domain, task) → subagent
                                              (non-streaming, scoped tools, runs INLINE)
@@ -85,7 +85,7 @@ Browser (WebSocket) -> FastAPI app -> main agent (streaming, ~11 core tools)
 The main agent never sees email/research/task tool schemas. It calls
 `consult_specialist(domain, task)` which runs a separate non-streaming LLM
 loop with only the tools for that domain, using the same MCP sessions. This
-keeps the main agent's context lean (~11 tools instead of ~44) and prevents
+keeps the main agent's context lean (~20 tools instead of ~55) and prevents
 tool-schema-heavy payloads from causing LLM 500 errors.
 
 `consult_specialist` is **synchronous/inline**: the specialist runs to
@@ -145,6 +145,7 @@ Configured MCP servers:
 - `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
 - `web-search`: stdio subprocess (mcp-tools' `server_serper.py`, run via its own venv). Exposes a single `web_search` tool — the "search" half of the search → read → reason pipeline — that tries self-hosted SearXNG first (`searxng.riegert.xyz`, free/private) and falls back to the **Serper.dev** Google API when SearXNG is unreachable, rate-limited, or returns nothing. Surfaced directly to the main agent, not behind a specialist. `server_serper.py` reads `SERPER_API_KEY` from `mcp-tools/.env` and trusts the system CA bundle for SearXNG's Caddy cert on its own (no env needed in the server config). **Without `SERPER_API_KEY` the fallback arm is inert — web search is SearXNG-only until a key is added.** Replaced the old varlabz `searxng-mcp` (`search` tool, SearXNG-only, no fallback).
 - `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `web-search`), not behind a specialist.
+- `vault-search`: streamable HTTP at `triplestuffed:8254/mcp` (mcp-tools' `server_vault.py` — sqlite-vec + FTS5 BM25 over the Obsidian vault, RRF-fused; co-located with the vault). Exposes a single `search_vault` tool, surfaced directly to the main agent. The `03-personal/Journaling/` subtree is excluded server-side. Search is the only vault operation that goes through MCP — note reads/writes are local file I/O (see "Vault" under Feature Notes).
 - `openalex`: stdio subprocess via `npm`
 - `vikunja-tasks`: streamable HTTP at `triplestuffed:8252/mcp`
 - `document-processing`: local stdio wrapper around remote processing on `lilripper:8251/mcp`
@@ -202,6 +203,7 @@ Route modules:
 - `routes/inbox.py` - inbox page and inbox REST API routes
 - `routes/conversations.py` - conversation history API routes
 - `routes/reader_api.py` - reader page and reader REST API routes
+- `routes/vault.py` - vault REST API (`/api/vault/{recent,note,search}`); search proxies the `search_vault` MCP, everything else is local file I/O via `vault_files.py`
 
 Conversation and tool loop:
 
@@ -214,7 +216,10 @@ Conversation and tool loop:
 - `local_tool_specs.py` - local tool schemas
 - `local_tool_registry.py` - compatibility wrapper for older local-tool imports
 - `local_tool_downloads.py` - local download filename logic and download tool execution
-- `local_tool_inbox.py` - local inbox save/read helpers used by tool handlers
+- `local_tool_vault.py` - `save_note` / `read_note` / `edit_note` / `commit_edit` tool handlers over `vault_files.py`
+- `vault_files.py` - pure file I/O over the Obsidian vault (path-safe, journaling-denied, atomic hash-guarded writes); search never goes through this module
+- `local_tool_inbox.py` - legacy stash save/read helpers (`save_to_stash` / `list_stash_items` — retired/unwired, no longer registered as tools)
+- `stash_to_obsidian.py` - watermark-based one-way exporter of `saved_items` rows to the vault inbox (run via the `obsidian-stash-export.timer` user unit)
 - `local_tool_reader.py` - local reader handoff and background PDF-processing helpers
 - `local_tool_documents.py` - `check_document_status` local tool (polls a docproc job by id)
 - `docproc_client.py` - loopback HTTP client for the docproc web queue (submit/poll a PDF conversion job); Octavius never imports the `docproc` package
@@ -293,27 +298,44 @@ a 64-sample context buffer before inference. Per-session LSTM state is carried
 between chunks and reset at the start of each turn. The `SileroVAD` class in
 `vad.py` wraps the ONNX model; each WebSocket session gets its own instance.
 
-### Stash (formerly "Knowledge Inbox")
+### Vault (Obsidian notes — the single note store)
 
-Dave's personal capture area. Renamed from "Knowledge Inbox" to avoid collision
-with his email inbox. User-facing strings, voice-agent tool names (`save_to_stash`,
-`list_stash_items`), and the system prompt have been updated. Filenames, route
-paths (`/inbox`, `/api/inbox/*`), DB tables (`saved_items` — already neutral),
-and the static page files still use the old name — see the "Stash rename" TODO.
+As of 2026-07-09, Dave's Obsidian vault is the single source of truth for
+notes; the DB stash write path is retired. The vault (`VAULT_PATH`, default
+`~/Documents/Personal`) is plain `.md` files on triplestuffed.
 
-- Stored in `octavius_history.db` as saved items for later review.
-- Item types: `note`, `search_summary`, `article`, `email_draft`
-- Status flow: `pending` -> `done` or `dismissed`
-- Hard delete is supported through `DELETE /api/inbox/{id}`
-- Semantic search uses bge-m3 embeddings on workhorse via Ollama
-- Each stash item can have a persistent item-chat conversation
+- Agent tools (local, in `local_tool_vault.py` over `vault_files.py`):
+  `save_note`, `read_note`, `edit_note`, `commit_edit`. Search is the
+  `search_vault` MCP tool (vault-search server), which reads a derived
+  sqlite-vec + FTS5 index, never the files directly.
+- Frozen vault API contract rules, enforced in `vault_files.py`: new notes
+  land in `01-Inbox/` only (filename frozen at creation);
+  `03-personal/Journaling/` is never listed, read, or written; paths are
+  vault-relative POSIX with traversal/symlink escapes rejected; writes are
+  atomic (temp file + `os.replace`, umask-honoring 0664) and hash-guarded
+  (`base_hash` = sha256 of file bytes, optimistic concurrency — `commit_edit`
+  409s on conflict).
+- REST surface for UI/clients (e.g. Android): `GET /api/vault/recent`,
+  `GET/POST/PUT /api/vault/note`, `GET /api/vault/search` (`routes/vault.py`).
+- Agents never rename or move notes — Dave files them in Obsidian himself.
 
-**TODO — Stash rename (deferred):** finish the rename by updating route paths
-(`/inbox` → `/stash`, `/api/inbox` → `/api/stash`), filenames (`routes/inbox.py`,
-`local_tool_inbox.py`, `static/inbox.html`, `static/inbox-app.js`,
-`tests/test_local_tool_inbox.py` if created), and UI strings in the static
-HTML/JS. Leave the `saved_items` table alone (name is already neutral).
-Bookmarks and persisted browser state will break — coordinate accordingly.
+### Stash (legacy, retiring)
+
+The old DB capture area (`saved_items` in `octavius_history.db`). The write
+path is retired: `save_to_stash` / `list_stash_items` still exist in
+`local_tool_inbox.py` but are unwired (no tool specs/handlers registered),
+and `stash_to_obsidian.py` exported existing items to the vault one-way
+(watermark-based, via the `obsidian-stash-export.timer` user unit). This
+supersedes the old "Stash rename" TODO (routes `/inbox` → `/stash`) — the
+stash is being retired, not renamed.
+
+Still live:
+
+- `process_pdf` background conversions write their result to a stash item.
+- The `/inbox` review UI and `/api/inbox/*` routes still work
+  (list/update/`DELETE /api/inbox/{id}`, bge-m3 semantic search).
+- Item chat still works, but the item's (capped) content is now inlined into
+  the prompt — the `read_item_content` tool was removed.
 
 ### Document Reader
 
