@@ -30,11 +30,11 @@ TOOLS = [
         "function": {
             "name": "save_note",
             "description": (
-                "Create a note in Dave's vault (the 01-Inbox capture area). "
+                "Create a note in Dave's vault (the 001-Fleeting capture area). "
                 "Use for saving search summaries, article content, or freeform "
                 "notes Dave wants to keep or act on later. Writes a markdown file "
                 "with frontmatter and returns its vault path. New notes always go "
-                "to the inbox; Dave files them in Obsidian himself."
+                "to the fleeting folder; Dave files them in Obsidian himself."
             ),
             "parameters": {
                 "type": "object",
@@ -96,7 +96,7 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Vault-relative path of the note, e.g. '01-Inbox/2026-07-08 my note.md'.",
+                        "description": "Vault-relative path of the note, e.g. '00-zettelkasten/001-Fleeting/2026-07-08 my note.md'.",
                     },
                 },
                 "required": ["path"],
@@ -110,7 +110,7 @@ TOOLS = [
             "description": (
                 "Edit the full content of an existing vault note. ALWAYS call "
                 "read_note first to get the note's current base_hash, then pass "
-                "it here. For notes in 01-Inbox this writes immediately (guarded "
+                "it here. For notes in 001-Fleeting this writes immediately (guarded "
                 "by base_hash — a mismatch means it changed under you; re-read "
                 "and retry). For notes ANYWHERE ELSE it does NOT write — it "
                 "returns a preview plus base_hash; confirm with Dave, then call "
@@ -143,7 +143,7 @@ TOOLS = [
             "name": "commit_edit",
             "description": (
                 "Commit an edit previewed by edit_note for a note outside "
-                "01-Inbox. Writes only if base_hash still matches the note on "
+                "001-Fleeting. Writes only if base_hash still matches the note on "
                 "disk (optimistic concurrency); on mismatch, re-read and retry."
             ),
             "parameters": {

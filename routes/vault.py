@@ -11,7 +11,7 @@ router = APIRouter()
 @router.get("/api/vault/recent")
 async def vault_recent(limit: int = 20):
     try:
-        items = vault_files.list_recent_inbox(limit)
+        items = vault_files.list_recent_fleeting(limit)
     except vault_files.VaultError as e:
         return JSONResponse({"error": str(e)}, status_code=e.status)
     return JSONResponse(items)

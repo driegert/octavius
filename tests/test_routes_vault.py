@@ -40,7 +40,7 @@ class VaultRoutesTests(VaultTestCase):
         )
         self.assertEqual(resp.status_code, 201)
         body = resp.json()
-        self.assertTrue(body["path"].startswith("01-Inbox/"))
+        self.assertTrue(body["path"].startswith("00-zettelkasten/001-Fleeting/"))
         self.assertTrue((self.vault / body["path"]).is_file())
 
     def test_create_requires_title(self):
@@ -52,7 +52,9 @@ class VaultRoutesTests(VaultTestCase):
         resp = self.client.get("/api/vault/note", params={"path": res["path"]})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["base_hash"], res["base_hash"])
-        resp = self.client.get("/api/vault/note", params={"path": "01-Inbox/nope.md"})
+        resp = self.client.get(
+            "/api/vault/note", params={"path": "00-zettelkasten/001-Fleeting/nope.md"}
+        )
         self.assertEqual(resp.status_code, 404)
 
     def test_journaling_read_forbidden(self):
@@ -84,7 +86,7 @@ class VaultRoutesTests(VaultTestCase):
         resp = self.client.put("/api/vault/note", json={"path": "x.md"})
         self.assertEqual(resp.status_code, 400)
 
-    def test_recent_lists_inbox(self):
+    def test_recent_lists_fleeting(self):
         vault_files.create_note("Recent One", "body")
         resp = self.client.get("/api/vault/recent")
         self.assertEqual(resp.status_code, 200)
@@ -95,9 +97,9 @@ class VaultRoutesTests(VaultTestCase):
             {
                 "results": [
                     {
-                        "path": "01-Inbox/hit.md",
+                        "path": "00-zettelkasten/001-Fleeting/hit.md",
                         "title": "Hit",
-                        "folder": "01-Inbox",
+                        "folder": "00-zettelkasten/001-Fleeting",
                         "heading": None,
                         "snippet": "…",
                         "score": 0.9,
@@ -110,7 +112,9 @@ class VaultRoutesTests(VaultTestCase):
         resp = self.client.get("/api/vault/search", params={"q": "hit"})
         self.assertEqual(resp.status_code, 200)
         results = resp.json()
-        self.assertEqual([r["path"] for r in results], ["01-Inbox/hit.md"])
+        self.assertEqual(
+            [r["path"] for r in results], ["00-zettelkasten/001-Fleeting/hit.md"]
+        )
         self.assertEqual(results[0]["title"], "Hit")
         # Untruncated proxy call against the search_vault MCP tool.
         name, arguments, max_chars = self.app.state.mcp_manager.calls[0]

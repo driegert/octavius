@@ -5,7 +5,7 @@ triplestuffed. Agents and the Android app read/create/edit notes directly here;
 search goes through the derived index (the `search_vault` MCP), never this module.
 
 Rules enforced (see the frozen vault API contract):
-  - New notes land in `01-Inbox/` only; filename frozen at creation.
+  - New notes land in `00-zettelkasten/001-Fleeting/` only; filename frozen at creation.
   - `03-personal/Journaling/` is off-limits: never listed, read, or written.
   - Every `path` is vault-relative POSIX; traversal / symlink escapes rejected.
   - Writes are atomic (temp file in the same dir, then os.replace).
@@ -25,7 +25,7 @@ VAULT_PATH = Path(
     os.environ.get("VAULT_PATH", str(Path.home() / "Documents/Personal"))
 ).expanduser()
 
-INBOX_DIR = "01-Inbox"
+FLEETING_DIR = "00-zettelkasten/001-Fleeting"
 JOURNALING_PREFIX = "03-personal/Journaling/"
 _JOURNALING_RESOLVED = (VAULT_PATH / "03-personal/Journaling").resolve()
 SNIPPET_LENGTH = 150
@@ -73,9 +73,9 @@ def is_denylisted(rel_path: str) -> bool:
     return norm == JOURNALING_PREFIX.rstrip("/") or norm.startswith(JOURNALING_PREFIX)
 
 
-def is_in_inbox(rel_path: str) -> bool:
+def is_in_fleeting(rel_path: str) -> bool:
     norm = _normalize(rel_path)
-    return norm == INBOX_DIR or norm.startswith(INBOX_DIR + "/")
+    return norm == FLEETING_DIR or norm.startswith(FLEETING_DIR + "/")
 
 
 def _resolve(rel_path: str) -> tuple[Path, str]:
@@ -174,13 +174,13 @@ def _atomic_write(target: Path, data: bytes) -> None:
         raise
 
 
-def list_recent_inbox(limit: int = 20) -> list[dict]:
+def list_recent_fleeting(limit: int = 20) -> list[dict]:
     limit = max(1, min(int(limit), 100))
-    inbox = VAULT_PATH / INBOX_DIR
-    if not inbox.is_dir():
+    fleeting = VAULT_PATH / FLEETING_DIR
+    if not fleeting.is_dir():
         return []
     entries = []
-    for p in inbox.rglob("*.md"):
+    for p in fleeting.rglob("*.md"):
         if not p.is_file():
             continue
         entries.append((p.stat().st_mtime, p))
@@ -219,22 +219,22 @@ def create_note(title: str, content: str, tags: list[str] | None = None) -> dict
     today = date.today().isoformat()
     stem = _FILENAME_BAD.sub(" ", title).strip()
     stem = re.sub(r"\s+", " ", stem)[:80].rstrip() or "note"
-    inbox = VAULT_PATH / INBOX_DIR
-    inbox.mkdir(parents=True, exist_ok=True)
-    # Guard a symlinked 01-Inbox that escapes the vault.
-    inbox_resolved = inbox.resolve()
+    fleeting = VAULT_PATH / FLEETING_DIR
+    fleeting.mkdir(parents=True, exist_ok=True)
+    # Guard a symlinked 001-Fleeting that escapes the vault.
+    fleeting_resolved = fleeting.resolve()
     vault_root = VAULT_PATH.resolve()
-    if inbox_resolved != vault_root and vault_root not in inbox_resolved.parents:
-        raise ForbiddenError("inbox path escapes the vault")
+    if fleeting_resolved != vault_root and vault_root not in fleeting_resolved.parents:
+        raise ForbiddenError("fleeting path escapes the vault")
     # Reserve the filename atomically (O_EXCL) so concurrent same-title creates
     # can't pick the same name and clobber each other.
-    target = inbox / f"{today} {stem}.md"
+    target = fleeting / f"{today} {stem}.md"
     n = 2
     while True:
         try:
             fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
-            target = inbox / f"{today} {stem} ({n}).md"
+            target = fleeting / f"{today} {stem} ({n}).md"
             n += 1
             continue
         os.close(fd)

@@ -49,11 +49,11 @@ def edit_note(args: dict, session=None, _mcp_manager=None) -> str:
             "note's current base_hash, then pass it here."
         )
     try:
-        # Inbox notes write directly, but still hash-guarded against the
+        # Fleeting notes write directly, but still hash-guarded against the
         # caller-supplied base_hash so a concurrent edit raises Conflict.
-        if vault_files.is_in_inbox(path):
+        if vault_files.is_in_fleeting(path):
             res = vault_files.commit_edit(path, content, base_hash)
-            return f"Edited inbox note {res['path']} (new base_hash={res['base_hash']})."
+            return f"Edited fleeting note {res['path']} (new base_hash={res['base_hash']})."
         current = vault_files.read_note(path)
     except vault_files.NotFoundError:
         return f"Error: note not found: {path}"
@@ -65,7 +65,7 @@ def edit_note(args: dict, session=None, _mcp_manager=None) -> str:
     except vault_files.VaultError as e:
         return f"Error: {e}"
     return (
-        "[PENDING EDIT — note is outside 01-Inbox, nothing written yet]\n"
+        "[PENDING EDIT — note is outside 001-Fleeting, nothing written yet]\n"
         f"path: {current['path']}\nbase_hash: {current['base_hash']}\n\n"
         "Confirm the change with Dave, then call "
         "commit_edit(path, content, base_hash) to write it.\n\n"

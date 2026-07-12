@@ -309,7 +309,7 @@ notes; the DB stash write path is retired. The vault (`VAULT_PATH`, default
   `search_vault` MCP tool (vault-search server), which reads a derived
   sqlite-vec + FTS5 index, never the files directly.
 - Frozen vault API contract rules, enforced in `vault_files.py`: new notes
-  land in `01-Inbox/` only (filename frozen at creation);
+  land in `00-zettelkasten/001-Fleeting/` only (filename frozen at creation);
   `03-personal/Journaling/` is never listed, read, or written; paths are
   vault-relative POSIX with traversal/symlink escapes rejected; writes are
   atomic (temp file + `os.replace`, umask-honoring 0664) and hash-guarded

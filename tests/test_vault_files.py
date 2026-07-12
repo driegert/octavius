@@ -16,7 +16,7 @@ class VaultTestCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.vault = Path(tmp.name) / "vault"
-        (self.vault / vault_files.INBOX_DIR).mkdir(parents=True)
+        (self.vault / vault_files.FLEETING_DIR).mkdir(parents=True)
         (self.vault / "03-personal" / "Journaling").mkdir(parents=True)
         for patcher in (
             patch.object(vault_files, "VAULT_PATH", self.vault),
@@ -45,13 +45,13 @@ class PathSafetyTests(VaultTestCase):
         with self.assertRaises(vault_files.ForbiddenError):
             vault_files.read_note("../outside.md")
         with self.assertRaises(vault_files.ForbiddenError):
-            vault_files.read_note("01-Inbox/../../outside.md")
+            vault_files.read_note("00-zettelkasten/001-Fleeting/../../outside.md")
 
     def test_empty_and_nul_paths_rejected(self):
         with self.assertRaises(vault_files.ForbiddenError):
             vault_files.read_note("")
         with self.assertRaises(vault_files.ForbiddenError):
-            vault_files.read_note("01-Inbox/a\x00b.md")
+            vault_files.read_note("00-zettelkasten/001-Fleeting/a\x00b.md")
 
     def test_journaling_read_rejected(self):
         self.write("03-personal/Journaling/secret.md", "private")
@@ -88,21 +88,23 @@ class PathSafetyTests(VaultTestCase):
         self.assertTrue(vault_files.is_denylisted("03-personal/Journaling/x.md"))
         self.assertTrue(vault_files.is_denylisted("03-personal/Journaling"))
         self.assertTrue(vault_files.is_denylisted("../escape.md"))
-        self.assertFalse(vault_files.is_denylisted("01-Inbox/x.md"))
+        self.assertFalse(vault_files.is_denylisted("00-zettelkasten/001-Fleeting/x.md"))
         self.assertFalse(vault_files.is_denylisted("03-personal/JournalingX.md"))
 
-    def test_is_in_inbox(self):
-        self.assertTrue(vault_files.is_in_inbox("01-Inbox/x.md"))
-        self.assertTrue(vault_files.is_in_inbox("01-Inbox"))
-        self.assertFalse(vault_files.is_in_inbox("01-Inboxy/x.md"))
-        self.assertFalse(vault_files.is_in_inbox("02-Notes/x.md"))
+    def test_is_in_fleeting(self):
+        self.assertTrue(vault_files.is_in_fleeting("00-zettelkasten/001-Fleeting/x.md"))
+        self.assertTrue(vault_files.is_in_fleeting("00-zettelkasten/001-Fleeting"))
+        self.assertFalse(vault_files.is_in_fleeting("00-zettelkasten/001-Fleetingy/x.md"))
+        self.assertFalse(vault_files.is_in_fleeting("02-Notes/x.md"))
+        # The old inbox drop zone is now just an ordinary folder.
+        self.assertFalse(vault_files.is_in_fleeting("01-Inbox/x.md"))
 
 
 class CreateNoteTests(VaultTestCase):
-    def test_creates_dated_file_in_inbox_with_frontmatter(self):
+    def test_creates_dated_file_in_fleeting_with_frontmatter(self):
         res = vault_files.create_note("My Note", "body text", ["Research"])
         today = date.today().isoformat()
-        self.assertEqual(res["path"], f"01-Inbox/{today} My Note.md")
+        self.assertEqual(res["path"], f"00-zettelkasten/001-Fleeting/{today} My Note.md")
         content = (self.vault / res["path"]).read_text(encoding="utf-8")
         self.assertTrue(content.startswith("---\n"))
         self.assertIn('title: "My Note"', content)
@@ -119,8 +121,8 @@ class CreateNoteTests(VaultTestCase):
         first = vault_files.create_note("Same Title", "one")
         second = vault_files.create_note("Same Title", "two")
         today = date.today().isoformat()
-        self.assertEqual(first["path"], f"01-Inbox/{today} Same Title.md")
-        self.assertEqual(second["path"], f"01-Inbox/{today} Same Title (2).md")
+        self.assertEqual(first["path"], f"00-zettelkasten/001-Fleeting/{today} Same Title.md")
+        self.assertEqual(second["path"], f"00-zettelkasten/001-Fleeting/{today} Same Title (2).md")
 
     def test_bad_filename_chars_sanitized(self):
         res = vault_files.create_note('a/b:c*d?"e', "body")
@@ -146,12 +148,12 @@ class CreateNoteTests(VaultTestCase):
         mode = (self.vault / res["path"]).stat().st_mode & 0o777
         self.assertEqual(mode, 0o640)
 
-    def test_symlinked_inbox_escaping_vault_rejected(self):
+    def test_symlinked_fleeting_escaping_vault_rejected(self):
         outside = self.vault.parent / "elsewhere"
         outside.mkdir()
-        inbox = self.vault / vault_files.INBOX_DIR
-        inbox.rmdir()
-        inbox.symlink_to(outside)
+        fleeting = self.vault / vault_files.FLEETING_DIR
+        fleeting.rmdir()
+        fleeting.symlink_to(outside)
         with self.assertRaises(vault_files.ForbiddenError):
             vault_files.create_note("Escape", "body")
 
@@ -159,25 +161,26 @@ class CreateNoteTests(VaultTestCase):
 class ReadNoteTests(VaultTestCase):
     def test_missing_note_raises_not_found(self):
         with self.assertRaises(vault_files.NotFoundError):
-            vault_files.read_note("01-Inbox/nope.md")
+            vault_files.read_note("00-zettelkasten/001-Fleeting/nope.md")
 
     def test_title_from_frontmatter(self):
         self.write(
-            "01-Inbox/x.md", '---\ntitle: "Real Title"\ncreated: 2026-07-10\n---\n\nbody'
+            "00-zettelkasten/001-Fleeting/x.md",
+            '---\ntitle: "Real Title"\ncreated: 2026-07-10\n---\n\nbody',
         )
-        note = vault_files.read_note("01-Inbox/x.md")
+        note = vault_files.read_note("00-zettelkasten/001-Fleeting/x.md")
         self.assertEqual(note["title"], "Real Title")
-        self.assertEqual(note["path"], "01-Inbox/x.md")
+        self.assertEqual(note["path"], "00-zettelkasten/001-Fleeting/x.md")
         self.assertIn("body", note["content"])
 
     def test_title_falls_back_to_stem(self):
-        self.write("01-Inbox/plain note.md", "no frontmatter here")
-        note = vault_files.read_note("01-Inbox/plain note.md")
+        self.write("00-zettelkasten/001-Fleeting/plain note.md", "no frontmatter here")
+        note = vault_files.read_note("00-zettelkasten/001-Fleeting/plain note.md")
         self.assertEqual(note["title"], "plain note")
 
     def test_base_hash_is_sha256_of_bytes(self):
-        target = self.write("01-Inbox/h.md", "content")
-        note = vault_files.read_note("01-Inbox/h.md")
+        target = self.write("00-zettelkasten/001-Fleeting/h.md", "content")
+        note = vault_files.read_note("00-zettelkasten/001-Fleeting/h.md")
         self.assertEqual(
             note["base_hash"], hashlib.sha256(target.read_bytes()).hexdigest()
         )
@@ -186,7 +189,7 @@ class ReadNoteTests(VaultTestCase):
 class CommitEditTests(VaultTestCase):
     def test_missing_note_raises_not_found(self):
         with self.assertRaises(vault_files.NotFoundError):
-            vault_files.commit_edit("01-Inbox/nope.md", "new", "hash")
+            vault_files.commit_edit("00-zettelkasten/001-Fleeting/nope.md", "new", "hash")
 
     def test_stale_hash_raises_conflict_with_current_hash(self):
         res = vault_files.create_note("Conflict", "original")
@@ -206,23 +209,30 @@ class CommitEditTests(VaultTestCase):
         )
 
 
-class ListRecentInboxTests(VaultTestCase):
-    def test_missing_inbox_returns_empty(self):
-        (self.vault / vault_files.INBOX_DIR).rmdir()
-        self.assertEqual(vault_files.list_recent_inbox(), [])
+class ListRecentFleetingTests(VaultTestCase):
+    def test_missing_fleeting_dir_returns_empty(self):
+        (self.vault / vault_files.FLEETING_DIR).rmdir()
+        self.assertEqual(vault_files.list_recent_fleeting(), [])
 
     def test_newest_first_with_limit_and_snippet(self):
         older = self.write(
-            "01-Inbox/old.md", '---\ntitle: "Old"\ncreated: 2026-07-01\n---\n\nold body'
+            "00-zettelkasten/001-Fleeting/old.md",
+            '---\ntitle: "Old"\ncreated: 2026-07-01\n---\n\nold body',
         )
-        newer = self.write("01-Inbox/new.md", "new body")
+        newer = self.write("00-zettelkasten/001-Fleeting/new.md", "new body")
         os.utime(older, (1_000_000, 1_000_000))
         os.utime(newer, (2_000_000, 2_000_000))
-        items = vault_files.list_recent_inbox(limit=1)
+        items = vault_files.list_recent_fleeting(limit=1)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["path"], "01-Inbox/new.md")
-        items = vault_files.list_recent_inbox()
-        self.assertEqual([i["path"] for i in items], ["01-Inbox/new.md", "01-Inbox/old.md"])
+        self.assertEqual(items[0]["path"], "00-zettelkasten/001-Fleeting/new.md")
+        items = vault_files.list_recent_fleeting()
+        self.assertEqual(
+            [i["path"] for i in items],
+            [
+                "00-zettelkasten/001-Fleeting/new.md",
+                "00-zettelkasten/001-Fleeting/old.md",
+            ],
+        )
         # Snippet is the body only — frontmatter stripped.
         self.assertEqual(items[1]["snippet"], "old body")
         self.assertEqual(items[1]["title"], "Old")

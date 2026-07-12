@@ -17,7 +17,9 @@ class SaveNoteTests(VaultTestCase):
 
     def test_success_returns_vault_path(self):
         result = local_tool_vault.save_note({"title": "A Note", "content": "body"})
-        self.assertTrue(result.startswith("Saved note to the vault: 01-Inbox/"))
+        self.assertTrue(
+            result.startswith("Saved note to the vault: 00-zettelkasten/001-Fleeting/")
+        )
         path = result.split(": ", 1)[1]
         self.assertTrue((self.vault / path).is_file())
 
@@ -33,8 +35,8 @@ class ReadNoteTests(VaultTestCase):
 
     def test_missing_note(self):
         self.assertEqual(
-            local_tool_vault.read_note({"path": "01-Inbox/nope.md"}),
-            "Error: note not found: 01-Inbox/nope.md",
+            local_tool_vault.read_note({"path": "00-zettelkasten/001-Fleeting/nope.md"}),
+            "Error: note not found: 00-zettelkasten/001-Fleeting/nope.md",
         )
 
     def test_forbidden_path_surfaced_as_error(self):
@@ -55,21 +57,21 @@ class EditNoteTests(VaultTestCase):
 
     def test_requires_base_hash(self):
         result = local_tool_vault.edit_note(
-            {"path": "01-Inbox/x.md", "content": "new"}
+            {"path": "00-zettelkasten/001-Fleeting/x.md", "content": "new"}
         )
         self.assertIn("base_hash is required", result)
         self.assertIn("read_note", result)
 
-    def test_inbox_note_writes_directly(self):
-        res = vault_files.create_note("Inbox Edit", "original")
+    def test_fleeting_note_writes_directly(self):
+        res = vault_files.create_note("Fleeting Edit", "original")
         result = local_tool_vault.edit_note(
             {"path": res["path"], "content": "updated", "base_hash": res["base_hash"]}
         )
-        self.assertIn("Edited inbox note", result)
+        self.assertIn("Edited fleeting note", result)
         self.assertEqual((self.vault / res["path"]).read_text(), "updated")
 
-    def test_inbox_note_stale_hash_conflict(self):
-        res = vault_files.create_note("Inbox Conflict", "original")
+    def test_fleeting_note_stale_hash_conflict(self):
+        res = vault_files.create_note("Fleeting Conflict", "original")
         result = local_tool_vault.edit_note(
             {"path": res["path"], "content": "updated", "base_hash": "deadbeef"}
         )
@@ -77,7 +79,7 @@ class EditNoteTests(VaultTestCase):
         self.assertIn(res["base_hash"], result)
         self.assertIn("original", (self.vault / res["path"]).read_text())
 
-    def test_outside_inbox_returns_pending_preview_without_writing(self):
+    def test_outside_fleeting_returns_pending_preview_without_writing(self):
         target = self.write("02-Notes/filed.md", "filed content")
         note = vault_files.read_note("02-Notes/filed.md")
         result = local_tool_vault.edit_note(
@@ -93,7 +95,7 @@ class EditNoteTests(VaultTestCase):
         # Nothing written until commit_edit.
         self.assertEqual(target.read_text(), "filed content")
 
-    def test_missing_note_outside_inbox(self):
+    def test_missing_note_outside_fleeting(self):
         result = local_tool_vault.edit_note(
             {"path": "02-Notes/nope.md", "content": "new", "base_hash": "h"}
         )
