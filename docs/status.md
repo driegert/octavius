@@ -119,6 +119,7 @@ Likely refactor targets, in rough priority order:
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
 4. Restore cross-host failover for the subagent chain (see Stability Notes): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive.
+5. Transcription/dictation mode (Dave, 2026-07-12): capture speech (Android app first), transcribe, and save the transcript to the `saved_items` stash — deliberately NOT the vault. No agent turn, no TTS. Revives the stash write path for non-note payloads; needs a WS message or REST route for STT-to-stash (the unwired `save_to_stash` helper in `local_tool_inbox.py` is a starting point). App-side sketch in `../octavius-android/docs/HANDOFF.md` NEXT WORK #3.
 
 ## Migration Note
 

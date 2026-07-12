@@ -42,7 +42,7 @@ Service endpoint:
 Primary UI routes:
 
 - `/` main voice UI
-- `/inbox` legacy stash review UI (see "Stash (legacy, retiring)" below)
+- `/inbox` legacy stash review UI (see "Stash (retired as a notes store; kept for non-note payloads)" below)
 - `/reader` document reader
 
 ## Validation Workflow
@@ -319,15 +319,20 @@ notes; the DB stash write path is retired. The vault (`VAULT_PATH`, default
   `GET/POST/PUT /api/vault/note`, `GET /api/vault/search` (`routes/vault.py`).
 - Agents never rename or move notes — Dave files them in Obsidian himself.
 
-### Stash (legacy, retiring)
+### Stash (retired as a notes store; kept for non-note payloads)
 
-The old DB capture area (`saved_items` in `octavius_history.db`). The write
-path is retired: `save_to_stash` / `list_stash_items` still exist in
-`local_tool_inbox.py` but are unwired (no tool specs/handlers registered),
-and `stash_to_obsidian.py` exported existing items to the vault one-way
-(watermark-based, via the `obsidian-stash-export.timer` user unit). This
-supersedes the old "Stash rename" TODO (routes `/inbox` → `/stash`) — the
-stash is being retired, not renamed.
+The old DB capture area (`saved_items` in `octavius_history.db`). The
+*notes* write path is retired: `save_to_stash` / `list_stash_items` still
+exist in `local_tool_inbox.py` but are unwired (no tool specs/handlers
+registered), and `stash_to_obsidian.py` exported existing items to the vault
+one-way (watermark-based, via the `obsidian-stash-export.timer` user unit).
+This supersedes the old "Stash rename" TODO (routes `/inbox` → `/stash`).
+
+The stash is NOT being deleted, though: Dave wants it kept for payloads that
+don't belong in Obsidian — first planned use is a transcription/dictation
+mode that saves raw transcripts to `saved_items` (see `docs/status.md`
+Near-Term Work #5; "there are use-cases for the Stash database still — just
+not typical notes").
 
 Still live:
 
