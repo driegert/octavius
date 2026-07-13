@@ -1,3 +1,4 @@
+import os
 import time
 import unittest
 from unittest.mock import patch
@@ -5,7 +6,15 @@ from unittest.mock import patch
 import httpx
 import numpy as np
 
-from service_clients import EmbeddingClient, LLMChainClient, SummaryClient, TTSClient
+import service_clients
+from service_clients import (
+    EmbeddingClient,
+    LLMChainClient,
+    SummaryClient,
+    TTSClient,
+    auth_headers,
+)
+from settings import _llm_api_keys
 
 
 class _FakeAsyncClient:
@@ -18,7 +27,7 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, url, json):
+    async def post(self, url, json=None, headers=None):
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -50,11 +59,12 @@ class _FakeTTSResponse:
 
 
 class _RecordingAsyncClient:
-    """Like _FakeAsyncClient but also records the URL of each post."""
+    """Like _FakeAsyncClient but also records the URL and headers of each post."""
 
     def __init__(self, outcomes):
         self._outcomes = list(outcomes)
         self.calls: list[str] = []
+        self.headers: list[dict] = []
 
     async def __aenter__(self):
         return self
@@ -62,8 +72,9 @@ class _RecordingAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         self.calls.append(url)
+        self.headers.append(headers or {})
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -283,6 +294,67 @@ class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
     def test_embedding_client_rejects_empty_chain(self):
         with self.assertRaises(ValueError):
             EmbeddingClient([])
+
+
+KEYED = "http://lilripper:8010/v1/chat/completions"
+OPEN = "http://lilripper:8020/v1/chat/completions"
+
+
+class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
+    """Endpoints behind auth get a Bearer header; open endpoints are untouched."""
+
+    def setUp(self):
+        patcher = patch.dict(
+            service_clients.settings.llm_api_keys,
+            {"http://lilripper:8010": "sk-abc"},
+            clear=True,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_env_keys_are_normalized_to_origin(self):
+        env = {"OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-abc"}}'}
+        with patch.dict(os.environ, env):
+            self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-abc"})
+
+    def test_no_keys_configured_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
+            self.assertEqual(_llm_api_keys(), {})
+
+    def test_auth_headers_only_for_keyed_origin(self):
+        self.assertEqual(auth_headers(KEYED), {"Authorization": "Bearer sk-abc"})
+        self.assertEqual(auth_headers(OPEN), {})
+
+    async def test_complete_with_tools_authenticates_keyed_entry_only(self):
+        client = LLMChainClient(
+            [
+                {"url": OPEN, "model": "qwen3.6-35b-a3b"},
+                {"url": KEYED, "model": "qwen3.6-35b-a3b-general"},
+            ]
+        )
+        fake = _RecordingAsyncClient([_FakeResponse("ok"), _FakeResponse("ok")])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            await client.complete_with_tools({"messages": []}, urls=[KEYED])
+            await client.complete_with_tools({"messages": []}, urls=[OPEN])
+
+        self.assertEqual(fake.calls, [KEYED, OPEN])
+        self.assertEqual(fake.headers[0], {"Authorization": "Bearer sk-abc"})
+        self.assertEqual(fake.headers[1], {})
+
+    async def test_complete_authenticates_url_outside_its_own_chain(self):
+        # The reader reaches lilripper:8010 through llm_client, whose chain does
+        # not list it, so the key must resolve from the URL and not the entry.
+        client = LLMChainClient([{"url": OPEN, "model": "qwen3.6-35b-a3b"}])
+        fake = _RecordingAsyncClient([_FakeResponse("ok")])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.complete({"messages": []}, urls=[KEYED])
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(fake.calls, [KEYED])
+        self.assertEqual(fake.headers, [{"Authorization": "Bearer sk-abc"}])
 
 
 class TTSCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):

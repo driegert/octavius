@@ -39,6 +39,31 @@ Service endpoint:
 - FastAPI binds to `127.0.0.1:8030`
 - Caddy exposes it at `https://octavius.riegert.xyz`
 
+### Configuration and secrets
+
+**Nothing loads a `.env` file.** `settings.py` reads `os.environ` directly, so
+config only reaches the app through the process environment. `.env.example` is
+a reference for variable names and defaults, not a file the app consumes.
+
+- **Service**: `~/.config/systemd/user/octavius.service.d/env.conf` adds
+  `EnvironmentFile=-/home/dave/.config/octavius/env` (mode 0600, outside the
+  repo). After editing either file: `systemctl --user daemon-reload && systemctl --user restart octavius`.
+- **Foreground**: `set -a; source ~/.config/octavius/env; set +a; uv run python main.py`.
+
+**LLM endpoint auth**: `OCTAVIUS_LLM_API_KEYS` is a JSON object mapping endpoint
+*origin* (`scheme://host:port`) to a bearer token, e.g.
+`{"http://lilripper:8010":"sk-..."}`. `service_clients.auth_headers()` resolves
+it by URL for every `LLMChainClient` request path (`stream_chat`, `complete`,
+`complete_with_tools`); endpoints absent from the map are called with no
+`Authorization` header, exactly as before. Keys are held per origin, not per
+chain entry, because one endpoint is reached from several chains — `lilripper:8010`
+serves the reader LLM, the vision chain, *and* the subagent fallback tier, and the
+reader calls it through a client whose own chain doesn't list it. In a systemd
+`EnvironmentFile`, single-quote the value so the JSON survives:
+`OCTAVIUS_LLM_API_KEYS='{"http://lilripper:8010":"sk-..."}'`.
+Auth failures surface as ordinary chain failures — a 401 is an `HTTPStatusError`,
+so it burns a failover hop and shows up in `/health`'s `llm_chain` section.
+
 Primary UI routes:
 
 - `/` main voice UI
@@ -132,12 +157,12 @@ External services currently expected:
   (`OCTAVIUS_TTS_URL`) is wired but disabled — its inconsistent output levels make
   it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` to restore
   the Voxtral-primary → Kokoro-fallback path (with circuit breaker).
-- **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions`
+- **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets")
 - **Summary/tag generation**: summary chain defaults to `127.0.0.1:8001/v1/chat/completions` with fallback `triplestuffed:8010/v1/chat/completions`
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
   - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
-- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-general`) — the only chain endpoint with image input enabled. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
+- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-general`) — the only chain endpoint with image input enabled, and **behind auth** (see "Configuration and secrets"). Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
 Configured MCP servers:
@@ -270,6 +295,7 @@ Tests:
 - `tests/test_local_tool_inbox.py`
 - `tests/test_subagent.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
+- `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, and LLM endpoint auth headers
 - `tests/test_docproc_client.py`
 - `tests/test_local_tool_documents.py`
 

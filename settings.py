@@ -1,6 +1,18 @@
 import json
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+
+def endpoint_origin(url: str) -> str:
+    """scheme://host:port for an endpoint URL, used to key API secrets.
+
+    Keys are held per origin rather than per chain entry because the same
+    endpoint is reached from several chains (the reader, for instance, calls
+    lilripper:8010 through a client whose own chain doesn't list it).
+    """
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def _env_str(name: str, default: str) -> str:
@@ -85,6 +97,10 @@ class Settings:
     # vs. handing the model a path + head excerpt instead.
     docproc_inline_char_budget: int
     docproc_excerpt_chars: int
+    # Bearer tokens for LLM endpoints that sit behind auth, keyed by origin
+    # (scheme://host:port). Endpoints absent from the map are called without an
+    # Authorization header, as before. Set via OCTAVIUS_LLM_API_KEYS.
+    llm_api_keys: dict[str, str]
 
 
 DEFAULT_VOXTRAL_VOICES = [
@@ -395,6 +411,13 @@ DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
 )
 
 
+def _llm_api_keys() -> dict[str, str]:
+    raw = _env_json("OCTAVIUS_LLM_API_KEYS", {})
+    if not isinstance(raw, dict):
+        raise ValueError("OCTAVIUS_LLM_API_KEYS must be a JSON object of origin -> key")
+    return {endpoint_origin(url): key for url, key in raw.items() if key}
+
+
 def load_settings() -> Settings:
     llm_chain = _env_json(
         "OCTAVIUS_LLM_CHAIN",
@@ -488,6 +511,7 @@ def load_settings() -> Settings:
         docproc_poll_timeout=_env_float("OCTAVIUS_DOCPROC_POLL_TIMEOUT", 300.0),
         docproc_inline_char_budget=_env_int("OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET", 20000),
         docproc_excerpt_chars=_env_int("OCTAVIUS_DOCPROC_EXCERPT_CHARS", 3000),
+        llm_api_keys=_llm_api_keys(),
     )
 
 

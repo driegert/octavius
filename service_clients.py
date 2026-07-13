@@ -11,9 +11,15 @@ import httpx
 import numpy as np
 import requests
 
-from settings import settings
+from settings import endpoint_origin, settings
 
 log = logging.getLogger(__name__)
+
+
+def auth_headers(url: str) -> dict[str, str]:
+    """Bearer header for an LLM endpoint behind auth, or {} for open endpoints."""
+    key = settings.llm_api_keys.get(endpoint_origin(url))
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 @dataclass
@@ -284,7 +290,12 @@ class LLMChainClient:
                             len(self.chain),
                             entry["url"],
                         )
-                    async with client.stream("POST", entry["url"], json=request_payload) as resp:
+                    async with client.stream(
+                        "POST",
+                        entry["url"],
+                        json=request_payload,
+                        headers=auth_headers(entry["url"]),
+                    ) as resp:
                         if resp.status_code >= 400:
                             await resp.aread()
                         resp.raise_for_status()
@@ -346,7 +357,7 @@ class LLMChainClient:
                             len(target_urls),
                             url,
                         )
-                    resp = await client.post(url, json=request_payload)
+                    resp = await client.post(url, json=request_payload, headers=auth_headers(url))
                     resp.raise_for_status()
                     text = resp.json()["choices"][0]["message"]["content"].strip()
                     self._record_success(
@@ -410,7 +421,11 @@ class LLMChainClient:
                             "LLM failover attempt %d/%d via %s",
                             i + 1, len(target_entries), entry["url"],
                         )
-                    resp = await client.post(entry["url"], json=request_payload)
+                    resp = await client.post(
+                        entry["url"],
+                        json=request_payload,
+                        headers=auth_headers(entry["url"]),
+                    )
                     resp.raise_for_status()
                     message = resp.json()["choices"][0]["message"]
                     self._record_success(
