@@ -715,6 +715,39 @@ class DelegationToolTests(unittest.TestCase):
         asyncio.run(run())
 
 
+class RunLoopDisconnectTests(unittest.TestCase):
+    """Starlette delivers a disconnect as a MESSAGE; calling receive() again
+    afterwards raises RuntimeError. The run loop must break on the disconnect
+    message itself — reaching cleanup through that RuntimeError chained the
+    traceback into every warning logged during cleanup."""
+
+    def test_disconnect_message_breaks_loop_without_re_receiving(self):
+        class _DisconnectingWS(_FakeWS):
+            def __init__(self):
+                super().__init__()
+                self.receive_calls = 0
+
+            async def accept(self):
+                pass
+
+            async def receive(self):
+                self.receive_calls += 1
+                if self.receive_calls > 1:
+                    raise RuntimeError(
+                        'Cannot call "receive" once a disconnect message has been received.'
+                    )
+                return {"type": "websocket.disconnect", "code": 1000}
+
+        async def run():
+            ws = _DisconnectingWS()
+            handler = WebSocketSessionHandler(ws)
+            await handler.run()
+            self.assertEqual(ws.receive_calls, 1)
+            self.assertTrue(handler.state.history_session.ended)
+
+        asyncio.run(run())
+
+
 class UnknownFrameTests(unittest.TestCase):
     """The dispatch dict is keyed on 'type'; anything not in it is a silent
     no-op. This is the safety net for 'ignore unknown frame fields/types

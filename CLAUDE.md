@@ -262,7 +262,7 @@ History and inbox:
 
 - `history.py` - DB bootstrap, conversation/session recording, and compatibility re-exports for history/inbox helpers
 - `history_enrichment.py` - embeddings, summaries, topic tags
-- `history_store.py` - conversation queries, inbox CRUD/search, stats
+- `history_store.py` - conversation queries, inbox CRUD/search, memory-push watermarks, stats
 - `schema.sql` - SQLite+vec schema
 
 Frontend:

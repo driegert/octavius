@@ -194,6 +194,12 @@ class WebSocketSessionHandler:
         try:
             while True:
                 message = await self.ws.receive()
+                # A disconnect arrives as a message, not an exception — calling
+                # receive() again after it raises RuntimeError (which cleanup
+                # used to be reached through; the traceback then leaked into
+                # every warning logged during cleanup via exception chaining).
+                if message.get("type") == "websocket.disconnect":
+                    break
                 if "text" in message:
                     await self.handle_text_message(message["text"])
                     continue
@@ -203,8 +209,9 @@ class WebSocketSessionHandler:
                     else:
                         await self.handle_audio_message(message["bytes"])
         except (WebSocketDisconnect, RuntimeError):
-            log.info("WebSocket disconnected")
-            await self.cleanup()
+            pass
+        log.info("WebSocket disconnected")
+        await self.cleanup()
 
     async def handle_text_message(self, text: str):
         try:

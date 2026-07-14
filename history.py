@@ -21,15 +21,18 @@ from history_enrichment import (
 from history_store import (
     get_conversation_messages,
     get_item_chat_conversation_id,
+    get_memory_watermark,
     get_saved_item,
     get_stats,
     list_saved_items,
+    messages_after_watermark,
     save_item,
     search_conversations,
     search_messages,
     search_messages_text,
     search_saved_items,
     set_item_chat_conversation,
+    set_memory_watermark,
     update_saved_item_status,
 )
 
@@ -435,9 +438,8 @@ class ConversationSession:
         ONLY — tool/email content never crosses to the extractor. Returns
         ``(transcript, max_id, watermark, conv_key, summary)``.
         """
-        import memory
-        watermark = memory.store.get_watermark(conn, conv_id)
-        msgs, max_id = memory.store.messages_after_watermark(conn, conv_id, watermark)
+        watermark = get_memory_watermark(conn, conv_id)
+        msgs, max_id = messages_after_watermark(conn, conv_id, watermark)
         row = conn.execute(
             "SELECT session_id, summary FROM conversations WHERE id = ?", (conv_id,)
         ).fetchone()
@@ -451,7 +453,6 @@ class ConversationSession:
         a failure leaves the watermark put so the next close retries. Uses its OWN
         short-lived connection (never races the about-to-close ``self.conn``)."""
         try:
-            import memory  # noqa: F401  (watermark helpers live here)
             from memory_client import memory_client
         except Exception:
             log.warning("Memory client unavailable; skipping push", exc_info=True)
@@ -480,7 +481,6 @@ class ConversationSession:
     def _push_memory(self, conv_id: int):
         """Sync sibling of ``_push_memory_async`` for the legacy sync ``end()``."""
         try:
-            import memory  # noqa: F401
             from memory_client import memory_client
         except Exception:
             log.warning("Memory client unavailable; skipping push", exc_info=True)
@@ -507,10 +507,9 @@ class ConversationSession:
         """Advance the watermark only when the service confirmed ingest of new turns."""
         if pushed is None:
             return
-        import memory
         res, msgs, max_id, watermark, _ = pushed
         if msgs:
-            memory.store.set_watermark(conn, conv_id, max_id)
+            set_memory_watermark(conn, conv_id, max_id)
             conn.commit()
             log.info("Memory: pushed conv %d (%d msgs id>%d) → +%s ~%s",
                      conv_id, len(msgs), watermark, res.get("added"), res.get("reinforced"))

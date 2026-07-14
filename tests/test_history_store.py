@@ -142,5 +142,66 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT status FROM saved_items WHERE id = 1").fetchone()[0], "done")
 
 
+class MemoryWatermarkTests(unittest.TestCase):
+    """The watermark helpers moved here from memory.store when the memory
+    service was extracted to the agent-memory repo — history.py's push path
+    imports them from history_store, so they must exist and behave."""
+
+    @staticmethod
+    def _conn():
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_extracted_message_id INTEGER
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL
+            )"""
+        )
+        conn.execute("INSERT INTO conversations (last_extracted_message_id) VALUES (NULL)")
+        for role, content in [
+            ("user", "hi"),
+            ("assistant", "hello"),
+            ("tool", "SECRET tool payload"),
+            ("user", "bye"),
+        ]:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content) VALUES (1, ?, ?)",
+                (role, content),
+            )
+        conn.commit()
+        return conn
+
+    def test_watermark_defaults_to_zero_and_round_trips(self):
+        conn = self._conn()
+        self.assertEqual(store.get_memory_watermark(conn, 1), 0)
+        self.assertEqual(store.get_memory_watermark(conn, 999), 0)  # unknown conv
+        store.set_memory_watermark(conn, 1, 4)
+        self.assertEqual(store.get_memory_watermark(conn, 1), 4)
+
+    def test_messages_after_watermark_excludes_tool_turns(self):
+        conn = self._conn()
+        msgs, max_id = store.messages_after_watermark(conn, 1, 0)
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "user"])
+        self.assertEqual(max_id, 4)
+        self.assertNotIn("SECRET", " ".join(m["content"] for m in msgs))
+
+    def test_messages_after_watermark_respects_watermark(self):
+        conn = self._conn()
+        msgs, max_id = store.messages_after_watermark(conn, 1, 2)
+        self.assertEqual([m["content"] for m in msgs], ["bye"])
+        self.assertEqual(max_id, 4)
+        # Nothing new past the watermark: max_id stays at the watermark.
+        msgs, max_id = store.messages_after_watermark(conn, 1, 4)
+        self.assertEqual(msgs, [])
+        self.assertEqual(max_id, 4)
+
+
 if __name__ == "__main__":
     unittest.main()

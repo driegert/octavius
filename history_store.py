@@ -341,6 +341,49 @@ def get_item_chat_conversation_id(conn: sqlite3.Connection, item_id: int) -> int
     return row[0] if row and row[0] else None
 
 
+def get_memory_watermark(conn: sqlite3.Connection, conversation_id: int) -> int:
+    """Highest message id already pushed to the memory service for this
+    conversation (``conversations.last_extracted_message_id``). The watermark
+    is Octavius-owned — the memory service never sees message ids.
+
+    These helpers lived in ``memory.store`` until the memory service was
+    extracted to the agent-memory repo; they operate purely on Octavius's own
+    tables, so they belong here.
+    """
+    row = conn.execute(
+        "SELECT last_extracted_message_id FROM conversations WHERE id = ?",
+        (conversation_id,),
+    ).fetchone()
+    return (row[0] or 0) if row else 0
+
+
+def set_memory_watermark(conn: sqlite3.Connection, conversation_id: int,
+                         message_id: int) -> None:
+    conn.execute(
+        "UPDATE conversations SET last_extracted_message_id = ? WHERE id = ?",
+        (message_id, conversation_id),
+    )
+
+
+def messages_after_watermark(conn: sqlite3.Connection, conversation_id: int,
+                             watermark: int) -> tuple[list[dict], int]:
+    """User+assistant turns with id > watermark. Returns (messages, max_id_seen).
+
+    TRUST BOUNDARY: role is restricted to user/assistant here — tool results
+    (untrusted email/web/file bodies) are never handed to fact extraction.
+    """
+    rows = conn.execute(
+        """SELECT id, role, content FROM messages
+           WHERE conversation_id = ? AND id > ?
+             AND role IN ('user', 'assistant')
+           ORDER BY id ASC""",
+        (conversation_id, watermark),
+    ).fetchall()
+    msgs = [{"id": r[0], "role": r[1], "content": r[2]} for r in rows]
+    max_id = max((r[0] for r in rows), default=watermark)
+    return msgs, max_id
+
+
 def get_stats(conn: sqlite3.Connection) -> dict:
     total_convs = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
     total_msgs = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
