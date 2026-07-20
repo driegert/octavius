@@ -142,6 +142,88 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT status FROM saved_items WHERE id = 1").fetchone()[0], "done")
 
 
+class ConversationLookupTests(unittest.TestCase):
+    @staticmethod
+    def _conversations_conn():
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """CREATE TABLE conversations (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id    TEXT NOT NULL UNIQUE,
+                started_at    TEXT NOT NULL,
+                ended_at      TEXT,
+                service       TEXT NOT NULL,
+                source        TEXT NOT NULL,
+                summary       TEXT,
+                model         TEXT,
+                message_count INTEGER DEFAULT 0
+            )"""
+        )
+        conn.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute(
+            """CREATE TABLE conversation_tags (
+                conversation_id INTEGER, tag_id INTEGER
+            )"""
+        )
+        rows = [
+            ("aaaa1111", "2026-07-19T12:00:00+00:00", "octavius", "voice", "Gutter talk"),
+            ("bbbb2222", "2026-07-20T13:00:00+00:00", "octavius", "voice", "Multitaper chat"),
+            ("cccc3333", "2026-07-20T14:00:00+00:00", "octavius", "matrix", "Matrix thread"),
+            ("dddd4444", "2026-07-20T15:00:00+00:00", "claude-code", "cli", "Other service"),
+        ]
+        for session_id, started, service, source, summary in rows:
+            conn.execute(
+                """INSERT INTO conversations
+                   (session_id, started_at, service, source, summary, message_count)
+                   VALUES (?, ?, ?, ?, ?, 2)""",
+                (session_id, started, service, source, summary),
+            )
+        # orphan row left by a WS connect that attached elsewhere / never spoke
+        conn.execute(
+            """INSERT INTO conversations
+               (session_id, started_at, service, source, summary, message_count)
+               VALUES ('eeee5555', '2026-07-20T16:00:00+00:00', 'octavius', 'voice',
+                       NULL, 0)"""
+        )
+        conn.commit()
+        return conn
+
+    def test_list_conversations_orders_and_filters(self):
+        conn = self._conversations_conn()
+        results = store.list_conversations(conn, service="octavius")
+        self.assertEqual(
+            [r["summary"] for r in results],
+            ["Matrix thread", "Multitaper chat", "Gutter talk"],
+        )
+        voice_only = store.list_conversations(conn, service="octavius", source="voice")
+        self.assertEqual(
+            [r["summary"] for r in voice_only], ["Multitaper chat", "Gutter talk"]
+        )
+        today = store.list_conversations(
+            conn, service="octavius", since="2026-07-20T00:00:00+00:00"
+        )
+        self.assertEqual(
+            [r["summary"] for r in today], ["Matrix thread", "Multitaper chat"]
+        )
+
+    def test_get_conversation_round_trip_and_missing(self):
+        conn = self._conversations_conn()
+        meta = store.get_conversation(conn, 2)
+        self.assertEqual(meta["summary"], "Multitaper chat")
+        self.assertEqual(meta["source"], "voice")
+        self.assertEqual(meta["session_id"], "bbbb2222"[:8])
+        self.assertIsNone(store.get_conversation(conn, 999))
+
+    def test_search_conversations_like_path_applies_filters(self):
+        conn = self._conversations_conn()
+        with patch.object(store, "embed_text", return_value=None):
+            hits = store.search_conversations(
+                conn, "a", service="octavius", source="voice",
+                since="2026-07-20T00:00:00+00:00",
+            )
+        self.assertEqual([r["summary"] for r in hits], ["Multitaper chat"])
+
+
 class MemoryWatermarkTests(unittest.TestCase):
     """The watermark helpers moved here from memory.store when the memory
     service was extracted to the agent-memory repo — history.py's push path

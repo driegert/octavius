@@ -68,6 +68,8 @@ def search_conversations(
     query: str,
     service: str | None = None,
     limit: int = 10,
+    source: str | None = None,
+    since: str | None = None,
 ) -> list[dict]:
     query_bytes = embed_text(query)
     if query_bytes is None:
@@ -80,6 +82,12 @@ def search_conversations(
         if service:
             sql += " AND service = ?"
             params.append(service)
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        if since:
+            sql += " AND started_at >= ?"
+            params.append(since)
         sql += " ORDER BY started_at DESC LIMIT ?"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
@@ -94,6 +102,12 @@ def search_conversations(
         if service:
             sql += " AND c.service = ?"
             params.append(service)
+        if source:
+            sql += " AND c.source = ?"
+            params.append(source)
+        if since:
+            sql += " AND c.started_at >= ?"
+            params.append(since)
         sql += " ORDER BY distance ASC LIMIT ?"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
@@ -116,6 +130,75 @@ def search_conversations(
             item["distance"] = row[9]
         results.append(item)
     return results
+
+
+def list_conversations(
+    conn: sqlite3.Connection,
+    service: str | None = None,
+    source: str | None = None,
+    since: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Recency-ordered conversation listing — no semantic query needed.
+
+    Unlike search_conversations, this also surfaces conversations whose
+    summaries were never embedded (index=False retrieval-only chats).
+    Empty conversations are skipped — every WS connect leaves a
+    message_count=0 row behind when the client attaches or never speaks.
+    """
+    sql = """SELECT id, session_id, started_at, ended_at, service, source,
+                    summary, model, message_count
+             FROM conversations WHERE message_count > 0"""
+    params: list = []
+    if service:
+        sql += " AND service = ?"
+        params.append(service)
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
+    if since:
+        sql += " AND started_at >= ?"
+        params.append(since)
+    sql += " ORDER BY started_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "conversation_id": row[0],
+            "session_id": row[1][:8],
+            "started_at": row[2],
+            "ended_at": row[3],
+            "service": row[4],
+            "source": row[5],
+            "summary": row[6],
+            "model": row[7],
+            "message_count": row[8],
+            "tags": _conversation_tags(conn, row[0]),
+        }
+        for row in rows
+    ]
+
+
+def get_conversation(conn: sqlite3.Connection, conversation_id: int) -> dict | None:
+    row = conn.execute(
+        """SELECT id, session_id, started_at, ended_at, service, source,
+                  summary, model, message_count
+           FROM conversations WHERE id = ?""",
+        (conversation_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "conversation_id": row[0],
+        "session_id": row[1][:8],
+        "started_at": row[2],
+        "ended_at": row[3],
+        "service": row[4],
+        "source": row[5],
+        "summary": row[6],
+        "model": row[7],
+        "message_count": row[8],
+    }
 
 
 def get_conversation_messages(conn: sqlite3.Connection, conversation_id: int) -> list[dict]:

@@ -224,27 +224,73 @@ TOOLS = [
         "function": {
             "name": "search_conversation_history",
             "description": (
-                "Search Dave's prior Octavius conversations by semantic meaning. "
-                "Use when he asks things like 'did we talk about X?', 'when did "
-                "we last discuss Y?', or 'remind me what we decided about Z'. "
-                "Returns past conversations with their one-line summary, age, "
-                "and topic tags. Note: purely retrieval-only conversations "
-                "(e.g. just listing emails or tasks) are not indexed, so the "
-                "absence of a match may mean nothing substantive was said."
+                "Search Dave's prior Octavius conversations by semantic meaning, "
+                "or list recent ones. Use when he asks things like 'did we talk "
+                "about X?', 'when did we last discuss Y?', or 'pull in my voice "
+                "conversation from this morning'. Returns past conversations "
+                "with their #id, source channel, start time, one-line summary, "
+                "and topic tags; feed a #id to read_conversation for the full "
+                "transcript. Omit query and pass source and/or since to get a "
+                "recency listing instead (that also finds retrieval-only chats "
+                "that semantic search skips)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Natural-language search phrase.",
+                        "description": (
+                            "Natural-language search phrase. Optional if source "
+                            "or since is given (then lists recent conversations)."
+                        ),
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["voice", "matrix", "text"],
+                        "description": "Only conversations from this channel.",
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": (
+                            "Only conversations started on/after this local date "
+                            "or datetime, e.g. '2026-07-20' for 'today'."
+                        ),
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Max conversations to return (1-20, default 5).",
                     },
                 },
-                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_conversation",
+            "description": (
+                "Read the full transcript of a prior Octavius conversation by "
+                "its #id (from search_conversation_history). Works across "
+                "channels — e.g. pull a past voice conversation into a Matrix "
+                "thread to continue it in text. Long transcripts are paged: "
+                "page 1 is the most recent stretch, higher pages go further "
+                "back in time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": {
+                        "type": "integer",
+                        "description": "The conversation #id to read.",
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": (
+                            "Transcript page (default 1 = most recent messages)."
+                        ),
+                    },
+                },
+                "required": ["conversation_id"],
             },
         },
     },

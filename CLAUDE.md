@@ -427,7 +427,16 @@ wire contract both repos implement against.
   `search_conversation_history` local tool, which wraps
   `history_store.search_conversations()` (semantic-first against
   `summary_embeddings`, with a text-LIKE fallback). Filtered to
-  `service="octavius"` and excludes the current conversation.
+  `service="octavius"` and excludes the current conversation. Optional
+  `source` (`voice`/`matrix`/`text`) and `since` filters; with a filter and
+  no query it becomes a recency listing (`history_store.list_conversations`),
+  which also surfaces retrieval-only chats that skip embedding.
+- The `read_conversation` local tool returns the full transcript of a prior
+  conversation by id (user/assistant turns only), channel-agnostic — this is
+  what lets a Matrix thread pull in a past voice conversation and continue it
+  in text. Transcripts are paged (page 1 = most recent, ~3.5k chars/page,
+  long single messages capped) because local tool results bypass the MCP
+  4000-char truncator. Handlers live in `local_tool_history.py`.
 - History can be resumed from the browser UI through `load_conversation`.
 - The same DB is shared with other AI services and exposed through the conversation-history MCP server.
 - Request handlers and background reader jobs use short-lived SQLite connections; live conversation history sessions keep their own dedicated connection until the session ends.

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Callable
 
 from local_tool_documents import check_document_status
 from local_tool_downloads import download_file
-from local_tool_history import search_conversation_history
+from local_tool_history import read_conversation, search_conversation_history
 from local_tool_memory import correct, forget, remember, what_do_you_know
 from local_tool_vault import commit_edit, edit_note, read_note, save_note
 from local_tool_reader import list_reader_documents, process_pdf_background, read_document
@@ -68,6 +68,7 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "process_pdf": process_pdf_background,
         "check_document_status": check_document_status,
         "search_conversation_history": search_conversation_history,
+        "read_conversation": read_conversation,
         "remember": remember,
         "forget": forget,
         "correct": correct,
