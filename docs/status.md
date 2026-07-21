@@ -64,6 +64,30 @@ These behaviors were fixed recently and should not regress:
 - post-conversion markdown lookup is resilient to mismatched output filenames from the remote processor
 - failed or interrupted reader documents can now be requeued from stored source metadata through the retry API/UI
 
+## Matrix Media / Docproc Fixes (2026-07-20)
+
+These were fixed in **mcp-tools** (`server_documents_voice_wrapper.py` /
+`server_documents_wrapper.py`, commits `cc9c82b` + `98191f1`) but the symptom
+appears in Octavius, so they're recorded here; should not regress:
+
+- **Matrix PDF conversions failed with a permission error** at the download
+  step: the wrapper created the output dir *next to the source PDF*, and the
+  Matrix spool (`/media/extra_stuff/octavius/matrix_media/`, owned by
+  `octavius-matrix`, mode 755) is read-only for the service user. The wrapper
+  now falls back to `~/docproc-output/<stem>-<source-path-hash>/` when the
+  source's parent isn't writable (`W_OK|X_OK`), pre-creates the target, and
+  scp's the remote dir's *contents* (`/.` suffix — plain `scp -r` nests into
+  a pre-existing target and breaks re-conversions).
+- **Remote dedup hits returned a wrong md path**: the cached output's `.md`
+  carries the *original* upload's filename stem, and the Matrix sidecar
+  prefixes every upload with a unique id — so re-sending the same PDF always
+  mismatched and Octavius logged "Could not read converted markdown" (the
+  agent then silently compensated via web search). The wrapper now globs the
+  downloaded dir for the actual `.md` instead of assuming the stem.
+- Cross-channel history access shipped the same day: `read_conversation` +
+  `source`/`since` filters on `search_conversation_history` (see CLAUDE.md
+  "Conversation History").
+
 ## Voice / TTS Fixes
 
 These behaviors were fixed recently and should not regress:
@@ -104,6 +128,7 @@ Operational assumptions worth keeping in mind during debugging:
 - external service reachability problems can look like application bugs if STT, TTS, LLM, or MCP endpoints are unavailable
 - `/health` now exposes `alive`, `ready`, `degraded`, per-server MCP status, and `llm_chain` failover information, so degraded runtime behavior should be checked there first
 - reader ingest jobs are in-memory background tasks and do not survive restart
+- docproc job ids are in-process state in the document-processing stdio wrapper and also do not survive an Octavius restart — `check_document_status` on a pre-restart id reports it unknown (graceful, but the model may go hunting)
 - restart recovery is now manual requeue rather than automatic job resurrection
 - live conversation and item-chat history sessions still keep their own dedicated SQLite connection until they are ended
 - the browser UIs are less script-heavy than before, but layout and markup are still concentrated in large static HTML files

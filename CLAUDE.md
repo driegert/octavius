@@ -287,15 +287,22 @@ Tests:
 - `tests/test_reader_ingest_service.py`
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
+- `tests/test_history_attach.py`
 - `tests/test_history_enrichment.py`
 - `tests/test_history_store.py`
 - `tests/test_local_tool_handlers.py`
+- `tests/test_local_tool_history.py` - search filters/list mode and `read_conversation` paging
 - `tests/test_local_tool_reader.py`
 - `tests/test_local_tool_registry.py`
 - `tests/test_local_tool_inbox.py`
+- `tests/test_local_tool_vault.py`
+- `tests/test_routes_vault.py`
+- `tests/test_vault_files.py`
 - `tests/test_subagent.py`
+- `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
 - `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, and LLM endpoint auth headers
+- `tests/test_tts.py` - `speechify` markdown→speech normalization
 - `tests/test_docproc_client.py`
 - `tests/test_local_tool_documents.py`
 
@@ -408,9 +415,16 @@ wire contract both repos implement against.
   `OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET`, else path + head excerpt). An empty
   caption gets an immediate acknowledgement mentioning the docproc job id.
   The `check_document_status` local tool lets the model check status / fetch
-  the markdown path for a job id later in the conversation.
+  the markdown path for a job id later in the conversation. Converted outputs
+  normally land next to the source PDF; when the source dir is read-only for
+  the service user (the Matrix spool), the mcp-tools wrapper falls back to
+  `~/docproc-output/<stem>-<path-hash>/` on this host. Job ids are in-process
+  wrapper state and do NOT survive an Octavius restart —
+  `check_document_status` on an old id reports it unknown.
 - **Non-PDF files** (`file_input`, other `mime`): a brief acknowledgement
-  turn only — Octavius can't process other file types yet.
+  turn only — Octavius can't process other file types yet. Matrix audio
+  (voice messages) and video never reach Octavius at all: the sidecar
+  degrades them to descriptive `text_input` frames.
 - Both flows record an `attachments` row (`type` `image`/`file`) against the
   persisted user message.
 
