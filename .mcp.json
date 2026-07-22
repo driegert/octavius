@@ -3,6 +3,10 @@
     "conversation-history": {
       "type": "http",
       "url": "http://127.0.0.1:8203/mcp"
+    },
+    "paper-search": {
+      "type": "http",
+      "url": "http://127.0.0.1:8206/mcp"
     }
   }
 }

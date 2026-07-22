@@ -171,6 +171,13 @@ Configured MCP servers:
 - `web-search`: stdio subprocess (mcp-tools' `server_serper.py`, run via its own venv). Exposes a single `web_search` tool — the "search" half of the search → read → reason pipeline — that tries self-hosted SearXNG first (`searxng.riegert.xyz`, free/private) and falls back to the **Serper.dev** Google API when SearXNG is unreachable, rate-limited, or returns nothing. Surfaced directly to the main agent, not behind a specialist. `server_serper.py` reads `SERPER_API_KEY` from `mcp-tools/.env` and trusts the system CA bundle for SearXNG's Caddy cert on its own (no env needed in the server config). **Without `SERPER_API_KEY` the fallback arm is inert — web search is SearXNG-only until a key is added.** Replaced the old varlabz `searxng-mcp` (`search` tool, SearXNG-only, no fallback).
 - `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `web-search`), not behind a specialist.
 - `vault-search`: streamable HTTP at `triplestuffed:8254/mcp` (mcp-tools' `server_vault.py` — sqlite-vec + FTS5 BM25 over the Obsidian vault, RRF-fused; co-located with the vault). Exposes a single `search_vault` tool, surfaced directly to the main agent. The `03-personal/Journaling/` subtree is excluded server-side. Search is the only vault operation that goes through MCP — note reads/writes are local file I/O (see "Vault" under Feature Notes).
+- `paper-search`: streamable HTTP at `127.0.0.1:8206/mcp` (mcp-tools'
+  `server_papers.py` — sqlite-vec + FTS5 BM25 over Dave's converted Paperpile
+  library at `/media/extra_stuff/papers/`, RRF-fused; runs as the
+  `papers-mcp.service` user unit on this host, no Caddy hop). Exposes
+  `search_papers` + `get_paper`, surfaced directly to the main agent.
+  Conversion/indexing is owned by mcp-tools (`papers_convert.py` /
+  `papers_indexer.py`, nightly `papers-sync.timer`) — see mcp-tools CLAUDE.md.
 - `openalex`: stdio subprocess via `npm`
 - `vikunja-tasks`: streamable HTTP at `triplestuffed:8252/mcp`
 - `document-processing`: local stdio wrapper around remote processing on `lilripper:8251/mcp`
@@ -560,11 +567,14 @@ Stop button could send `stt_start`/cancel the same way.
 Claude Code MCP access for this repo is configured in `.mcp.json` (committed; you
 approve the server on first launch in this repo).
 
-Configured server:
+Configured servers:
 
 - `conversation-history`: `http://127.0.0.1:8203/mcp` — the conversation-history
   MCP server (`mcp-tools/server_history.py`), running as the
   `conversation-history.service` user unit on triplestuffed.
+- `paper-search`: `http://127.0.0.1:8206/mcp` — Dave's paper library
+  (`mcp-tools/server_papers.py`, `papers-mcp.service`). No PII; safe for
+  cloud-connected clients, unlike vault-search.
 
 The conversation-history server includes inbox-related tools such as `save_to_inbox`, `search_inbox`, `list_inbox`, `get_inbox_item`, and `update_inbox_item`.
 

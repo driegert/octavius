@@ -198,6 +198,8 @@ DEFAULT_TOOL_LABELS = {
     "edit_note": "Editing Note",
     "commit_edit": "Saving Edit",
     "search_vault": "Searching Vault",
+    "search_papers": "Searching Papers",
+    "get_paper": "Reading Paper",
     "read_document": "Preparing Document",
     "list_reader_documents": "Listing Reader Docs",
     "process_pdf": "Processing PDF",
@@ -259,6 +261,20 @@ DEFAULT_MCP_SERVERS = {
             "thoughts). Use for 'what did I note about X', 'find my note on Y', "
             "or recalling past ideas. Returns note paths — read one with "
             "read_note. NOT for web or academic search."
+        ),
+    },
+    "paper-search": {
+        "transport": "http",
+        # Paper library search (mcp-tools' server_papers.py) — sqlite-vec +
+        # FTS5 BM25 over Dave's converted Paperpile PDFs, RRF-fused. Runs
+        # locally on triplestuffed (papers-mcp.service); no Caddy hop needed.
+        # Tools: search_papers, get_paper.
+        "url": "http://127.0.0.1:8206/mcp",
+        "tool_description_suffix": (
+            " | Dave's academic paper library (Paperpile, ~1000 papers). Use "
+            "for 'what papers discuss X' or reading a specific paper he owns. "
+            "NOT for general web search; use openalex via the research "
+            "specialist for papers he does NOT have."
         ),
     },
     "openalex": {
