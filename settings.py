@@ -479,7 +479,10 @@ def load_settings() -> Settings:
     reader = ReaderSettings(
         directory=_env_str("OCTAVIUS_READER_DIR", "/home/dave/octavius-reader"),
         llm_url=_env_str("OCTAVIUS_READER_LLM_URL", "http://lilripper:8010/v1/chat/completions"),
-        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.5-9b"),
+        # qwen3.5-9b went stale on the lilripper router (still listed in /v1/models,
+        # but completions hang) — every reader math chunk silently fell back to
+        # dollar-stripping. Keep this pointed at a model verified LIVE on :8010.
+        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-general"),
     )
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),

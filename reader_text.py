@@ -1,5 +1,6 @@
 """Reader markdown chunking and speech-preparation pipeline."""
 
+import asyncio
 import json
 import logging
 import re
@@ -20,7 +21,13 @@ READER_PATH.mkdir(parents=True, exist_ok=True)
 
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 HEADING_RE = re.compile(r'^(#{1,3})\s+(.+)$', re.MULTILINE)
-MATH_RE = re.compile(r'\$\$?.+?\$\$?', re.DOTALL)
+MATH_RE = re.compile(
+    r'\$\$?.+?\$\$?'          # $inline$ / $$display$$
+    r'|\\\(.+?\\\)'           # \(inline\)
+    r'|\\\[.+?\\\]'           # \[display\]
+    r'|\\begin\{[a-z]+\*?\}', # equation/align/... environments
+    re.DOTALL,
+)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 MATH_TO_SPEECH_PROMPT = """Rewrite the following text, replacing all LaTeX math expressions with natural spoken English. Keep all surrounding non-math text exactly as-is. Only change the math parts.
@@ -111,6 +118,28 @@ def has_math(text: str) -> bool:
     return bool(MATH_RE.search(text))
 
 
+def strip_latex(text: str) -> str:
+    """Last-resort de-LaTeX for when the LLM pass fails: not real spoken math, but far
+    better than the command soup ("frac{1}{N} sum_{n=0}...") the TTS reads otherwise.
+    Substitutions run twice to unwrap one level of nesting."""
+    text = re.sub(r'\\tag\{[^}]*\}', '', text)
+    text = re.sub(r'\\(?:left|right|quad|qquad|limits|displaystyle)\b|\\[,;!]', ' ', text)
+    for _ in range(2):
+        text = re.sub(r'\\(?:widehat|hat)\{([^{}]*)\}', r'\1 hat', text)
+        text = re.sub(r'\\(?:overline|bar)\{([^{}]*)\}', r'\1 bar', text)
+        text = re.sub(r'\\tilde\{([^{}]*)\}', r'\1 tilde', text)
+        text = re.sub(r'\\frac\{([^{}]*)\}\{([^{}]*)\}', r'\1 over \2', text)
+        text = re.sub(r'\\sqrt\{([^{}]*)\}', r'square root of \1', text)
+        text = re.sub(r'\\(?:mathbf|mathrm|mathcal|text|operatorname)\{([^{}]*)\}', r'\1', text)
+    text = re.sub(r'\^2(?![\d\w])', ' squared', text)
+    text = re.sub(r'\^\{([^{}]*)\}|\^(\S)', lambda m: f' to the {m.group(1) or m.group(2)} ', text)
+    text = re.sub(r'_\{([^{}]*)\}|_(\S)', lambda m: f' sub {m.group(1) or m.group(2)} ', text)
+    text = re.sub(r'[${}]', '', text)
+    text = re.sub(r'\\\(|\\\)|\\\[|\\\]', ' ', text)
+    text = re.sub(r'\\(?:begin|end)\{[a-z]+\*?\}', ' ', text)
+    return re.sub(r'  +', ' ', text).strip()
+
+
 async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
     payload = {
         "model": settings.reader.llm_model,
@@ -118,7 +147,9 @@ async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
             {"role": "system", "content": MATH_TO_SPEECH_PROMPT},
             {"role": "user", "content": text},
         ],
-        "max_tokens": 2048,
+        # Reasoning models burn tokens inside <think> before the rewrite; 2048 could
+        # truncate mid-think, leaving an UNCLOSED think block that THINK_RE can't strip.
+        "max_tokens": 8192,
         "temperature": 0.1,
         "stream": False,
     }
@@ -126,12 +157,14 @@ async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
     try:
         raw = await llm_client.complete(payload, urls=[settings.reader.llm_url])
         result = THINK_RE.sub("", raw or "").strip()
-        if result:
+        if result and "<think>" in result:
+            log.warning("Reader LLM returned a truncated think block — using strip_latex fallback")
+        elif result:
             return result
     except Exception as exc:
         log.warning("Reader LLM failed: %s", exc)
 
-    return re.sub(r'\$+', '', text)
+    return strip_latex(text)
 
 
 async def _convert_chunk(client: httpx.AsyncClient, chunk: dict) -> str:
@@ -159,11 +192,15 @@ async def _convert_all_chunks(chunks: list[dict]) -> list[str]:
     math_count = sum(1 for chunk in chunks if has_math(chunk["text"]))
     log.info("Reader: %d of %d chunks contain math — only those hit the LLM", math_count, len(chunks))
 
-    results = []
+    # The reader model (qwen3.6-35b-a3b) serves 3 parallel slots on lilripper.
+    sem = asyncio.Semaphore(3)
+
+    async def convert(chunk: dict) -> str:
+        async with sem:
+            return await _convert_chunk(client, chunk)
+
     async with httpx.AsyncClient(timeout=60.0) as client:
-        for chunk in chunks:
-            results.append(await _convert_chunk(client, chunk))
-    return results
+        return list(await asyncio.gather(*(convert(chunk) for chunk in chunks)))
 
 
 def split_sentences(text: str) -> list[str]:
