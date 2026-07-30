@@ -989,6 +989,12 @@ class WebSocketSessionHandler:
                     source=source,
                 ):
                     full_reply_parts.append(sentence)
+                    # Text-side streaming: emit each sentence as it lands so a
+                    # client can render progressively instead of waiting for the
+                    # final `response`. The Matrix sidecar edits its reply in
+                    # place from these; the browser ignores unknown frame types.
+                    # Sent before TTS so text isn't gated on audio synthesis.
+                    await self.send_json("response_delta", sentence)
                     if self.state.tts_enabled:
                         if first_sentence:
                             await self.send_json("status", "Speaking...")

@@ -443,11 +443,16 @@ def load_settings() -> Settings:
             {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
         ],
     )
+    # Subagents (inline consult_specialist + backgrounded delegations) run on
+    # lilripper:8010, which is served with --parallel 3, so they no longer queue
+    # behind the main agent's own turn on the single-slot :8020. `capacity`
+    # matches that --parallel, letting SubagentDispatcher run three consults at
+    # once instead of serialising them. :8020 stays as the HTTP-level fallback.
     subagent_llm_chain = _env_json(
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "primary"},
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general", "role": "fallback"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general", "role": "primary", "capacity": 3},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "fallback"},
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS

@@ -303,6 +303,50 @@ class RunTurnAudioDoneTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_response_delta_streams_each_sentence_before_final_response(self):
+        """Text clients (the Matrix sidecar) render progressively from
+        response_delta; `response` still carries the authoritative full text."""
+        async def run():
+            import json
+            handler, ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                for sentence in ["Hi there. ", "How can I help?"]:
+                    yield sentence
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                await handler.run_turn("hello", source="matrix")
+
+            frames = [json.loads(text) for text in ws.sent]
+            deltas = [f["text"] for f in frames if f.get("type") == "response_delta"]
+            self.assertEqual(deltas, ["Hi there. ", "How can I help?"])
+
+            types = self._payload_types(ws)
+            # Every delta lands before the final response.
+            self.assertLess(
+                max(i for i, t in enumerate(types) if t == "response_delta"),
+                types.index("response"),
+            )
+            responses = [f["text"] for f in frames if f.get("type") == "response"]
+            self.assertEqual(responses, ["Hi there. How can I help?"])
+
+        asyncio.run(run())
+
+    def test_no_response_delta_when_reply_is_empty(self):
+        async def run():
+            handler, ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                if False:
+                    yield  # async-generator that yields nothing
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                await handler.run_turn("hello", source="matrix")
+
+            self.assertNotIn("response_delta", self._payload_types(ws))
+
+        asyncio.run(run())
+
     def test_audio_done_sent_on_empty_reply(self):
         async def run():
             handler, ws = self._make_handler()
