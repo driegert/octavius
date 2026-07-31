@@ -39,12 +39,16 @@ the first changed token. Don't re-litigate this.
   `consult_specialist` reserves a dispatcher ticket, so the old `capacity: 1` serialised
   consults against each other *and* against the main agent's own turn on single-slot `:8020`.
 
-**Sidecar** (`520ef60`, `45e82c4` — **built, NOT installed**, see below):
-- Posts an `m.notice` placeholder into the thread on first progress, edits it in place
-  (`m.replace`, throttled to 1.5 s) with tool statuses then answer sentences.
-- Final answer posts as its **own** `m.text` message, then the notice is redacted. Mobile push
-  is built from the original event, so an edit would notify `⋯ Thinking...` forever — and Dave
-  reads these on mobile. Notices are push-suppressed, so streaming never buzzes the phone.
+**Sidecar** (`520ef60`, `45e82c4`, `40827df`):
+- Progress is a **typing indicator**, held open for the turn (refresh 3.5 s: the SDK suppresses
+  resends within 3 s, the server expires at 4 s). Nothing is left in the timeline.
+- The streamed-`m.notice` version (`520ef60`/`45e82c4`) was **reverted in `40827df`**: it redacted
+  the notice after posting the answer, but Matrix has no silent delete, so every turn left a
+  "Message deleted" tombstone — in the *main* timeline, because redaction strips `m.relates_to`
+  and the tombstone falls out of its thread. Don't reintroduce a redact-based cleanup.
+- Final answer posts as its **own** `m.text` message. Mobile push is built from the original
+  event, so delivering it as an edit would notify `⋯ Thinking...` forever — and Dave reads these
+  on mobile.
 - Sends `{"type":"settings","tts":false}` on connect. **Every Matrix reply up to 2026-07-30 was
   synthesised to speech and discarded** (all 133 assistant messages since Jul 1 carry a
   `tts_model`) — ~1.2 s per three-sentence reply, awaited *between* sentences, which would have
@@ -58,13 +62,17 @@ the first changed token. Don't re-litigate this.
 
 2. ~~Chase the `:8020` 502s~~ — **closed 2026-07-31, see below.**
 
-3. **Truly progressive text (optional).** `agent.py` accumulates `buffered_sentences` and only
-   yields them after a round completes without tool calls — necessary because some Qwen builds
-   emit tool calls as XML inside `content` (`agent.py:321`). So `response_delta` frames all fire
-   at the end; what streams today is the *progress line*, not the text. To make text progressive:
-   emit sentences optimistically and use the existing `TurnEvent::Restart` path in the sidecar
-   bridge to discard them when the round turns out to be a tool call. Risk: briefly flashing
-   tool-call XML into the thread.
+3. ~~Truly progressive text~~ — **moot for Matrix as of 2026-07-31.** Rendering progressive text
+   requires a real Matrix message, and every real message is either permanent clutter or (if
+   cleaned up) a tombstone. Progress is a typing indicator only.
+
+   Octavius still emits `response_delta` and the sidecar still drains it without rendering, so the
+   plumbing survives for any client that *can* render in place (the PWA). If that's ever picked
+   up: `agent.py` accumulates `buffered_sentences` and only yields them after a round completes
+   without tool calls, because some Qwen builds emit tool calls as XML inside `content`
+   (`agent.py:321`) — so deltas all fire at the end. Making them progressive means emitting
+   optimistically and using the `TurnEvent::Restart` path to discard on tool-call rounds. Risk:
+   briefly flashing tool-call XML.
 
 4. **Keep-warm ping** for the 2.77 s cold-start hit, and cross-host failover for the subagent
    chain (see `status.md` Near-Term Work #4 — both tiers are still on `lilripper`).
