@@ -15,6 +15,13 @@ from settings import endpoint_origin, settings
 
 log = logging.getLogger(__name__)
 
+# Chain timeouts. `read` stays long because generation legitimately takes minutes,
+# but `connect` must not: a flat 120 s meant a host that swallows SYNs (lilripper
+# mid-reboot) burned two minutes per chain entry before failover, while a host that
+# merely 502s failed over instantly. Connect is a LAN TCP handshake — 5 s is already
+# ~40x the observed 0.12 s — so this only fires when the host is genuinely unreachable.
+CHAIN_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+
 
 def auth_headers(url: str) -> dict[str, str]:
     """Bearer header for an LLM endpoint behind auth, or {} for open endpoints."""
@@ -129,7 +136,7 @@ class TTSClient:
             )
 
     async def synthesize(self, text: str, voice: str | None = None) -> bytes:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=CHAIN_TIMEOUT) as client:
             # When primary (Voxtral) is disabled, route everything to Kokoro:
             # Kokoro voices speak in their voice; other voices fall back to
             # the configured fallback voice. The breaker is never touched.
@@ -277,7 +284,7 @@ class LLMChainClient:
     @asynccontextmanager
     async def stream_chat(self, payload: dict) -> AsyncIterator[httpx.Response]:
         failed_urls: list[str] = []
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=CHAIN_TIMEOUT) as client:
             for i, entry in enumerate(self.chain):
                 self._mark_attempt(entry["url"])
                 try:
@@ -346,7 +353,7 @@ class LLMChainClient:
         request_payload = dict(payload)
         request_payload["model"] = model
         failed_urls: list[str] = []
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=CHAIN_TIMEOUT) as client:
             for i, url in enumerate(target_urls):
                 self._mark_attempt(url)
                 try:
@@ -410,7 +417,7 @@ class LLMChainClient:
         request_payload = dict(payload)
         request_payload["stream"] = False
         failed_urls: list[str] = []
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=CHAIN_TIMEOUT) as client:
             for i, entry in enumerate(target_entries):
                 self._mark_attempt(entry["url"])
                 model = entry.get("model") or payload_model
