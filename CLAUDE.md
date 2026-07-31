@@ -537,6 +537,7 @@ For current refactor notes, recent fixes, and change-oriented status, see `docs/
 - `README.md` - short setup and development commands
 - `docs/status.md` - current refactor notes, recent fixes, and active hotspots
 - `docs/ws-media-contract.md` - frozen WS media contract (`image_input`/`file_input`) shared with `matrix-agent-sidecar`
+- `docs/HANDOFF-matrix-latency.md` - Matrix first-turn latency: measurements, the streaming + subagent-routing changes, and the open 502 chase
 - `octavius-prd.md` - broader product/design document
 - `octavius-android-design.md` - Android companion app design exploration
 
