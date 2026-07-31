@@ -145,6 +145,26 @@ class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["endpoints"][0]["failures"], 1)
         self.assertEqual(health["endpoints"][1]["failures"], 1)
 
+    async def test_chain_connect_timeout_is_short_but_read_stays_long(self):
+        """A host that swallows SYNs must not hold the chain for the read budget.
+
+        Generation legitimately runs for minutes, so `read` stays at 120 s; but an
+        unreachable host used to burn that same 120 s on connect before failover.
+        """
+        client = LLMChainClient([{"url": "http://primary", "model": "model-a"}])
+        captured = {}
+
+        def _capture(*args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return _FakeAsyncClient([_FakeResponse("ok")])
+
+        with patch("service_clients.httpx.AsyncClient", side_effect=_capture):
+            await client.complete({"messages": []})
+
+        timeout = captured["timeout"]
+        self.assertEqual(timeout.connect, 5.0)
+        self.assertEqual(timeout.read, 120.0)
+
     async def test_summary_client_acomplete_uses_fallback(self):
         client = SummaryClient("http://primary", "http://fallback")
         outcomes = [

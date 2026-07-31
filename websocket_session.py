@@ -299,6 +299,23 @@ class WebSocketSessionHandler:
         )
 
     async def handle_reset(self, _data: dict):
+        # Mirror handle_stt_start: a reset must actually kill any in-flight turn, or it
+        # keeps streaming into (and its reply gets recorded under) the fresh conversation
+        # created below. Cancelling BEFORE end_async() also means the interrupted turn's
+        # partial reply is persisted into the conversation it belongs to — the old one.
+        turn = self.state.turn_task
+        if turn and not turn.done():
+            turn.cancel()
+            try:
+                await turn
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug("In-flight turn ended during reset", exc_info=True)
+        # A reset also abandons any open streaming-STT capture (e.g. the Android client
+        # tearing down a live mic for New Chat) — don't leave the stream armed.
+        self.state.stt_stream.reset()
+        self.state.stt_stream.active = False
         await self.state.history_session.end_async()
         self.state.conversation.reset()
         self.state.history_session = self.state.history.start_conversation(
@@ -989,6 +1006,12 @@ class WebSocketSessionHandler:
                     source=source,
                 ):
                     full_reply_parts.append(sentence)
+                    # Text-side streaming: emit each sentence as it lands so a
+                    # client can render progressively instead of waiting for the
+                    # final `response`. The Matrix sidecar edits its reply in
+                    # place from these; the browser ignores unknown frame types.
+                    # Sent before TTS so text isn't gated on audio synthesis.
+                    await self.send_json("response_delta", sentence)
                     if self.state.tts_enabled:
                         if first_sentence:
                             await self.send_json("status", "Speaking...")

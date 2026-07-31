@@ -146,11 +146,11 @@ External services currently expected:
   - first fallback: `127.0.0.1:8001/v1/chat/completions` on lilbuddy
   - second fallback: `triplestuffed:8010/v1/chat/completions`
 - **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
-  - primary: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b` — the main agent's dedicated, always-warm 35B. Inline consults block the main loop, so there's no real contention, and this avoids a cold-load/swap on the first consult.
-  - fallback: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-general` — HTTP-level failover only.
+  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-general`, `capacity: 3` — served with `--parallel 3`, so consults no longer queue behind the main agent's own turn on the single-slot `:8020`. `consult_specialist` is the dominant Matrix first-turn cost (~15 s average, 50 s worst), and it reserves a dispatcher ticket, so the old `capacity: 1` also serialised concurrent consults against each other. Same model as the reader and the vision chain, so sharing `:8010` costs no extra llama-swap.
+  - fallback: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b` — HTTP-level failover only.
   - The dispatcher (`subagent_dispatcher.py`) routes by `role`. Only two roles matter per call: `primary` (first-try / concurrency routing, with `secondary` as an optional concurrency-overflow tier) and `fallback` (the single per-call HTTP-failover target passed alongside the assigned URL). Per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
   - **Model-alias gotcha**: `lilripper:8010` is a llama-swap that serves `qwen3.6-35b-a3b-general` / `-code` and the reader's `qwen3.5-9b` — **not** the bare `qwen3.6-35b-a3b` alias (that alias only exists on `lilripper:8020`, `triplestuffed:8010`, and `lilbuddy:8010`). `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so a wrong alias hard-400s and silently costs a failover hop. `lilripper:8010` is also shared with the reader, so interleaving document reading and email/task consults pays a llama-swap cost.
-  - **KNOWN LIMITATION (handle later):** both tiers now live on `lilripper` (`:8020` primary, `:8010` fallback), so there is **no cross-host failover** — if `lilripper` is fully down, `consult_specialist` has nowhere to go. `lilbuddy:8010` / `triplestuffed:8010` were dropped from the subagent chain. Because the dispatcher only tries `[assigned_url, fallback_url]` per call, restoring cross-host resilience means putting a remote host (e.g. `triplestuffed:8010`, local; or `lilbuddy:8010`) in the **`fallback`** slot — a `secondary` entry only absorbs concurrency overflow, not error-failover. See `docs/status.md`.
+  - **KNOWN LIMITATION (handle later):** both tiers live on `lilripper` (`:8010` primary, `:8020` fallback), so there is **no cross-host failover** — if `lilripper` is fully down, `consult_specialist` has nowhere to go. `lilbuddy:8010` / `triplestuffed:8010` were dropped from the subagent chain. Because the dispatcher only tries `[assigned_url, fallback_url]` per call, restoring cross-host resilience means putting a remote host (e.g. `triplestuffed:8010`, local; or `lilbuddy:8010`) in the **`fallback`** slot — a `secondary` entry only absorbs concurrency overflow, not error-failover. See `docs/status.md`.
 - **TTS**: Kokoro at `lilbuddy:8880/v1/audio/speech` (voice `bm_lewis`) — the live
   default. `TTSSettings.voxtral_enabled` is **False**, so every synth call goes
   straight to Kokoro (Voxtral-only voices remap to the fallback voice). Voxtral 4B
@@ -213,6 +213,7 @@ Configured MCP servers:
 WebSocket message families:
 
 - Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
+- Text streaming (server→client): `response_delta` — one sentence of the reply as it streams, emitted before the final `response` (which stays authoritative). The Matrix sidecar edits its thread message in place from these; the browser ignores the frame.
 - Matrix media (client→server, same session/threading semantics as `text_input`): `image_input`, `file_input` — frozen contract, see `docs/ws-media-contract.md`. Both repos (`octavius`, `matrix-agent-sidecar`) implement against that doc.
 - Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
@@ -536,6 +537,7 @@ For current refactor notes, recent fixes, and change-oriented status, see `docs/
 - `README.md` - short setup and development commands
 - `docs/status.md` - current refactor notes, recent fixes, and active hotspots
 - `docs/ws-media-contract.md` - frozen WS media contract (`image_input`/`file_input`) shared with `matrix-agent-sidecar`
+- `docs/HANDOFF-matrix-latency.md` - Matrix first-turn latency: measurements, the streaming + subagent-routing changes, and the open 502 chase
 - `octavius-prd.md` - broader product/design document
 - `octavius-android-design.md` - Android companion app design exploration
 
