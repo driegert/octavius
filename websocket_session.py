@@ -299,6 +299,23 @@ class WebSocketSessionHandler:
         )
 
     async def handle_reset(self, _data: dict):
+        # Mirror handle_stt_start: a reset must actually kill any in-flight turn, or it
+        # keeps streaming into (and its reply gets recorded under) the fresh conversation
+        # created below. Cancelling BEFORE end_async() also means the interrupted turn's
+        # partial reply is persisted into the conversation it belongs to — the old one.
+        turn = self.state.turn_task
+        if turn and not turn.done():
+            turn.cancel()
+            try:
+                await turn
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug("In-flight turn ended during reset", exc_info=True)
+        # A reset also abandons any open streaming-STT capture (e.g. the Android client
+        # tearing down a live mic for New Chat) — don't leave the stream armed.
+        self.state.stt_stream.reset()
+        self.state.stt_stream.active = False
         await self.state.history_session.end_async()
         self.state.conversation.reset()
         self.state.history_session = self.state.history.start_conversation(
