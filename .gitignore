@@ -20,3 +20,6 @@ wheels/
 
 # Downloads directory
 octavius-downloads/
+
+# APK hosting
+static/app-debug.apk
