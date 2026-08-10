@@ -10,13 +10,60 @@ import local_tool_reader
 
 class LocalToolReaderTests(unittest.TestCase):
     def test_read_document_requires_database_connection(self):
+        # The connection is a precondition for every branch, so it is checked
+        # before the path is resolved.
         result = asyncio.run(local_tool_reader.read_document({"path": "/tmp/missing.pdf"}, session=None))
+        self.assertEqual(result, "Error: no database connection available.")
+
+    def test_read_document_reports_missing_file(self):
+        session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
+        result = asyncio.run(
+            local_tool_reader.read_document({"path": "/tmp/missing.pdf"}, session=session)
+        )
         self.assertEqual(result, "Error: file not found: /tmp/missing.pdf")
 
-    def test_read_document_rejects_missing_path_arg(self):
+    def test_read_document_rejects_missing_path_and_text(self):
         session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
         result = asyncio.run(local_tool_reader.read_document({}, session=session))
-        self.assertEqual(result, "Error: path is required.")
+        self.assertEqual(result, "Error: provide either path (a file) or text (raw content).")
+
+    def test_read_document_accepts_raw_text(self):
+        """Pasted/dictated content with no file behind it."""
+        session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
+
+        async def fake_start(db_path, text, title):
+            return {"id": 77, "status": "processing", "title": title or "Derived"}
+
+        with patch.object(local_tool_reader, "start_text_ingest", side_effect=fake_start):
+            result = asyncio.run(
+                local_tool_reader.read_document(
+                    {"text": "Some pasted prose.", "title": "Prose"}, session=session
+                )
+            )
+        self.assertIn("document #77", result)
+        self.assertIn("Prose", result)
+
+    def test_read_document_text_delegates_to_shared_ingest(self):
+        """The agent path and the /reader paste box must go through the same
+        entrypoint so both get title derivation and retry persistence."""
+        session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
+        seen = {}
+
+        async def fake_start(db_path, text, title):
+            seen.update(db_path=db_path, text=text, title=title)
+            return {"id": 5, "status": "processing", "title": "Derived"}
+
+        with patch.object(local_tool_reader, "start_text_ingest", side_effect=fake_start):
+            asyncio.run(local_tool_reader.read_document({"text": "body"}, session=session))
+
+        self.assertEqual(seen["text"], "body")
+        self.assertIsNone(seen["title"])
+        self.assertEqual(seen["db_path"], Path("/tmp/test.db"))
+
+    def test_read_document_rejects_whitespace_only_text(self):
+        session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
+        result = asyncio.run(local_tool_reader.read_document({"text": "   \n  "}, session=session))
+        self.assertEqual(result, "Error: the text provided is empty.")
 
     def test_read_document_schedules_markdown_ingest(self):
         with tempfile.TemporaryDirectory() as tmpdir:

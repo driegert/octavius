@@ -35,8 +35,12 @@ async def start_reader_ingest(db_path: str | Path, mcp_manager: "MCPManager", bo
     if source == "inbox" and saved_item_id:
         return await start_inbox_ingest(db_path, saved_item_id, title, ReaderIngestError)
 
-    if source == "text" and text:
-        return await start_text_ingest(db_path, text, title)
+    if source == "text":
+        if not (text and text.strip()):
+            raise ReaderIngestError("Text is empty")
+        # Pass the raw title (not the "Untitled" default) so start_text_ingest
+        # can derive one from the content when the caller didn't supply one.
+        return await start_text_ingest(db_path, text, body.get("title"))
 
     if source == "url" and (body.get("url") or path):
         url = body.get("url") or path

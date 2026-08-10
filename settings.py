@@ -391,6 +391,10 @@ You have access to tools:
   When Dave says "read this document", "read this paper", or provides a file
   path to read aloud, use read_document. Math expressions are automatically
   converted to natural speech. The document will be available at /reader.
+  It also takes raw text instead of a path: pass text="..." when Dave pastes
+  or dictates something to read, or wants something from this conversation
+  sent to the reader. Pass the full text verbatim, never a summary. A title
+  is derived from the first line if you don't give one.
 - list_reader_documents to check what's in the reader and whether in-flight
   PDF conversions have finished. Use when Dave asks "what's in the reader",
   "is that PDF ready yet", or "did the conversion finish".
@@ -427,20 +431,68 @@ DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
 )
 
 
+# Origin whose bearer token may be supplied by the dedicated
+# OCTAVIUS_8010_API_KEY env var. The var is named for the port, but it is bound
+# to lilripper specifically on purpose: `lilbuddy:8010` (main-chain fallback,
+# summary primary) and `triplestuffed:8010` (main-chain fallback, summary
+# fallback) also listen on 8010 and are OPEN — they must never receive this
+# header. Only lilripper:8010 is behind auth.
+KEYED_8010_ORIGIN = "http://lilripper:8010"
+
+
 def _llm_api_keys() -> dict[str, str]:
+    """Resolve bearer tokens for LLM endpoints, keyed by origin.
+
+    Two sources, in increasing precedence:
+
+    1. ``OCTAVIUS_LLM_API_KEYS`` — a JSON object of endpoint URL -> token,
+       normalized to origins. Still the general mechanism; use it if another
+       endpoint ever goes behind auth.
+    2. ``OCTAVIUS_8010_API_KEY`` — a bare token for ``KEYED_8010_ORIGIN``.
+       This is the one that rotates, so it wins on conflict. A dedicated var
+       exists because rotating a value nested inside single-quoted JSON in a
+       systemd EnvironmentFile is easy to get subtly wrong (and a mangled key
+       fails as a 401, which the chain client reports as an ordinary failover,
+       not as an auth error).
+    """
     raw = _env_json("OCTAVIUS_LLM_API_KEYS", {})
     if not isinstance(raw, dict):
         raise ValueError("OCTAVIUS_LLM_API_KEYS must be a JSON object of origin -> key")
-    return {endpoint_origin(url): key for url, key in raw.items() if key}
+    keys = {endpoint_origin(url): key for url, key in raw.items() if key}
+    direct = _env_str("OCTAVIUS_8010_API_KEY", "").strip()
+    if direct:
+        keys[KEYED_8010_ORIGIN] = direct
+    return keys
 
 
 def load_settings() -> Settings:
+    # lilripper:8020 is a llama.cpp *router* now, not a single-model server, so
+    # the model id is load-bearing: it selects which model the router serves.
+    # The bare "qwen3.6-35b-a3b" alias is gone there — every router alias carries
+    # a variant suffix. No auth on :8020 (OCTAVIUS_LLM_API_KEYS keys :8010 only).
+    #
+    # Chain shape as of 2026-08-08:
+    #  1. :8020 — primary. Shared with pi-agent, which pulls the 27B; contention
+    #     there produced a live `500 model ... failed to load` on this alias, so
+    #     a working second hop on lilripper matters more than it used to.
+    #  2. :8010 — second hop, deliberately on the alias ALREADY RESIDENT there
+    #     (the subagent + reader alias, not the Q6 mtp-general). Failing over to
+    #     a different alias would pin :8010 to it for the duration of a :8020
+    #     outage and make every consult_specialist / reader call swap the model
+    #     back — turning one degraded endpoint into three. Quality is the right
+    #     thing to trade here: this only serves turns whose primary already died.
+    #  3. lilbuddy:8010 — plain single-model server (model id ignored).
+    #     UNREACHABLE as of 2026-08-08 and expected to stay down for some days;
+    #     kept because it costs only the 5 s connect timeout while down.
+    # triplestuffed:8010 was REMOVED: its GPUs serve Positron autocomplete/NES
+    # models, and it currently accepts connections without ever generating, so a
+    # failover into it burned the full 120 s read timeout. See docs/status.md.
     llm_chain = _env_json(
         "OCTAVIUS_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general"},
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
-            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
         ],
     )
     # Subagents (inline consult_specialist + backgrounded delegations) run on
@@ -448,21 +500,29 @@ def load_settings() -> Settings:
     # behind the main agent's own turn on the single-slot :8020. `capacity`
     # matches that --parallel, letting SubagentDispatcher run three consults at
     # once instead of serialising them. :8020 stays as the HTTP-level fallback.
+    #
+    # Model choice: the q4 MTP variant. consult_specialist is the dominant
+    # first-turn latency cost, and speculative decoding buys more here than Q5
+    # weights do on tool-calling work. NOTE the model is resolved per ENDPOINT
+    # URL (subagent.py::_model_for_url), not per domain — all three specialist
+    # domains on :8010 share this one model.
     subagent_llm_chain = _env_json(
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general", "role": "primary", "capacity": 3},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b", "role": "fallback"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general", "role": "primary", "capacity": 3},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "fallback"},
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS
-    # frames from the Matrix sidecar). Separate from llm_chain because most
-    # of the default chain's endpoints don't have image input enabled — only
-    # lilripper:8010 (qwen3.6-35b-a3b-general) currently does.
+    # frames from the Matrix sidecar). Still separate from llm_chain even though
+    # its primary is now the same endpoint: llm_chain's two fallbacks are
+    # text-only single-model servers on other hosts, so an image turn must never
+    # be allowed to fail over onto them. Both entries here accept image input.
     vision_llm_chain = _env_json(
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-general"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general"},
         ],
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
@@ -487,7 +547,10 @@ def load_settings() -> Settings:
         # qwen3.5-9b went stale on the lilripper router (still listed in /v1/models,
         # but completions hang) — every reader math chunk silently fell back to
         # dollar-stripping. Keep this pointed at a model verified LIVE on :8010.
-        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-general"),
+        # Deliberately the SAME alias the subagent chain uses on :8010: reading a
+        # document and running a consult otherwise thrash the router between two
+        # resident models.
+        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-q4-general"),
     )
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
@@ -503,9 +566,16 @@ def load_settings() -> Settings:
         tool_labels=_env_json("OCTAVIUS_TOOL_LABELS", DEFAULT_TOOL_LABELS),
         mcp_servers=_env_json("OCTAVIUS_MCP_SERVERS", DEFAULT_MCP_SERVERS),
         system_prompt=_env_str("OCTAVIUS_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
-        summary_url=_env_str("OCTAVIUS_SUMMARY_URL", "http://lilbuddy:8010/v1/chat/completions"),
-        summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://triplestuffed:8010/v1/chat/completions"),
-        summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b"),
+        # Both former endpoints (lilbuddy:8010, triplestuffed:8010) were dead on
+        # 2026-08-08, so conversation-end summaries and tags were failing
+        # silently — a failed summary is invisible to the user, it just leaves
+        # history unsummarised and untagged. Moved onto lilripper.
+        # SummaryClient sends ONE model to both URLs, so the alias must exist on
+        # both ports: qwen3.6-35b-a3b-mtp-general does, and it is already the
+        # resident alias on :8020, so the primary costs no model swap.
+        summary_url=_env_str("OCTAVIUS_SUMMARY_URL", "http://lilripper:8020/v1/chat/completions"),
+        summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8010/v1/chat/completions"),
+        summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
         embedding_chain=_env_json(
             "OCTAVIUS_EMBEDDING_CHAIN",

@@ -62,9 +62,12 @@ TOOLS = [
         "function": {
             "name": "read_document",
             "description": (
-                "Start the document reader for a PDF, markdown file, or article. "
-                "Ingests the document, converts math expressions to speech-friendly text, "
-                "and prepares it for audio playback in the reader UI at /reader."
+                "Start the document reader for a PDF, markdown file, article, or "
+                "a block of raw text. Ingests the content, converts math "
+                "expressions to speech-friendly text, and prepares it for audio "
+                "playback in the reader UI at /reader. "
+                "Provide EITHER path (for a file) OR text (for content Dave "
+                "pasted, dictated, or that you already have in the conversation)."
             ),
             "parameters": {
                 "type": "object",
@@ -73,12 +76,24 @@ TOOLS = [
                         "type": "string",
                         "description": "File path to the document (PDF or markdown).",
                     },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Raw text or markdown to read aloud, used instead of "
+                            "path when there is no file. Use this when Dave pastes "
+                            "or dictates something and asks you to read it, or "
+                            "wants text from this conversation sent to the reader. "
+                            "Pass the full text verbatim, not a summary."
+                        ),
+                    },
                     "title": {
                         "type": "string",
-                        "description": "Title for the document.",
+                        "description": (
+                            "Title for the document. Optional for text — a title "
+                            "is derived from the first line when omitted."
+                        ),
                     },
                 },
-                "required": ["path"],
             },
         },
     },

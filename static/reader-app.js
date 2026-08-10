@@ -3,6 +3,12 @@
   const docList = document.getElementById('doc-list');
   const ingestInput = document.getElementById('ingest-input');
   const ingestBtn = document.getElementById('ingest-btn');
+  const pasteToggle = document.getElementById('paste-toggle');
+  const pasteBar = document.getElementById('paste-bar');
+  const pasteInput = document.getElementById('paste-input');
+  const pasteTitle = document.getElementById('paste-title');
+  const pasteSubmit = document.getElementById('paste-submit');
+  const pasteCancel = document.getElementById('paste-cancel');
   const playerDiv = document.getElementById('player');
   const playerBack = document.getElementById('player-back');
   const playerTitle = document.getElementById('player-title');
@@ -226,6 +232,56 @@
 
   ingestInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') ingestBtn.click();
+  });
+
+  function closePasteBar() {
+    pasteBar.classList.remove('active');
+    pasteInput.value = '';
+    pasteTitle.value = '';
+  }
+
+  pasteToggle.addEventListener('click', () => {
+    const opening = !pasteBar.classList.contains('active');
+    pasteBar.classList.toggle('active', opening);
+    if (opening) pasteInput.focus();
+    else closePasteBar();
+  });
+
+  pasteCancel.addEventListener('click', closePasteBar);
+
+  pasteSubmit.addEventListener('click', async () => {
+    const text = pasteInput.value.trim();
+    if (!text) return;
+
+    // Title is optional — the server derives one from the first line.
+    const body = { source: 'text', text };
+    const title = pasteTitle.value.trim();
+    if (title) body.title = title;
+
+    pasteSubmit.disabled = true;
+    try {
+      const resp = await fetch('/api/reader/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        console.error('Paste ingest failed:', err.error || resp.status);
+        return;
+      }
+      closePasteBar();
+      loadDocList();
+    } catch (e) {
+      console.error('Paste ingest failed:', e);
+    } finally {
+      pasteSubmit.disabled = false;
+    }
+  });
+
+  // Ctrl/Cmd+Enter submits, matching the single-line input's Enter behavior.
+  pasteInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pasteSubmit.click();
   });
 
   async function openDocument(docId) {

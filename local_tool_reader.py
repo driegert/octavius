@@ -11,7 +11,7 @@ from document_sources import ensure_pdf_suffix, is_likely_html, is_pdf_file, rea
 from local_tool_inbox import _format_age
 from reader_store import create_document, list_documents
 from reader_text import ingest_document
-from reader_ingest_handlers import ingest_pdf_document
+from reader_ingest_handlers import ingest_pdf_document, start_text_ingest
 
 log = logging.getLogger(__name__)
 
@@ -42,17 +42,32 @@ def _update_saved_item_content(db_path: str | Path, item_id: int, title: str, co
 
 async def read_document(args: dict, session=None, mcp_manager=None) -> str:
     path = args.get("path", "")
-    if not path:
-        return "Error: path is required."
+    text = args.get("text", "")
+
+    if not path and not text:
+        return "Error: provide either path (a file) or text (raw content)."
+
+    conn = session.conn if session else None
+    if conn is None:
+        return "Error: no database connection available."
+
+    # Raw text has no file behind it; delegate to the shared ingest entrypoint
+    # so pasted content from the agent and from the /reader UI take the exact
+    # same path (including being persisted for retry).
+    if text and not path:
+        if not text.strip():
+            return "Error: the text provided is empty."
+        result = await start_text_ingest(Path(session.db_path), text, args.get("title"))
+        return (
+            f"'{result['title']}' is being prepared for reading "
+            f"(document #{result['id']}). It'll be available at /reader shortly."
+        )
 
     source_path = Path(path)
     if not source_path.exists():
         return f"Error: file not found: {path}"
 
     title = args.get("title", source_path.stem)
-    conn = session.conn if session else None
-    if conn is None:
-        return "Error: no database connection available."
 
     if source_path.suffix.lower() == ".pdf" or is_pdf_file(source_path):
         pdf_path = source_path if source_path.suffix.lower() == ".pdf" else ensure_pdf_suffix(source_path)

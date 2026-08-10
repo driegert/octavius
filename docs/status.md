@@ -9,6 +9,78 @@ This document holds change-oriented project status that is useful in the short t
 
 Keep durable architecture and contributor workflow in `CLAUDE.md`.
 
+## Deployment State (2026-08-10) — RESTART PENDING
+
+The working tree is **ahead of the running service**. `octavius.service` has been up
+since 2026-08-08 13:46 and is still running the pre-change configuration. Everything
+below is committed to the tree but not yet live; none of it is half-applied.
+
+Live process is running the OLD config:
+
+- main chain `:8020` → `lilbuddy:8010` → `triplestuffed:8010` (the two fallbacks are dead — see Stability Notes)
+- summary chain `lilbuddy:8010` → `triplestuffed:8010` (both dead, so **conversation-end summaries and tags have been failing silently**)
+- no `OCTAVIUS_8010_API_KEY` support, no `/health` failure classification, no reader pasted-text
+
+Changed in the tree, waiting on a restart:
+
+1. **Endpoint/model rewiring** for the llama.cpp routers on both lilripper ports (model ids are now load-bearing).
+2. **`OCTAVIUS_8010_API_KEY`** — dedicated env var for the lilripper:8010 token, takes precedence over the `OCTAVIUS_LLM_API_KEYS` JSON map. Not yet set in `~/.config/octavius/env`; the old JSON key still works, so this is optional to adopt.
+3. **`/health` failure classification** — `auth` / `client_error` / `server_error` / `connect` / `connect_timeout` / `timeout` / `bad_response`, plus `endpoints_rejecting_credentials`.
+4. **Summary chain moved to lilripper** + `SummaryClient` now sends auth headers (it previously sent none).
+5. **Reader accepts pasted text** end-to-end (see below).
+
+What a restart fixes: summaries/tags start working again, the main chain gets a
+*working* second hop (`lilripper:8010`) instead of two dead ones, and failing over
+stops costing 120 s on the triplestuffed zombie.
+
+What a restart does NOT fix: **voice**. TTS is `lilbuddy:8880` Kokoro and lilbuddy is
+still fully down — Octavius stays mute until it returns or a Kokoro runs elsewhere.
+Text and Matrix turns are unaffected.
+
+Also note `/health` will report `degraded` again the first time any request exhausts
+the whole chain, and stay that way until restart — that flag is a lifetime counter,
+not current state (see Stability Notes).
+
+## OPEN: Android client misbehaving, Octavius server looks clean (2026-08-10)
+
+Dave reported Octavius "misbehaving". Server-side investigation found **nothing wrong**:
+25/26 chain requests succeeded on `:8020`, zero failovers, MCP 8/8 connected, and the
+only journal errors since 2026-08-08 were the one `:8020` model-load 500 and a 403 from
+a paywalled inc.com download. Nothing recurring.
+
+Dave's read: **the PWA is working fine, so the fault is likely in the Android client**
+(`../octavius-android`), not the server. Start there when picking this up.
+
+Rule out the known-broken-but-unrelated things first, none of which are the Android app's
+fault and all of which look like misbehaviour from a client:
+
+- **No TTS at all** — `lilbuddy:8880` Kokoro is down, so every voice turn returns text and
+  no audio on *both* clients. Not a client bug.
+- **`/health` reports `degraded`** — latched lifetime counter from Friday, not live state.
+- **Summaries/tags failing silently** — dead summary chain; fixed in the tree, needs the restart.
+
+Note the Android client depends on WS behaviour the server did NOT change this session
+(STT/VAD/`audio_done`/empty-transcription semantics are untouched — see CLAUDE.md "Native
+Android client"), so a protocol regression from this session's work is unlikely.
+
+## Reader: pasted text (2026-08-10)
+
+The reader now accepts raw text alongside files, URLs, and inbox items.
+
+- `POST /api/reader/documents {"source":"text","text":...}` already existed and was
+  built for the Android client (`ReaderRepository.addText`). What was missing was the
+  agent tool and the web UI.
+- `read_document` takes `text` as an alternative to `path` (either one suffices), and
+  delegates to `start_text_ingest` so the agent and the UI can't drift.
+- `/reader` gained a Paste panel (`static/reader.html` + `reader-app.js`); the main
+  voice UI and the WS protocol are untouched, so no Android rebuild is needed.
+- Titles are derived from the first line when omitted (`document_sources.derive_title_from_text`),
+  which also stops Android's blank-title pastes from all landing as "Untitled".
+- Pasted text is persisted to `<reader_dir>/pasted/<id>-<slug>.md` and recorded as
+  `source_path`, which is what makes it retryable — `start_retry_task`'s existing
+  `markdown` branch needed no changes. Best-effort: a write failure costs retry, not
+  the document.
+
 ## Refactor Status
 
 The codebase has been through a reliability and maintainability refactor focused on reducing orchestration-heavy modules and making external-service boundaries clearer.
@@ -134,11 +206,30 @@ Operational assumptions worth keeping in mind during debugging:
 - the browser UIs are less script-heavy than before, but layout and markup are still concentrated in large static HTML files
 - Silero VAD requires `models/silero_vad.onnx` to be present; if the file is missing, VAD is skipped and auto-stop will not work
 - STT failover (lilripper primary, lilbuddy fallback) is not yet implemented — switching requires a settings change
-- **`lilripper:8010` is behind auth (2026-07-13).** It 401s without a bearer token. The key lives in `~/.config/octavius/env` as `OCTAVIUS_LLM_API_KEYS` (JSON, origin → token) and reaches the service through the `EnvironmentFile` drop-in; `service_clients.auth_headers()` attaches it by URL on every `LLMChainClient` request path. Three consumers depend on it: the reader LLM, the vision chain, and — since 2026-07-30 — the subagent **primary** tier, so a bad key now breaks every `consult_specialist` on its first hop rather than only on failover. Two failure modes to keep apart when debugging: a **missing/wrong key** is a 401 → `HTTPStatusError` → burns a failover hop and shows up in `/health`'s `llm_chain` (not an obvious auth error), while **empty content with no failover** is usually Qwen think-mode eating a small `max_tokens`, not auth. Nothing loads a `.env` file, so a key placed there is silently ignored.
+- **`lilripper:8010` is behind auth (2026-07-13).** It 401s without a bearer token. The key lives in `~/.config/octavius/env` and reaches the service through the `EnvironmentFile` drop-in. As of 2026-08-08 the preferred variable is **`OCTAVIUS_8010_API_KEY`** (a bare token, no JSON quoting to get wrong) which takes precedence over the older `OCTAVIUS_LLM_API_KEYS` JSON map; the token rotates but the variable name does not. It is bound to `lilripper:8010` specifically (`settings.KEYED_8010_ORIGIN`) — `lilbuddy:8010` and `triplestuffed:8010` share the port, are open, and must stay unkeyed. `service_clients.auth_headers()` attaches it by URL on every `LLMChainClient` request path. Three consumers depend on it: the reader LLM, the vision chain, and — since 2026-07-30 — the subagent **primary** tier, so a bad key breaks every `consult_specialist` on its first hop rather than only on failover. Two failure modes to keep apart when debugging: a **missing/wrong key** is a 401 → `HTTPStatusError` → burns a failover hop, while **empty content with no failover** is usually Qwen think-mode eating a small `max_tokens`, not auth. Nothing loads a `.env` file, so a key placed there is silently ignored.
+
+  **Since 2026-08-08 a 401 identifies itself.** `/health`'s `llm_chain` now carries `endpoints_rejecting_credentials` (URLs whose most recent attempt was 401/403), `auth_failures`, `last_failure_kind`, and per-endpoint `last_error_kind` / `last_error_status` / `authenticated`; a 401 also logs at ERROR naming the origin and the env var to check. Triage order when a chain looks flaky: `endpoints_rejecting_credentials` non-empty → key problem; `last_error_kind` of `connect`/`connect_timeout` → host down (no TCP handshake); `timeout` → host accepted the connection but never generated (zombie); `last_error_kind == "client_error"` with 400/404 → the model alias isn't in that endpoint's catalog. `last_error_*` clears on the endpoint's next success, so it reflects current belief, not history.
 - **Memory push was silently dead 2026-07-02 → 2026-07-13 (fixed; should not regress).** When the memory service was extracted to the `agent-memory` repo, `history.py`'s push path kept doing `import memory` for three watermark helpers, so every conversation end logged "Memory client unavailable; skipping push" and skipped the push. The helpers (`get_memory_watermark` / `set_memory_watermark` / `messages_after_watermark`) now live in `history_store.py` — they only touch Octavius's own tables (`conversations.last_extracted_message_id` + `messages`), so Octavius no longer imports anything from agent-memory except over HTTP via `memory_client.py`. Conversations that *ended* during the gap were never mined for facts (push happens at conversation end; watermarks stayed put but closed conversations don't re-push) — a backfill would need a one-off script.
 - **WS disconnects arrive as messages, not exceptions (fixed; should not regress).** Starlette's `ws.receive()` returns a `websocket.disconnect` message; calling `receive()` again raises `RuntimeError`. The run loop used to reach cleanup *through* that RuntimeError, which chained the traceback into every `exc_info` warning logged during cleanup (confusing journal noise). `websocket_session.run` now breaks on the disconnect message itself.
 - **Caddy leaks upstream WS sockets when a client stalls silently (mitigated 2026-07-13).** A downstream client that freezes without dying (phone in Doze: app stops reading, kernel keeps ACKing) blocks Caddy's copy goroutines; when uvicorn's WS ping timeout then closes the upstream leg, Caddy never reaps its side — one CLOSE_WAIT socket to `127.0.0.1:8030` per stalled client (~3/day observed; clean closes and RSTs do NOT leak — verified by live probe). Mitigation: `stream_timeout 24h` in the octavius `reverse_proxy` block in the Caddyfile (safe because the app and PWA both auto-reconnect). A Caddy restart clears any backlog.
-- **Subagent chain has no cross-host failover.** `consult_specialist` routes primary `lilripper:8010` (`qwen3.6-35b-a3b-general`, `--parallel 3`, `capacity: 3`) → fallback `lilripper:8020` (`qwen3.6-35b-a3b`). The tiers swapped on 2026-07-30 to get consults off the main agent's single-slot `:8020` (see `HANDOFF-matrix-latency.md`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`. Watch the model alias: `lilripper:8010` serves `-general`/`-code`, not the bare `qwen3.6-35b-a3b` (see CLAUDE.md "Subagent LLM chain"). To handle later.
+- **Subagent chain has no cross-host failover — and as of 2026-08-08 neither does the vision chain.** `consult_specialist` routes primary `lilripper:8010` (`qwen3.6-35b-a3b-mtp-q4-general`, `--parallel 3`, `capacity: 3`) → fallback `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`). The tiers swapped on 2026-07-30 to get consults off the main agent's single-slot `:8020` (see `HANDOFF-matrix-latency.md`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`.
+
+  The **vision chain** now has the same shape: `lilripper:8020` → `lilripper:8010`. It gained a second entry on 2026-08-08 (it was previously a single `:8010` entry with no failover at all, so this is an improvement, not a regression) — but both are on lilripper. Restoring cross-host vision failover is harder than for subagents: the remote host must accept **image input**, and neither `lilbuddy:8010` nor `triplestuffed:8010` currently does. Until one of them serves a multimodal alias, the third entry doesn't exist to add. The reader (`:8010`) has no failover either and never has.
+
+  Net: **lilripper is a single point of failure for consults, image turns, and the reader.** The main text chain is the only LLM path with cross-host redundancy on paper (`lilbuddy:8010`, `triplestuffed:8010`) — but see below, both were dead when measured.
+
+- **lilbuddy is fully down (2026-08-08), and it is expected to stay down for some days** — Dave can't ping or ssh it and isn't physically near the machine. No ICMP response; `:8010`, `:8020`, `:8880` all unreachable. This is the highest-impact outage in the fleet because of what lilbuddy carries:
+  - **`:8880` Kokoro — the live TTS path.** `TTSSettings.voxtral_enabled` is False, so *every* synth call goes straight to this "fallback" and the Voxtral primary is never attempted. With lilbuddy gone there is **no working TTS at all**: Octavius is mute on the voice UI, the Android client, and continuous conversation. Text/Matrix turns are unaffected. `lilripper:8030` (the configured Voxtral primary) 502s — Caddy is up, no upstream behind it — so flipping `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` does not help. Restoring voice needs a Kokoro instance somewhere reachable; running one on triplestuffed (co-located with Octavius, no network hop) is the obvious candidate.
+  - **`:8020` bge-m3 — the embedding primary.** Degrades cleanly: the `workhorse:11434` Ollama fallback is up and verified returning 1024-dim vectors, so semantic history/inbox search still works.
+  - **`:8010` — main-chain fallback.** Now the third hop; costs only a fast connect failure while down.
+
+- **triplestuffed:8010 is a zombie (2026-08-08).** `/v1/models` answers `200` in ~1 ms, but `/v1/chat/completions` never returns (>30 s by hand, 120 s `ReadTimeout` in the app) — its GPUs are serving Positron IDE autocomplete/NES models. Reachability checks pass while generation is dead, the same failure shape as the reader's stale `qwen3.5-9b`: **do not treat a `/v1/models` probe as proof an endpoint works.** Removed from the main chain and from the summary chain as a result.
+
+  Consequence for the cross-host work: the two hosts that were candidates for the subagent/vision `fallback` slot are exactly these two. Fix the hosts before wiring anything to them, and verify with a real completion, not a model list.
+
+- **`/health` latches `degraded` until restart.** `main.py` computes `degraded = mcp_degraded or llm_health["terminal_failures"] > 0`, and `terminal_failures` is a lifetime counter — so a single all-endpoints-failed request pins `status: "degraded"` forever even after the chain fully recovers. Observed 2026-08-08: one failed turn at 13:48, chain healthy at 14/15 successes afterwards, still reporting degraded. Contrast the per-endpoint `last_error_kind`, which deliberately clears on success. Making `degraded` reflect current state (e.g. terminal failure since last success, or a recent window) is a small `main.py` change; not done yet because it changes a signal anything might be alerting on.
+
+- **Both lilripper LLM ports are llama.cpp routers now (2026-08-08), so model ids are load-bearing.** `:8020` stopped being a single-model server; the bare `qwen3.6-35b-a3b` alias exists on **neither** lilripper port (only on `triplestuffed:8010` / `lilbuddy:8010`). `complete_with_tools` and `stream_chat` send each chain *entry's* model, and an alias missing from that endpoint's catalog hard-400s — which `LLMChainClient` treats as an ordinary failure, so it silently burns a failover hop instead of surfacing as a config error. This bit the subagent fallback, which sat on the dead bare alias until 2026-08-08 (every subagent failover was a guaranteed 400 — i.e. `consult_specialist` effectively had no failover at all). Full per-port catalogs are in CLAUDE.md under "Router model ids"; re-curl `/v1/models` on both ports before trusting a model id.
 
 ## Near-Term Work
 
@@ -147,8 +238,56 @@ Likely refactor targets, in rough priority order:
 1. Further narrow `main.py` so it remains a routing layer rather than a coordination module.
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
-4. Restore cross-host failover for the subagent chain (see Stability Notes): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive.
+4. Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input, which no non-lilripper endpoint currently does. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
 5. Transcription/dictation mode (Dave, 2026-07-12): capture speech (Android app first), transcribe, and save the transcript to the `saved_items` stash — deliberately NOT the vault. No agent turn, no TTS. Revives the stash write path for non-note payloads; needs a WS message or REST route for STT-to-stash (the unwired `save_to_stash` helper in `local_tool_inbox.py` is a starting point). App-side sketch in `../octavius-android/docs/HANDOFF.md` NEXT WORK #3.
+
+## Planned: `deep_research` domain via headless pi (2026-08-08)
+
+Dave raised replacing the in-process subagent loop with `pi --mode json -p --no-session`
+so specialist behavior isn't re-implemented in Octavius every time an MCP server changes.
+Conclusion: **do it for a new async `deep_research` domain only; leave the inline quick
+domains (email/tasks/research) on `subagent.py`.**
+
+Why not for the inline domains:
+
+- Warm MCP sessions are the whole latency story. `run_subagent` borrows the main
+  process's already-connected `MCPManager` sessions. A headless pi call is a cold
+  process: interpreter start + an MCP handshake per server, *per call*.
+  `consult_specialist` already averages ~15 s (50 s worst) and is the dominant Matrix
+  first-turn cost — process startup would land directly on voice latency.
+- Shelling out bypasses `SubagentDispatcher`, so `:8010`'s `--parallel 3` capacity
+  accounting is lost unless the ticket is re-wrapped around the subprocess (doable —
+  the ticket is independent of the LLM call, see `run_inline_subagent`).
+- The `===TOOL DATA===` block in `_compose_result` (verbatim tool observations, so the
+  main agent lifts exact IDs rather than trusting paraphrased numbers) has no pi
+  equivalent; it would mean parsing raw tool results out of pi's json event stream.
+- Per-tool `status_callback` → UI status line would likewise need re-deriving from
+  pi events.
+
+Also worth recording, because it undercuts the original motivation: **MCP tool schemas
+already flow through dynamically.** `mcp.get_tools_for_servers()` filters live session
+tools, so a server adding or renaming a tool needs no Octavius change. What doesn't
+auto-update is the per-domain system prompt — the evangeline `hybrid_search`
+folder=null/`1970-01-01` defaults, the Vikunja `done=false` trap, the don't-search-twice
+guard in `SUBAGENT_DOMAINS`. That is accumulated tuning, and moving to pi relocates it
+rather than removing it.
+
+Why it fits `deep_research`:
+
+- The async delegation path is already built and reserved for exactly this:
+  `delegate_task` / `pull_delegation` / `list_pending_delegations` / `cancel_delegation`,
+  the "Agents at Work" badge, `spawn_delegation` / `_run_and_announce`, the
+  `proactive_speak` setting, and the `delegation_*` WS messages all still exist and are
+  merely unregistered. Re-enabling is one tool spec plus one registry line.
+- Process startup is noise against a multi-minute research run.
+- pi already has a parallel `deep_research` orchestrator, which is the part genuinely
+  not worth reimplementing.
+
+Sketch: a `deep_research` entry in the local tool specs → `spawn_delegation` →
+`_run_and_announce` shells out to `pi --mode json -p --no-session`, parses the final
+assistant `message_end`, and announces via the existing badge/pull lifecycle. Keep the
+dispatcher ticket around the subprocess so long research runs still respect endpoint
+capacity. Not started; no code written.
 
 ## Migration Note
 

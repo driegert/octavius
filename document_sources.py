@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from urllib.parse import urlparse
+
+TITLE_MAX_CHARS = 80
 
 
 def is_pdf_bytes(data: bytes) -> bool:
     return data.startswith(b"%PDF-")
+
+
+def derive_title_from_text(text: str, default: str = "Pasted Text") -> str:
+    """Best-effort title for pasted text, which has no filename or URL to borrow.
+
+    Takes the first markdown heading or first non-empty line, strips leading
+    heading hashes and list markers, and truncates. Falls back to `default` for
+    text that is empty or only punctuation.
+    """
+    for line in text.splitlines():
+        stripped = re.sub(r"^\s*(#+|[-*+>]|\d+[.)])\s*", "", line).strip()
+        if not stripped or not any(ch.isalnum() for ch in stripped):
+            continue
+        if len(stripped) > TITLE_MAX_CHARS:
+            stripped = stripped[: TITLE_MAX_CHARS - 3].rstrip() + "..."
+        return stripped
+    return default
 
 
 def is_likely_html(text: str) -> bool:

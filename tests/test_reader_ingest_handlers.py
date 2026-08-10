@@ -69,22 +69,85 @@ class ReaderIngestHandlerTests(unittest.TestCase):
             handlers.start_retry_task(Path("/tmp/fake.db"), _FakeMCP(), doc, _ReaderIngestError)
         self.assertEqual(ctx.exception.status_code, 400)
 
-    def test_start_text_ingest_creates_background_task(self):
+    def _run_text_ingest(self, text, title=None, *, save_side_effect=None):
+        """Run start_text_ingest with persistence stubbed; returns (result, tasks, saved)."""
         created_tasks = []
+        saved = {}
 
         def fake_create_task(coro):
             created_tasks.append(coro)
             coro.close()
             return None
 
+        def fake_save(doc_id, body, doc_title):
+            if save_side_effect:
+                raise save_side_effect
+            saved.update(doc_id=doc_id, text=body, title=doc_title)
+            return Path(f"/reader/pasted/{doc_id}-slug.md")
+
         with (
             patch.object(handlers, "create_document", return_value=42),
+            patch.object(handlers, "save_pasted_text", side_effect=fake_save),
+            patch.object(handlers, "update_document") as update_doc,
+            patch.object(handlers, "connect_db"),
             patch.object(handlers.asyncio, "create_task", side_effect=fake_create_task),
         ):
-            result = asyncio.run(handlers.start_text_ingest(Path("/tmp/test.db"), "hello", "Hello"))
+            result = asyncio.run(handlers.start_text_ingest(Path("/tmp/test.db"), text, title))
+        return result, created_tasks, saved, update_doc
 
-        self.assertEqual(result, {"id": 42, "status": "processing"})
-        self.assertEqual(len(created_tasks), 1)
+    def test_start_text_ingest_creates_background_task(self):
+        result, tasks, _, _ = self._run_text_ingest("hello", "Hello")
+        self.assertEqual(result, {"id": 42, "status": "processing", "title": "Hello"})
+        self.assertEqual(len(tasks), 1)
+
+    def test_start_text_ingest_derives_title_when_omitted(self):
+        result, _, saved, _ = self._run_text_ingest("# Multitaper Notes\n\nbody text", None)
+        self.assertEqual(result["title"], "Multitaper Notes")
+        self.assertEqual(saved["title"], "Multitaper Notes")
+
+    def test_start_text_ingest_ignores_blank_title(self):
+        result, _, _, _ = self._run_text_ingest("first line here", "   ")
+        self.assertEqual(result["title"], "first line here")
+
+    def test_start_text_ingest_persists_source_path_for_retry(self):
+        """Pasted text has no file behind it, so it is written out and recorded
+        as source_path — otherwise start_retry_task has nothing to re-read."""
+        _, _, saved, update_doc = self._run_text_ingest("body", "Title")
+        self.assertEqual(saved["text"], "body")
+        self.assertEqual(saved["doc_id"], 42)
+        update_doc.assert_called_once()
+        self.assertEqual(
+            update_doc.call_args.kwargs["source_path"], "/reader/pasted/42-slug.md"
+        )
+
+    def test_start_text_ingest_survives_persistence_failure(self):
+        """A failed write costs retryability, never the document itself."""
+        result, tasks, _, update_doc = self._run_text_ingest(
+            "body", "Title", save_side_effect=OSError("read-only fs")
+        )
+        self.assertEqual(result["id"], 42)
+        self.assertEqual(len(tasks), 1)
+        update_doc.assert_not_called()
+
+    def test_pasted_text_document_is_retryable_through_markdown_branch(self):
+        """The persisted file makes retry work with no new retry code."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "42-notes.md"
+            source.write_text("# Notes\n\nbody", encoding="utf-8")
+            doc = {
+                "id": 42,
+                "title": "Notes",
+                "source_type": "markdown",
+                "source_path": str(source),
+                "original_md_file": None,
+            }
+            created = []
+            with patch.object(
+                handlers.asyncio, "create_task",
+                side_effect=lambda coro: (created.append(coro), coro.close(), None)[2],
+            ):
+                handlers.start_retry_task(Path("/tmp/fake.db"), _FakeMCP(), doc, _ReaderIngestError)
+            self.assertEqual(len(created), 1)
 
     def test_ingest_pdf_document_marks_failed_when_no_job_id_returned(self):
         with tempfile.TemporaryDirectory() as tmpdir:

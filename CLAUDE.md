@@ -50,19 +50,42 @@ a reference for variable names and defaults, not a file the app consumes.
   repo). After editing either file: `systemctl --user daemon-reload && systemctl --user restart octavius`.
 - **Foreground**: `set -a; source ~/.config/octavius/env; set +a; uv run python main.py`.
 
-**LLM endpoint auth**: `OCTAVIUS_LLM_API_KEYS` is a JSON object mapping endpoint
-*origin* (`scheme://host:port`) to a bearer token, e.g.
-`{"http://lilripper:8010":"sk-..."}`. `service_clients.auth_headers()` resolves
-it by URL for every `LLMChainClient` request path (`stream_chat`, `complete`,
-`complete_with_tools`); endpoints absent from the map are called with no
-`Authorization` header, exactly as before. Keys are held per origin, not per
-chain entry, because one endpoint is reached from several chains — `lilripper:8010`
-serves the reader LLM, the vision chain, *and* the subagent fallback tier, and the
-reader calls it through a client whose own chain doesn't list it. In a systemd
-`EnvironmentFile`, single-quote the value so the JSON survives:
-`OCTAVIUS_LLM_API_KEYS='{"http://lilripper:8010":"sk-..."}'`.
-Auth failures surface as ordinary chain failures — a 401 is an `HTTPStatusError`,
-so it burns a failover hop and shows up in `/health`'s `llm_chain` section.
+**LLM endpoint auth**: only `lilripper:8010` is behind auth. Two env vars feed
+`settings.llm_api_keys`, which `service_clients.auth_headers()` resolves by URL
+for every `LLMChainClient` request path (`stream_chat`, `complete`,
+`complete_with_tools`):
+
+- **`OCTAVIUS_8010_API_KEY`** (preferred) — a bare token for `lilripper:8010`.
+  This is the value that rotates, so it **wins** over the JSON map. The var name
+  is stable across rotations by design. It is scoped to lilripper, *not* to port
+  8010: `lilbuddy:8010` and `triplestuffed:8010` also listen on 8010 and are
+  open, so they must never receive the header (`settings.KEYED_8010_ORIGIN`
+  pins this; there are tests).
+- **`OCTAVIUS_LLM_API_KEYS`** — the general mechanism: a JSON object mapping
+  endpoint *origin* (`scheme://host:port`) to a bearer token, e.g.
+  `{"http://lilripper:8010":"sk-..."}`. Use it if another endpoint goes behind
+  auth. In a systemd `EnvironmentFile`, single-quote the value so the JSON
+  survives: `OCTAVIUS_LLM_API_KEYS='{"http://lilripper:8010":"sk-..."}'`.
+
+Endpoints absent from both are called with no `Authorization` header. Keys are
+held per origin, not per chain entry, because one endpoint is reached from
+several chains — `lilripper:8010` serves the reader LLM, the vision fallback,
+*and* the subagent primary tier, and the reader calls it through a client whose
+own chain doesn't list it.
+
+A 401 still burns a failover hop (it is an `HTTPStatusError` like any other),
+but as of 2026-08-08 it no longer *hides*: `service_clients.classify_chain_error`
+buckets every chain failure into `auth` / `client_error` / `server_error` /
+`connect` / `connect_timeout` / `timeout` / `bad_response`, and `/health`'s `llm_chain` reports
+`endpoints_rejecting_credentials`, `auth_failures`, `last_failure_kind`, and
+per-endpoint `last_error_kind` / `last_error_status` / `authenticated`. A 401
+also logs at ERROR naming the origin and which env var to check. `last_error_*`
+clears on that endpoint's next success, so a non-null value means "currently
+believed broken, this way"; the counters are lifetime. The practical split:
+`auth` = key problem; `connect`/`connect_timeout` = host down (no TCP
+handshake); `timeout` = host accepted the connection but never generated (a
+"zombie" — `/v1/models` answers, completions hang); `client_error` (usually
+400/404) = model alias missing from that endpoint's catalog.
 
 Primary UI routes:
 
@@ -141,15 +164,20 @@ defeat the Inbox-only and 6-month-lookback defaults on the other search tools.
 External services currently expected:
 
 - **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
-- **LLM chain (main agent)**: Qwen3.6-35B-A3B via `OCTAVIUS_LLM_CHAIN`, defaulting to:
-  - primary: `lilripper:8020/v1/chat/completions`
-  - first fallback: `127.0.0.1:8001/v1/chat/completions` on lilbuddy
-  - second fallback: `triplestuffed:8010/v1/chat/completions`
+- **LLM chain (main agent)**: via `OCTAVIUS_LLM_CHAIN`, defaulting to:
+  - primary: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general` — a llama.cpp **router**, so the model id selects the model (see "Router model ids" below). Accepts image input. No auth. Shared with pi-agent (which pulls the 27B), and that contention has produced a live `500 model ... failed to load`.
+  - first fallback: `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-mtp-q4-general`) — deliberately the alias **already resident** on `:8010`, not the Q6 `mtp-general`. Failing over to a different alias would pin `:8010` to it for the length of a `:8020` outage and make every `consult_specialist` and reader call swap the model back, turning one degraded endpoint into three. Behind auth.
+  - second fallback: `lilbuddy:8010/v1/chat/completions` (`qwen3.6-35b-a3b`) — plain single-model server, text-only, so an image turn must never land on it (hence the separate vision chain below).
+  - `triplestuffed:8010` was **removed** from this chain on 2026-08-08: its GPUs serve Positron autocomplete/NES models, and it accepts connections without ever generating, so failing into it burned the full 120 s read timeout. See `docs/status.md`.
 - **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
-  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-general`, `capacity: 3` — served with `--parallel 3`, so consults no longer queue behind the main agent's own turn on the single-slot `:8020`. `consult_specialist` is the dominant Matrix first-turn cost (~15 s average, 50 s worst), and it reserves a dispatcher ticket, so the old `capacity: 1` also serialised concurrent consults against each other. Same model as the reader and the vision chain, so sharing `:8010` costs no extra llama-swap.
-  - fallback: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b` — HTTP-level failover only.
+  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-q4-general`, `capacity: 3` — served with `--parallel 3`, so consults no longer queue behind the main agent's own turn on the single-slot `:8020`. `consult_specialist` is the dominant Matrix first-turn cost (~15 s average, 50 s worst), and it reserves a dispatcher ticket, so the old `capacity: 1` also serialised concurrent consults against each other. The q4 MTP variant is chosen for speculative-decoding speed: on tool-calling work, latency beats Q5 weights. Same alias as the reader, so sharing `:8010` costs no extra model swap.
+  - fallback: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general` — HTTP-level failover only.
   - The dispatcher (`subagent_dispatcher.py`) routes by `role`. Only two roles matter per call: `primary` (first-try / concurrency routing, with `secondary` as an optional concurrency-overflow tier) and `fallback` (the single per-call HTTP-failover target passed alongside the assigned URL). Per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
-  - **Model-alias gotcha**: `lilripper:8010` is a llama-swap that serves `qwen3.6-35b-a3b-general` / `-code` and the reader's `qwen3.5-9b` — **not** the bare `qwen3.6-35b-a3b` alias (that alias only exists on `lilripper:8020`, `triplestuffed:8010`, and `lilbuddy:8010`). `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so a wrong alias hard-400s and silently costs a failover hop. `lilripper:8010` is also shared with the reader, so interleaving document reading and email/task consults pays a llama-swap cost.
+  - **Model is per endpoint, not per domain.** `subagent.py::_model_for_url` resolves the model from the chain entry matching the assigned URL, so all three specialist domains sharing `:8010` share one model. Per-domain models would need a `model` key on `SUBAGENT_DOMAINS` overriding that lookup.
+  - **Router model ids (both ports are routers now; the alias is load-bearing).** `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so an alias absent from that endpoint's catalog hard-400s and silently burns a failover hop. The bare `qwen3.6-35b-a3b` alias exists on **neither** lilripper port — only on `triplestuffed:8010` and `lilbuddy:8010`. Catalogs as of 2026-08-08:
+    - `:8020` (5 aliases): `qwen3.6-27b-mtp-{code,general}`, `qwen3.6-35b-a3b-mtp-{code,general}`, `unsloth/Qwen3-Coder-30B-A3B-Instruct-1M-GGUF:Q8_0`. All but the unsloth coder accept images.
+    - `:8010` (14 aliases): the above plus `qwen3.6-35b-a3b-{code,general}`, `qwen3.6-35b-a3b-mtp-q4-{code,general}`, `gemma4-26b-a4b`, `gemma4-31b`, `glm-4.7-flash`, `ministral-14b`, `qwen3.5-9b`.
+  - **Keep `:8010`'s consumers on one alias.** The subagent chain, the reader, and the vision fallback all point at `:8010`; if they disagree on the alias, interleaving a document read with a consult thrashes the router between resident models. Same applies to `:8020` (main chain + vision primary + subagent fallback all on `qwen3.6-35b-a3b-mtp-general`).
   - **KNOWN LIMITATION (handle later):** both tiers live on `lilripper` (`:8010` primary, `:8020` fallback), so there is **no cross-host failover** — if `lilripper` is fully down, `consult_specialist` has nowhere to go. `lilbuddy:8010` / `triplestuffed:8010` were dropped from the subagent chain. Because the dispatcher only tries `[assigned_url, fallback_url]` per call, restoring cross-host resilience means putting a remote host (e.g. `triplestuffed:8010`, local; or `lilbuddy:8010`) in the **`fallback`** slot — a `secondary` entry only absorbs concurrency overflow, not error-failover. See `docs/status.md`.
 - **TTS**: Kokoro at `lilbuddy:8880/v1/audio/speech` (voice `bm_lewis`) — the live
   default. `TTSSettings.voxtral_enabled` is **False**, so every synth call goes
@@ -157,12 +185,12 @@ External services currently expected:
   (`OCTAVIUS_TTS_URL`) is wired but disabled — its inconsistent output levels make
   it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` to restore
   the Voxtral-primary → Kokoro-fallback path (with circuit breaker).
-- **Reader LLM**: Qwen3.5-9B at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets")
-- **Summary/tag generation**: summary chain defaults to `127.0.0.1:8001/v1/chat/completions` with fallback `triplestuffed:8010/v1/chat/completions`
+- **Reader LLM**: `qwen3.6-35b-a3b-mtp-q4-general` at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets"). `qwen3.5-9b` is still in `:8010`'s catalog but went stale — it lists in `/v1/models` and then hangs on completion, which silently degraded every math chunk to dollar-stripping. Alias deliberately matches the subagent chain's `:8010` entry.
+- **Summary/tag generation**: `lilripper:8020` with fallback `lilripper:8010`, model `qwen3.6-35b-a3b-mtp-general` (moved off the dead lilbuddy/triplestuffed pair 2026-08-08). `SummaryClient` is **not** an `LLMChainClient`: it sends one model to both URLs, so the alias must exist on both ports. It does attach `auth_headers` (added 2026-08-08 — previously it sent none, so any authed endpoint here would have 401'd silently). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
   - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
-- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-general`) — the only chain endpoint with image input enabled, and **behind auth** (see "Configuration and secrets"). Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
+- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`) with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-q4-general`) as fallback — the `:8010` entry is **behind auth** (see "Configuration and secrets"). The primary is now the *same endpoint and model as the main chain*, since `:8020` gained image input; the chain stays separate purely so image turns can't fail over onto the main chain's text-only fallbacks on lilbuddy/triplestuffed. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
 Configured MCP servers:
@@ -208,7 +236,7 @@ Configured MCP servers:
   citations/LaTeX for converted journal PDFs).
 - Conversation history trims automatically to 40 messages.
 - `/health` distinguishes `alive`, `ready`, and `degraded` states.
-- `/health` exposes per-server MCP connection status plus `llm_chain` observability including configured endpoints, failover count, terminal failures, and the last successful endpoint.
+- `/health` exposes per-server MCP connection status plus `llm_chain` observability including configured endpoints, failover count, terminal failures, the last successful endpoint, and **failure classification** — `endpoints_rejecting_credentials` / `auth_failures` / `last_failure_kind`, plus per-endpoint `last_error_kind`, `last_error_status`, and `authenticated`. Check `endpoints_rejecting_credentials` first when a chain looks flaky: non-empty means a key problem, not an outage.
 
 WebSocket message families:
 
@@ -253,7 +281,7 @@ Conversation and tool loop:
 - `vault_files.py` - pure file I/O over the Obsidian vault (path-safe, journaling-denied, atomic hash-guarded writes); search never goes through this module
 - `local_tool_inbox.py` - legacy stash save/read helpers (`save_to_stash` / `list_stash_items` — retired/unwired, no longer registered as tools)
 - `stash_to_obsidian.py` - watermark-based one-way exporter of `saved_items` rows to the vault inbox (run via the `obsidian-stash-export.timer` user unit)
-- `local_tool_reader.py` - local reader handoff and background PDF-processing helpers
+- `local_tool_reader.py` - local reader handoff (file, and raw text via `read_document(text=...)`) and background PDF-processing helpers
 - `local_tool_documents.py` - `check_document_status` local tool (polls a docproc job by id)
 - `docproc_client.py` - loopback HTTP client for the docproc web queue (submit/poll a PDF conversion job); Octavius never imports the `docproc` package
 
@@ -385,7 +413,7 @@ Still live:
 
 ### Document Reader
 
-- Accepts local files, URLs, and inbox items.
+- Accepts local files, URLs, inbox items, and **raw pasted text**.
 - Converts PDF, markdown, and extracted HTML content into speech-oriented JSON.
 - HTML extraction uses trafilatura.
 - Math-heavy paragraphs are sent to the reader LLM; non-math paragraphs are cleaned locally.
@@ -396,7 +424,16 @@ Still live:
 Reader storage:
 
 - speech-ready JSON files: `/home/dave/octavius-reader/`
+- pasted-text originals: `/home/dave/octavius-reader/pasted/<doc_id>-<slug>.md`
 - metadata: `reader_documents` table
+
+Pasted text (`source: "text"`) is the one source with no file or URL behind it,
+so `start_text_ingest` writes it out and records the path as `source_path`.
+That is what makes it retryable: `start_retry_task`'s existing `markdown`
+branch re-reads `source_path`, so retry needed no new code. Writing it out is
+best-effort — a failure costs retryability, never the document. Both entry
+points (the `/reader` paste box and the agent's `read_document(text=...)`) go
+through `start_text_ingest`, so both get title derivation and persistence.
 
 ### Matrix media (image / PDF turns)
 
@@ -409,11 +446,16 @@ wire contract both repos implement against.
   base64-reads the spool file and builds an OpenAI-style multimodal content
   array. The turn routes through `settings.vision_llm_chain` instead of the
   default chain (see `agent.py`'s `use_vision` handling in
-  `stream_agent_turn`). Once the turn completes, the in-memory conversation's
-  image content is downgraded back to a text placeholder
-  (`Conversation.replace_last_user_content`) — later turns go back to the
-  default text chain. Persisted history and the memory extractor only ever
-  see the placeholder/caption text, never base64.
+  `stream_agent_turn`). The image content array **stays** in the in-memory
+  conversation and the thread stays on the vision chain for its remaining
+  turns (`Conversation.has_images` is sticky until reset/load), so follow-up
+  questions about the same image still see the pixels rather than a summary.
+  llama.cpp's prefix cache absorbs the re-sent image tokens; payload growth is
+  bounded by `Conversation.trim()`. `Conversation.replace_last_user_content`
+  implements a downgrade-to-placeholder but is **not called from production
+  code** (tests only) — an earlier design that was dropped in favour of
+  keeping the image. Persisted history and the memory extractor only ever see
+  the placeholder/caption text, never base64.
 - **PDFs** (`file_input`, `mime=application/pdf`): submitted to the docproc
   web queue deterministically (plain code, not an LLM tool call) via
   `docproc_client.py`. A non-empty caption is treated as instructions —

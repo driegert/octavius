@@ -13,6 +13,7 @@ from service_clients import (
     SummaryClient,
     TTSClient,
     auth_headers,
+    classify_chain_error,
 )
 from settings import _llm_api_keys
 
@@ -32,6 +33,13 @@ class _FakeAsyncClient:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+def _http_error(status: int, url: str = "http://x") -> httpx.HTTPStatusError:
+    """An HTTPStatusError shaped like the ones httpx raises from raise_for_status."""
+    request = httpx.Request("POST", url)
+    response = httpx.Response(status, request=request, text="denied")
+    return httpx.HTTPStatusError(f"{status}", request=request, response=response)
 
 
 class _AsyncNoop:
@@ -88,6 +96,148 @@ def _make_tts_client(kokoro_voices: list[str] | None = None) -> TTSClient:
         response_format="wav",
         kokoro_voices=kokoro_voices,
     )
+
+
+class ChainErrorClassificationTests(unittest.IsolatedAsyncioTestCase):
+    """A stale bearer token must be distinguishable from an endpoint outage.
+
+    Both arrive as exceptions from the same except clause and both burn a
+    failover hop, so without classification /health reports them identically.
+    """
+
+    def test_classify_separates_auth_from_other_failures(self):
+        cases = {
+            401: ("auth", 401),
+            403: ("auth", 403),
+            400: ("client_error", 400),
+            404: ("client_error", 404),
+            500: ("server_error", 500),
+            502: ("server_error", 502),
+        }
+        for status, expected in cases.items():
+            with self.subTest(status=status):
+                self.assertEqual(classify_chain_error(_http_error(status)), expected)
+
+        self.assertEqual(classify_chain_error(httpx.ConnectError("down")), ("connect", None))
+        self.assertEqual(classify_chain_error(KeyError("choices")), ("bad_response", None))
+
+    def test_connect_timeout_is_not_confused_with_a_slow_generation(self):
+        """Observed 2026-08-08: lilbuddy:8010 swallowed SYNs (host down) while
+        triplestuffed:8010 accepted the connection and then never generated.
+        Both raise httpx.TimeoutException; they need different responses, so
+        ConnectTimeout must be tested before the generic case."""
+        self.assertEqual(
+            classify_chain_error(httpx.ConnectTimeout("no handshake")),
+            ("connect_timeout", None),
+        )
+        self.assertEqual(
+            classify_chain_error(httpx.ReadTimeout("accepted, never answered")),
+            ("timeout", None),
+        )
+        self.assertTrue(issubclass(httpx.ConnectTimeout, httpx.TimeoutException))
+
+    async def test_health_names_the_endpoint_rejecting_credentials(self):
+        client = LLMChainClient(
+            [
+                {"url": KEYED, "model": "model-a"},
+                {"url": OPEN, "model": "model-a"},
+            ]
+        )
+        # Keyed endpoint 401s (stale token), open endpoint answers.
+        outcomes = [_http_error(401, KEYED), _FakeResponse("ok")]
+        with patch("service_clients.httpx.AsyncClient", return_value=_FakeAsyncClient(outcomes)):
+            result = await client.complete({"messages": []})
+
+        self.assertEqual(result, "ok")
+        health = client.get_health()
+        self.assertEqual(health["endpoints_rejecting_credentials"], [KEYED])
+        self.assertEqual(health["auth_failures"], 1)
+        self.assertEqual(health["endpoints"][0]["last_error_kind"], "auth")
+        self.assertEqual(health["endpoints"][0]["last_error_status"], 401)
+        self.assertEqual(health["endpoints"][0]["auth_failures"], 1)
+
+    async def test_outage_is_not_reported_as_an_auth_problem(self):
+        """The whole point: a down endpoint must NOT show up as a key problem."""
+        client = LLMChainClient(
+            [
+                {"url": KEYED, "model": "model-a"},
+                {"url": OPEN, "model": "model-a"},
+            ]
+        )
+        outcomes = [httpx.ConnectError("host down"), _FakeResponse("ok")]
+        with patch("service_clients.httpx.AsyncClient", return_value=_FakeAsyncClient(outcomes)):
+            await client.complete({"messages": []})
+
+        health = client.get_health()
+        self.assertEqual(health["endpoints_rejecting_credentials"], [])
+        self.assertEqual(health["auth_failures"], 0)
+        self.assertEqual(health["endpoints"][0]["last_error_kind"], "connect")
+        self.assertIsNone(health["endpoints"][0]["last_error_status"])
+
+    async def test_dead_model_alias_reads_as_client_error_not_outage(self):
+        """A model id absent from a router's catalog hard-400s. It should be
+        distinguishable from both a key problem and the host being down."""
+        client = LLMChainClient([{"url": OPEN, "model": "qwen3.6-35b-a3b"}])
+        with patch(
+            "service_clients.httpx.AsyncClient",
+            return_value=_FakeAsyncClient([_http_error(400, OPEN)]),
+        ):
+            self.assertIsNone(await client.complete({"messages": []}))
+
+        health = client.get_health()
+        self.assertEqual(health["endpoints"][0]["last_error_kind"], "client_error")
+        self.assertEqual(health["endpoints"][0]["last_error_status"], 400)
+        self.assertEqual(health["endpoints_rejecting_credentials"], [])
+        self.assertEqual(health["last_failure_kind"], "client_error")
+
+    async def test_success_clears_stale_error_state(self):
+        """last_error_* describes current belief, so a recovered endpoint must
+        stop being listed as rejecting credentials."""
+        client = LLMChainClient([{"url": KEYED, "model": "model-a"}])
+        outcomes = [_http_error(401, KEYED), _FakeResponse("ok")]
+        with patch("service_clients.httpx.AsyncClient", return_value=_FakeAsyncClient(outcomes)):
+            await client.complete({"messages": []})   # 401, terminal
+            await client.complete({"messages": []})   # key fixed, succeeds
+
+        health = client.get_health()
+        self.assertEqual(health["endpoints_rejecting_credentials"], [])
+        self.assertIsNone(health["endpoints"][0]["last_error_kind"])
+        # Lifetime counter survives; current-state field does not.
+        self.assertEqual(health["auth_failures"], 1)
+        self.assertEqual(health["endpoints"][0]["auth_failures"], 1)
+
+    async def test_offchain_target_auth_failure_is_still_named(self):
+        """The reader reaches lilripper:8010 via llm_client.complete(urls=[...]),
+        an endpoint absent from llm_chain. Its 401 must name the endpoint, not
+        just bump the chain-level counter."""
+        client = LLMChainClient([{"url": OPEN, "model": "model-a"}])
+        with patch(
+            "service_clients.httpx.AsyncClient",
+            return_value=_FakeAsyncClient([_http_error(401, KEYED)]),
+        ):
+            self.assertIsNone(await client.complete({"messages": []}, urls=[KEYED]))
+
+        health = client.get_health()
+        self.assertEqual(health["endpoints_rejecting_credentials"], [KEYED])
+        offchain = [e for e in health["endpoints"] if e["off_chain"]]
+        self.assertEqual([e["url"] for e in offchain], [KEYED])
+        self.assertEqual(offchain[0]["last_error_status"], 401)
+        # The configured endpoint was never attempted and stays clean.
+        self.assertEqual(health["endpoints"][0]["url"], OPEN)
+        self.assertEqual(health["endpoints"][0]["attempts"], 0)
+
+    async def test_health_reports_which_endpoints_send_a_key(self):
+        client = LLMChainClient(
+            [{"url": KEYED, "model": "m"}, {"url": OPEN, "model": "m"}]
+        )
+        with patch.dict(
+            service_clients.settings.llm_api_keys,
+            {"http://lilripper:8010": "sk-abc"},
+            clear=True,
+        ):
+            health = client.get_health()
+        self.assertTrue(health["endpoints"][0]["authenticated"])
+        self.assertFalse(health["endpoints"][1]["authenticated"])
 
 
 class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
@@ -340,7 +490,51 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
     def test_no_keys_configured_by_default(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
+            os.environ.pop("OCTAVIUS_8010_API_KEY", None)
             self.assertEqual(_llm_api_keys(), {})
+
+    def test_dedicated_8010_var_supplies_the_key(self):
+        with patch.dict(os.environ, {"OCTAVIUS_8010_API_KEY": "sk-direct"}):
+            os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
+            self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-direct"})
+
+    def test_dedicated_8010_var_wins_over_json_map(self):
+        """The dedicated var is the one that rotates, so it takes precedence."""
+        env = {
+            "OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-stale"}}',
+            "OCTAVIUS_8010_API_KEY": "sk-fresh",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-fresh"})
+
+    def test_dedicated_8010_var_does_not_leak_to_other_8010_hosts(self):
+        """lilbuddy:8010 and triplestuffed:8010 are open; they must stay unkeyed
+        even though they share the port the env var is named for."""
+        with patch.dict(os.environ, {"OCTAVIUS_8010_API_KEY": "sk-direct"}):
+            os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
+            keys = _llm_api_keys()
+        self.assertNotIn("http://lilbuddy:8010", keys)
+        self.assertNotIn("http://triplestuffed:8010", keys)
+
+        with patch.dict(service_clients.settings.llm_api_keys, keys, clear=True):
+            self.assertEqual(
+                auth_headers("http://lilripper:8010/v1/chat/completions"),
+                {"Authorization": "Bearer sk-direct"},
+            )
+            self.assertEqual(auth_headers("http://lilbuddy:8010/v1/chat/completions"), {})
+            self.assertEqual(
+                auth_headers("http://triplestuffed:8010/v1/chat/completions"), {}
+            )
+
+    def test_blank_dedicated_8010_var_is_ignored(self):
+        """An unset-but-declared EnvironmentFile line must not register an
+        empty token (which would send `Bearer ` and 401)."""
+        env = {
+            "OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-abc"}}',
+            "OCTAVIUS_8010_API_KEY": "   ",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-abc"})
 
     def test_auth_headers_only_for_keyed_origin(self):
         self.assertEqual(auth_headers(KEYED), {"Authorization": "Bearer sk-abc"})

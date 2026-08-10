@@ -29,11 +29,64 @@ def auth_headers(url: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
+# 401/403. Bucketed separately from other 4xx because a rejected credential is
+# otherwise invisible: httpx raises HTTPStatusError for a 401 exactly as it does
+# for a 500, so a stale bearer token burns a failover hop and lands in /health as
+# a generic chain failure — indistinguishable from the endpoint being down.
+AUTH_STATUSES = (401, 403)
+
+
+def classify_chain_error(exc: Exception) -> tuple[str, int | None]:
+    """Bucket a chain-attempt exception into (kind, http_status).
+
+    Kinds are deliberately status-driven rather than body-sniffing, so they
+    stay honest across llama.cpp / llama-swap / router versions:
+
+      auth          401/403 — our key is missing, stale, or not accepted here
+      client_error  other 4xx — most often a model alias absent from this
+                    endpoint's catalog, which hard-400s (see CLAUDE.md
+                    "Router model ids")
+      server_error  5xx — endpoint reachable but failing
+      connect       TCP refused/unreachable — endpoint is down
+      connect_timeout  no TCP handshake within the connect budget — host is
+                    swallowing SYNs (rebooting, firewalled, wedged NIC)
+      timeout       handshake succeeded, but no response in budget — the
+                    server is UP and accepting connections while failing to
+                    generate. A "zombie" endpoint: /v1/models answers fine,
+                    completions hang.
+      bad_response  2xx whose JSON shape we could not parse
+
+    The connect_timeout / timeout split matters operationally: they mean
+    different hosts need different attention, and both otherwise present as a
+    bare `httpx.TimeoutException` (ConnectTimeout subclasses it, so it must be
+    tested first).
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        status = exc.response.status_code
+        if status in AUTH_STATUSES:
+            return "auth", status
+        if 400 <= status < 500:
+            return "client_error", status
+        return "server_error", status
+    if isinstance(exc, httpx.ConnectError):
+        return "connect", None
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "connect_timeout", None
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout", None
+    return "bad_response", None
+
+
 @dataclass
 class EndpointStats:
     attempts: int = 0
     successes: int = 0
     failures: int = 0
+    auth_failures: int = 0
+    # Last observed error for this endpoint, cleared on its next success, so
+    # these describe *current* belief rather than lifetime history.
+    last_error_kind: str | None = None
+    last_error_status: int | None = None
 
 
 @dataclass
@@ -207,6 +260,8 @@ class LLMChainClient:
         self._total_requests = 0
         self._failover_requests = 0
         self._terminal_failures = 0
+        self._auth_failures = 0
+        self._last_failure_kind: str | None = None
         self._last_success_url: str | None = None
         self._last_success_model: str | None = None
         self._last_failure_error: str | None = None
@@ -227,6 +282,10 @@ class LLMChainClient:
                 self._failover_requests += 1
             stats = self._endpoint_stats.setdefault(outcome.url, EndpointStats())
             stats.successes += 1
+            # This endpoint just answered, so whatever it last failed with no
+            # longer describes it. Counters stay; current-state fields clear.
+            stats.last_error_kind = None
+            stats.last_error_status = None
             self._last_success_url = outcome.url
             self._last_success_model = outcome.model
             self._last_failure_error = None
@@ -255,23 +314,82 @@ class LLMChainClient:
             stats = self._endpoint_stats.setdefault(url, EndpointStats())
             stats.attempts += 1
 
+    def _record_endpoint_error(self, url: str, exc: Exception) -> str:
+        """Classify and record a single failed attempt against one endpoint.
+
+        Returns the kind so callers can log it. Auth failures get an explicit
+        error-level log naming the env var to check, because the whole point of
+        this classification is that a stale key would otherwise read as "that
+        endpoint is flaky".
+        """
+        kind, status = classify_chain_error(exc)
+        with self._lock:
+            stats = self._endpoint_stats.setdefault(url, EndpointStats())
+            stats.last_error_kind = kind
+            stats.last_error_status = status
+            self._last_failure_kind = kind
+            if kind == "auth":
+                stats.auth_failures += 1
+                self._auth_failures += 1
+        if kind == "auth":
+            origin = endpoint_origin(url)
+            log.error(
+                "LLM %s rejected our credentials (HTTP %s). This is an AUTH failure, "
+                "not an outage — check the bearer token for origin %s "
+                "(OCTAVIUS_8010_API_KEY, or OCTAVIUS_LLM_API_KEYS). Sending %s.",
+                url, status, origin,
+                "a key" if settings.llm_api_keys.get(origin) else "NO key",
+            )
+        return kind
+
     def get_health(self) -> dict:
         with self._lock:
-            endpoints = [
-                {
-                    "url": entry["url"],
-                    "model": entry["model"],
-                    "attempts": self._endpoint_stats.get(entry["url"], EndpointStats()).attempts,
-                    "successes": self._endpoint_stats.get(entry["url"], EndpointStats()).successes,
-                    "failures": self._endpoint_stats.get(entry["url"], EndpointStats()).failures,
+            endpoints = []
+            rejecting_credentials = []
+
+            def row(url: str, model: str | None, off_chain: bool) -> dict:
+                stats = self._endpoint_stats.get(url, EndpointStats())
+                if stats.last_error_kind == "auth":
+                    rejecting_credentials.append(url)
+                return {
+                    "url": url,
+                    "model": model,
+                    "attempts": stats.attempts,
+                    "successes": stats.successes,
+                    "failures": stats.failures,
+                    "auth_failures": stats.auth_failures,
+                    # Cleared on this endpoint's next success, so a non-null
+                    # value means "currently believed broken, this way".
+                    "last_error_kind": stats.last_error_kind,
+                    "last_error_status": stats.last_error_status,
+                    "authenticated": bool(
+                        settings.llm_api_keys.get(endpoint_origin(url))
+                    ),
+                    "off_chain": off_chain,
                 }
-                for entry in self.chain
+
+            configured = {entry["url"] for entry in self.chain}
+            endpoints = [row(e["url"], e["model"], False) for e in self.chain]
+            # Callers may target a URL outside this client's own chain via the
+            # `urls=` argument — the reader does exactly that, reaching
+            # lilripper:8010 through llm_client. Those endpoints still record
+            # stats, so surface them here or their auth failures would bump the
+            # chain-level counter without ever naming the endpoint.
+            endpoints += [
+                row(url, None, True)
+                for url in sorted(self._endpoint_stats)
+                if url not in configured
             ]
             return {
                 "configured_endpoints": len(self.chain),
                 "total_requests": self._total_requests,
                 "failover_requests": self._failover_requests,
                 "terminal_failures": self._terminal_failures,
+                "auth_failures": self._auth_failures,
+                # The headline: endpoints whose most recent attempt was a
+                # 401/403. Non-empty means a key problem, not an outage.
+                "endpoints_rejecting_credentials": rejecting_credentials,
+                "last_failure_kind": self._last_failure_kind,
                 "last_success_url": self._last_success_url,
                 "last_success_model": self._last_success_model,
                 "last_failure_error": self._last_failure_error,
@@ -324,6 +442,7 @@ class LLMChainClient:
                         return
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                     failed_urls.append(entry["url"])
+                    self._record_endpoint_error(entry["url"], exc)
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
                         try:
                             body = exc.response.text[:1000]
@@ -384,6 +503,7 @@ class LLMChainClient:
                     return text
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, KeyError, IndexError, json.JSONDecodeError) as exc:
                     failed_urls.append(url)
+                    self._record_endpoint_error(url, exc)
                     log.debug("Completion failed via %s", url, exc_info=True)
                     continue
         self._record_failure(
@@ -452,6 +572,7 @@ class LLMChainClient:
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                         KeyError, IndexError, json.JSONDecodeError) as exc:
                     failed_urls.append(entry["url"])
+                    self._record_endpoint_error(entry["url"], exc)
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
                         try:
                             body = exc.response.text[:1000]
@@ -472,6 +593,15 @@ class LLMChainClient:
 
 
 class SummaryClient:
+    """Conversation-end summary/tag generation.
+
+    Unlike LLMChainClient this carries one model for both URLs (the payload's
+    model is sent as-is), so both endpoints must serve the same alias. It does
+    attach `auth_headers` — without them an authenticated endpoint here 401s
+    silently, since a failed summary only means a missing summary, never a
+    user-visible error.
+    """
+
     def __init__(self, primary_url: str, fallback_url: str):
         self.urls = [primary_url, fallback_url]
 
@@ -486,7 +616,9 @@ class SummaryClient:
                         len(self.urls),
                         url,
                     )
-                resp = requests.post(url, json=payload, timeout=timeout)
+                resp = requests.post(
+                    url, json=payload, timeout=timeout, headers=auth_headers(url)
+                )
                 resp.raise_for_status()
                 text = resp.json()["choices"][0]["message"]["content"].strip()
                 if failed_urls:
@@ -514,7 +646,7 @@ class SummaryClient:
                             len(self.urls),
                             url,
                         )
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json=payload, headers=auth_headers(url))
                     resp.raise_for_status()
                     text = resp.json()["choices"][0]["message"]["content"].strip()
                     if failed_urls:

@@ -202,3 +202,51 @@ class ReaderIngestServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReaderIngestTextSourceTests(unittest.TestCase):
+    """The `text` source is what backs both the /reader paste box and the
+    agent's read_document(text=...) call."""
+
+    def test_rejects_empty_text(self):
+        with self.assertRaises(service.ReaderIngestError) as ctx:
+            asyncio.run(service.start_reader_ingest("/tmp/x.db", _FakeMCP(), {"source": "text", "text": ""}))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_rejects_whitespace_only_text(self):
+        with self.assertRaises(service.ReaderIngestError) as ctx:
+            asyncio.run(
+                service.start_reader_ingest("/tmp/x.db", _FakeMCP(), {"source": "text", "text": "   \n "})
+            )
+        self.assertEqual(ctx.exception.message, "Text is empty")
+
+    def test_passes_text_and_title_through(self):
+        seen = {}
+
+        async def fake_start(db_path, text, title):
+            seen.update(text=text, title=title)
+            return {"id": 1, "status": "processing", "title": title or "Derived"}
+
+        with patch.object(service, "start_text_ingest", side_effect=fake_start):
+            result = asyncio.run(
+                service.start_reader_ingest(
+                    "/tmp/x.db", _FakeMCP(), {"source": "text", "text": "body", "title": "Mine"}
+                )
+            )
+        self.assertEqual(seen, {"text": "body", "title": "Mine"})
+        self.assertEqual(result["id"], 1)
+
+    def test_omitted_title_is_not_defaulted_to_untitled(self):
+        """start_text_ingest derives a title from the content, so the route must
+        forward None rather than the generic "Untitled" default."""
+        seen = {}
+
+        async def fake_start(db_path, text, title):
+            seen.update(title=title)
+            return {"id": 1, "status": "processing", "title": "Derived"}
+
+        with patch.object(service, "start_text_ingest", side_effect=fake_start):
+            asyncio.run(
+                service.start_reader_ingest("/tmp/x.db", _FakeMCP(), {"source": "text", "text": "body"})
+            )
+        self.assertIsNone(seen["title"])

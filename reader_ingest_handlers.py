@@ -13,6 +13,7 @@ import httpx
 from db import connect_db
 from document_sources import (
     decode_text_bytes,
+    derive_title_from_text,
     ensure_pdf_suffix,
     is_likely_html,
     is_pdf_file,
@@ -361,11 +362,53 @@ async def start_url_ingest(
     return {"id": doc_id, "status": "processing"}
 
 
-async def start_text_ingest(db_path: Path, text: str, title: str) -> dict:
+PASTED_TEXT_DIRNAME = "pasted"
+
+
+def _slugify(title: str, limit: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return slug[:limit] or "untitled"
+
+
+def save_pasted_text(doc_id: int, text: str, title: str) -> Path:
+    """Persist pasted text under the reader directory and return its path.
+
+    Pasted text is the one source with no file or URL behind it, so without
+    this the content would exist only in the request body: a failed ingest
+    would be permanently unrecoverable and the retry button would report
+    "Cannot retry markdown document without a stored source path". Writing it
+    out lets retry reuse the existing `markdown` branch of `start_retry_task`
+    unchanged.
+    """
+    directory = Path(settings.reader.directory) / PASTED_TEXT_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{doc_id}-{_slugify(title)}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+async def start_text_ingest(db_path: Path, text: str, title: str | None = None) -> dict:
+    """Ingest raw pasted text/markdown. Derives a title when none is given."""
+    title = (title or "").strip() or derive_title_from_text(text)
     with connect_db(db_path) as conn:
         doc_id = create_document(conn, title, "markdown")
+
+    # Best-effort, and deliberately broad: persisting the text only buys the
+    # ability to RETRY this document later. A failure here (unwritable reader
+    # dir, DB hiccup) must not cost the ingest itself, which is already usable
+    # from the in-memory text below.
+    try:
+        source_path = str(save_pasted_text(doc_id, text, title))
+        with connect_db(db_path) as conn:
+            update_document(conn, doc_id, source_path=source_path)
+    except Exception:
+        log.warning(
+            "Reader: could not persist pasted text for document %d; "
+            "ingest continues but retry will be unavailable", doc_id, exc_info=True,
+        )
+
     asyncio.create_task(ingest_document_task(db_path, doc_id, text, title))
-    return {"id": doc_id, "status": "processing"}
+    return {"id": doc_id, "status": "processing", "title": title}
 
 
 async def start_inbox_ingest(

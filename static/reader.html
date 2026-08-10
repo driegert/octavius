@@ -80,6 +80,60 @@
   }
   .ingest-bar button:hover, .small-btn:hover { border-color: #555; color: #ccc; }
 
+  /* Paste-text panel (hidden until the Paste button is used) */
+  .paste-bar { display: none; margin-bottom: 1.2rem; }
+  .paste-bar.active { display: block; }
+
+  .paste-bar textarea {
+    width: 100%;
+    min-height: 9rem;
+    resize: vertical;
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #c8c8d0;
+    font-family: inherit;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    padding: 0.6rem 0.7rem;
+    outline: none;
+    box-sizing: border-box;
+  }
+  .paste-bar textarea:focus { border-color: #60a0ff; }
+  .paste-bar textarea::placeholder { color: #444; }
+
+  .paste-actions {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.4rem;
+  }
+  .paste-actions input {
+    flex: 1;
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #c8c8d0;
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 0.5rem 0.7rem;
+    outline: none;
+  }
+  .paste-actions input:focus { border-color: #60a0ff; }
+  .paste-actions input::placeholder { color: #444; }
+  .paste-actions button {
+    background: #151520;
+    border: 1px solid #2a2a35;
+    border-radius: 6px;
+    color: #888;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  .paste-actions button:hover { border-color: #555; color: #ccc; }
+
   /* Document list */
   #doc-list {
     display: flex;
@@ -310,6 +364,15 @@
   <div class="ingest-bar">
     <input type="text" id="ingest-input" placeholder="File path or URL...">
     <button id="ingest-btn">Add</button>
+    <button id="paste-toggle" title="Paste text instead">Paste</button>
+  </div>
+  <div class="paste-bar" id="paste-bar">
+    <textarea id="paste-input" placeholder="Paste or type text to read aloud..."></textarea>
+    <div class="paste-actions">
+      <input type="text" id="paste-title" placeholder="Title (optional)">
+      <button id="paste-cancel">Cancel</button>
+      <button id="paste-submit">Add Text</button>
+    </div>
   </div>
   <div id="doc-list"></div>
 </div>

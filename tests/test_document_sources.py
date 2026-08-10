@@ -2,7 +2,37 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from document_sources import decode_text_bytes, ensure_pdf_suffix, is_pdf_file, is_pdf_response, read_text_file
+from document_sources import (
+    decode_text_bytes,
+    derive_title_from_text,
+    ensure_pdf_suffix,
+    is_pdf_file,
+    is_pdf_response,
+    read_text_file,
+)
+
+
+class DeriveTitleFromTextTests(unittest.TestCase):
+    def test_uses_markdown_heading(self):
+        self.assertEqual(derive_title_from_text("# Multitaper Notes\n\nbody"), "Multitaper Notes")
+
+    def test_uses_first_non_empty_line(self):
+        self.assertEqual(derive_title_from_text("\n\n  Spectral estimation  \nmore"), "Spectral estimation")
+
+    def test_strips_list_markers(self):
+        self.assertEqual(derive_title_from_text("- first bullet\n- second"), "first bullet")
+
+    def test_truncates_long_first_line(self):
+        title = derive_title_from_text("x" * 200)
+        self.assertEqual(len(title), 80)
+        self.assertTrue(title.endswith("..."))
+
+    def test_skips_lines_without_alphanumerics(self):
+        self.assertEqual(derive_title_from_text("---\n***\nReal Title"), "Real Title")
+
+    def test_falls_back_for_empty_text(self):
+        self.assertEqual(derive_title_from_text(""), "Pasted Text")
+        self.assertEqual(derive_title_from_text("\n  \n"), "Pasted Text")
 
 
 class DocumentSourceTests(unittest.TestCase):
