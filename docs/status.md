@@ -56,10 +56,25 @@ Message embeds detached via `spawn_embedding`. New `history_sweeper.py` repairs 
 that never landed. `conversations.indexed` persists the summariser's index decision.
 See CLAUDE.md's Embeddings bullet for the durable description.
 
-**Verified live.** First sweep after restart behaved exactly as designed: repaired 5
-rows, then workhorse returned two transient 500s, and the pass **aborted** rather than
-grinding 13 more rows against a failing chain. The breaker recorded one failure and did
-not trip (threshold 2); workhorse was back to 5/5 at ~0.25 s minutes later.
+**Verified live — and the first deploy found a real bug.** The first sweep repaired 5
+rows and then "aborted on a failing chain". The chain was fine. Message 1524 is **20,034
+characters**, and workhorse 500s on anything past roughly 4-6k (Ollama's default
+`num_ctx` is 2048 tokens; measured: 4000 chars → 200, 6000 → 500). Because the batch is
+ordered newest-first and the pass aborted on the first `None`, that one row sat at the
+head of the queue and blocked the other 12 **permanently**. The convergence test missed
+it because every row in it was the same small size.
+
+Two fixes, both pinned by tests:
+
+- `history_enrichment.EMBED_MAX_CHARS = 4000` clips input at the choke point every embed
+  goes through. Not `num_ctx`: bge-m3 caps at 8192 tokens so a 20k-char input still 500s
+  with `num_ctx=8192`, and that call took 4.5 s versus 0.25 s.
+- The sweeper now separates "this row is bad" from "the chain is down". It skips a
+  failing row and gives up only when the breaker reports every endpoint tripped, or
+  after `MAX_CONSECUTIVE_FAILURES` in a row.
+
+Worth remembering as a general shape: **a per-item failure and a whole-dependency
+outage look identical when the item is the thing you retry first.**
 
 **Two gotchas worth keeping.**
 

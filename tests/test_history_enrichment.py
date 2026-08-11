@@ -39,6 +39,21 @@ class HistoryEnrichmentTests(unittest.TestCase):
         self.assertEqual(result, b"abc")
         mock_embed.assert_called_once()
 
+    def test_oversized_text_is_truncated_before_embedding(self):
+        """Embedders reject anything past their context limit outright (workhorse
+        500s above ~4-6k chars), so an untruncated 20k-char message never embeds."""
+        long_text = "x" * 20034
+        with patch.object(enrichment.embedding_client, "embed_text", return_value=b"v") as mock_embed:
+            enrichment.embed_text(long_text)
+        sent = mock_embed.call_args.args[0]
+        self.assertEqual(len(sent), enrichment.EMBED_MAX_CHARS)
+        self.assertTrue(long_text.startswith(sent))
+
+    def test_text_within_the_limit_is_passed_through_unchanged(self):
+        with patch.object(enrichment.embedding_client, "embed_text", return_value=b"v") as mock_embed:
+            enrichment.embed_text("short message")
+        self.assertEqual(mock_embed.call_args.args[0], "short message")
+
 
 class GenerateSummaryTests(unittest.TestCase):
     def _messages(self):

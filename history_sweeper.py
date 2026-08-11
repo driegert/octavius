@@ -23,6 +23,7 @@ from pathlib import Path
 
 from db import connect_db
 from history_enrichment import embed_text_async, store_embedding_bytes
+from service_clients import embedding_client
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,14 @@ MIN_AGE_SECONDS = 120
 PAUSE_BETWEEN_ROWS = 0.2
 SWEEP_INTERVAL_SECONDS = 900
 INITIAL_DELAY_SECONDS = 30
+# Enough consecutive per-row failures to conclude the chain is down rather than
+# the rows being bad, for the case where the breaker has not tripped yet.
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+def embedding_client_is_down() -> bool:
+    """Has the breaker written off every endpoint? Then stop, don't keep trying."""
+    return embedding_client.get_health()["all_tripped"]
 
 
 def _cutoff(min_age_seconds: int) -> str:
@@ -109,13 +118,23 @@ async def _embed_rows(conn, rows, table: str, id_col: str, guard=None) -> tuple[
     forever, which is the exact staleness this sweeper exists to repair.
     """
     repaired = 0
+    consecutive_failures = 0
     for row_id, text in rows:
         emb = await embed_text_async(text)
         if emb is None:
-            # None means the whole chain failed. Grinding through the rest of the
-            # batch would just burn the timeout budget per row against dead hosts.
-            log.warning("Embedding unavailable; aborting sweep after %d %s row(s)", repaired, table)
-            return repaired, True
+            # A None is ambiguous: the chain may be down, or this one row may be
+            # unembeddable. Treating every None as "chain down" and aborting let
+            # a single bad row wedge the sweeper forever, because the batch is
+            # ordered newest-first and that row stayed at the head of it.
+            consecutive_failures += 1
+            if embedding_client_is_down() or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                log.warning(
+                    "Embedding unavailable; aborting sweep after %d %s row(s)", repaired, table
+                )
+                return repaired, True
+            log.warning("Could not embed %s row %d; skipping it", table, row_id)
+            continue
+        consecutive_failures = 0
         if guard is not None and not guard(conn, row_id, text):
             log.info("Skipping %s row %d: it changed while we were embedding it", table, row_id)
             continue

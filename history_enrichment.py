@@ -56,12 +56,34 @@ TAG_SYSTEM_PROMPT = (
 )
 
 
+# Embedders have a hard context limit and reject anything past it outright:
+# Ollama's default num_ctx is 2048 tokens, and workhorse 500s somewhere between
+# 4000 and 6000 characters (measured 2026-08-11). A 20k-character message
+# therefore never embeds, and before this cap it wedged the sweeper — it sorts
+# newest-first and aborted on the first failure, so one oversized row blocked
+# every other pending row behind it, permanently.
+#
+# Truncate rather than raising num_ctx: bge-m3 tops out at 8192 tokens anyway
+# (a 20k-char input still 500s with num_ctx=8192), and a full-context embed took
+# 4.5s versus 0.25s. The opening characters carry the topical signal that
+# semantic search actually keys on. Matches the 4000-char convention used for
+# tool results.
+EMBED_MAX_CHARS = 4000
+
+
+def _clip(text: str) -> str:
+    if len(text) <= EMBED_MAX_CHARS:
+        return text
+    log.debug("Truncating %d-char text to %d for embedding", len(text), EMBED_MAX_CHARS)
+    return text[:EMBED_MAX_CHARS]
+
+
 def embed_text(text: str) -> bytes | None:
-    return embedding_client.embed_text(text, timeout=EMBEDDING_TIMEOUT)
+    return embedding_client.embed_text(_clip(text), timeout=EMBEDDING_TIMEOUT)
 
 
 async def embed_text_async(text: str) -> bytes | None:
-    return await embedding_client.aembed_text(text, timeout=EMBEDDING_TIMEOUT)
+    return await embedding_client.aembed_text(_clip(text), timeout=EMBEDDING_TIMEOUT)
 
 
 def store_embedding(conn: sqlite3.Connection, table: str, id_col: str, row_id: int, text: str):

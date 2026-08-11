@@ -100,19 +100,52 @@ class SweepOnceTests(SweeperTestBase):
         self.assertEqual(second["messages"], 0)
         self.assertEqual(self._vector_count(), 2)
 
-    async def test_aborts_the_pass_on_the_first_chain_failure(self):
-        """A None means the whole chain is down; grinding through the rest of the
-        batch would just burn the timeout budget per row."""
+    async def test_aborts_the_pass_when_the_breaker_says_the_chain_is_down(self):
+        """No point grinding through the batch against endpoints already written
+        off — one call is enough to learn that."""
         for i in range(1, 6):
             self._add_message(i, "user", f"msg {i}")
 
         with patch.object(sweeper, "embed_text_async", return_value=None) as embed, \
+             patch.object(sweeper, "embedding_client_is_down", return_value=True), \
              patch.object(sweeper, "PAUSE_BETWEEN_ROWS", 0):
             result = await sweeper.sweep_once(self.db_path)
 
         self.assertEqual(embed.await_count, 1)
         self.assertTrue(result["aborted"])
         self.assertEqual(result["messages"], 0)
+
+    async def test_aborts_after_repeated_failures_even_if_the_breaker_is_closed(self):
+        for i in range(1, 11):
+            self._add_message(i, "user", f"msg {i}")
+
+        with patch.object(sweeper, "embed_text_async", return_value=None) as embed, \
+             patch.object(sweeper, "embedding_client_is_down", return_value=False), \
+             patch.object(sweeper, "PAUSE_BETWEEN_ROWS", 0):
+            result = await sweeper.sweep_once(self.db_path)
+
+        self.assertEqual(embed.await_count, sweeper.MAX_CONSECUTIVE_FAILURES)
+        self.assertTrue(result["aborted"])
+
+    async def test_one_unembeddable_row_does_not_wedge_the_others(self):
+        """Observed in production: a 20k-char message the embedder rejects sat at
+        the head of the newest-first batch and blocked every row behind it, pass
+        after pass, forever."""
+        self._add_message(1, "user", "fine")
+        self._add_message(2, "user", "also fine")
+        self._add_message(3, "user", "poison")  # highest id -> selected first
+
+        async def embed(text):
+            return None if text == "poison" else VECTOR
+
+        with patch.object(sweeper, "embed_text_async", side_effect=embed), \
+             patch.object(sweeper, "embedding_client_is_down", return_value=False), \
+             patch.object(sweeper, "PAUSE_BETWEEN_ROWS", 0):
+            result = await sweeper.sweep_once(self.db_path)
+
+        self.assertFalse(result["aborted"])
+        self.assertEqual(result["messages"], 2)
+        self.assertEqual(self._vector_count(), 2)
 
     async def test_empty_backlog_is_a_no_op(self):
         with patch.object(sweeper, "embed_text_async", return_value=VECTOR) as embed:

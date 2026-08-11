@@ -208,13 +208,22 @@ External services currently expected:
     via `asyncio.to_thread` on its own connection. Cap: 8 in flight;
     `drain_inflight()` runs at shutdown. Consequence: message-level semantic search is
     **eventually consistent**.
+  - **Embed input is capped at `EMBED_MAX_CHARS` (4000)** in `history_enrichment`, the
+    choke point every embed call goes through. Embedders reject over-long input
+    outright — Ollama's default `num_ctx` is 2048 tokens and workhorse 500s somewhere
+    between 4000 and 6000 characters. Raising `num_ctx` is not a fix: bge-m3 tops out at
+    8192 tokens (a 20k-char input still 500s), and a full-context embed took 4.5 s versus
+    0.25 s.
   - **`history_sweeper.py`** re-embeds anything that never landed (startup + every
     15 min, behind `OCTAVIUS_EMBEDDING_SWEEPER`). The pending marker is simply the
-    absence of a row in the vec0 table. Two non-obvious rules: the `role IN
+    absence of a row in the vec0 table. Three non-obvious rules: the `role IN
     ('user','assistant')` filter is load-bearing (tool results are never embedded, and
-    without it the sweeper re-selects the whole tool-call history forever), and a pass
-    **aborts on the first `None`** rather than burning the timeout budget per row
-    against a dead chain.
+    without it the sweeper re-selects the whole tool-call history forever); a pass gives
+    up when the breaker reports every endpoint tripped, or after
+    `MAX_CONSECUTIVE_FAILURES`, rather than burning the timeout budget row by row; but a
+    *single* failing row is **skipped, not fatal**. That last one is load-bearing too —
+    aborting on the first `None` meant one unembeddable row at the head of the
+    newest-first batch blocked every row behind it, pass after pass, forever.
   - **`conversations.indexed`** (added 2026-08-10, additive migration) records the
     summariser's index decision, which was previously unpersisted — so "skipped on
     purpose" and "the embedder was down" looked identical and the summary sweeper
