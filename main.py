@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
@@ -7,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 
 from db import DEFAULT_DB_PATH
 from history import HistoryRecorder, init_db
+from history_enrichment import drain_inflight
+from history_sweeper import run_sweeper
 from mcp_manager import MCPManager
 from settings import settings
 from routes.conversations import router as conversations_router
@@ -14,7 +17,7 @@ from routes.inbox import router as inbox_router
 from routes.reader_api import router as reader_router
 from routes.vault import router as vault_router
 from reader_store import fail_stale_processing_documents
-from service_clients import llm_client
+from service_clients import embedding_client, llm_client
 from subagent_dispatcher import SubagentDispatcher
 import tools as local_tools
 from websocket_session import handle_websocket_session
@@ -55,9 +58,22 @@ async def lifespan(app: FastAPI):
             "Local tool name(s) collide with MCP tools (local handler wins): %s",
             sorted(overlap),
         )
+    sweeper_task = None
+    if settings.embedding_sweeper_enabled:
+        sweeper_task = asyncio.create_task(run_sweeper(db_path))
+        app.state.embedding_sweeper_task = sweeper_task
+    else:
+        log.info("Embedding sweeper disabled")
     yield
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
+    if sweeper_task is not None:
+        sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper_task
+    # Give detached embeds a moment to land; anything still pending is picked
+    # up by the sweeper on the next boot.
+    await drain_inflight()
 
 
 def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH) -> FastAPI:
@@ -112,6 +128,7 @@ async def health(request: Request):
             "mcp_tool_count": len(mcp_manager.tools) if mcp_manager else 0,
             "mcp": mcp_health,
             "llm_chain": llm_health,
+            "embedding_chain": embedding_client.get_health(),
         }
     )
 

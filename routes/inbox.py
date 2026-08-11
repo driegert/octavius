@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 
 from fastapi import APIRouter, Request
@@ -23,11 +24,17 @@ async def inbox_list(
     limit: int = 50,
     offset: int = 0,
 ):
-    with connect_db(request.app.state.db_path) as conn:
-        if q:
-            items = search_saved_items(conn, q, limit=limit)
-        else:
-            items = list_saved_items(conn, status=status, item_type=type, limit=limit, offset=offset)
+    def _query():
+        # Runs in a worker thread: search_saved_items embeds the query
+        # synchronously, and blocking the loop here would stall every other
+        # session. The connection is created and used inside this callable
+        # because sqlite3 connections are bound to their creating thread.
+        with connect_db(request.app.state.db_path) as conn:
+            if q:
+                return search_saved_items(conn, q, limit=limit)
+            return list_saved_items(conn, status=status, item_type=type, limit=limit, offset=offset)
+
+    items = await asyncio.to_thread(_query)
     return JSONResponse({"items": items})
 
 

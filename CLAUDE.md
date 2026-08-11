@@ -188,8 +188,41 @@ External services currently expected:
 - **Reader LLM**: `qwen3.6-35b-a3b-mtp-q4-general` at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets"). `qwen3.5-9b` is still in `:8010`'s catalog but went stale — it lists in `/v1/models` and then hangs on completion, which silently degraded every math chunk to dollar-stripping. Alias deliberately matches the subagent chain's `:8010` entry.
 - **Summary/tag generation**: `lilripper:8020` with fallback `lilripper:8010`, model `qwen3.6-35b-a3b-mtp-general` (moved off the dead lilbuddy/triplestuffed pair 2026-08-08). `SummaryClient` is **not** an `LLMChainClient`: it sends one model to both URLs, so the alias must exist on both ports. It does attach `auth_headers` (added 2026-08-08 — previously it sent none, so any authed endpoint here would have 401'd silently). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
-  - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
-  - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
+  - primary: `workhorse:11434/api/embeddings` (Ollama schema)
+  - fallback: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
+  - **Order reversed 2026-08-10.** lilbuddy was primary and went unreachable; because a
+    dead host drops packets rather than refusing them, every embed burned the full
+    connect budget on it first. `EmbeddingClient` now also has a **per-endpoint circuit
+    breaker** (2 consecutive failures → skipped for 300 s, then a single half-open
+    probe) and no longer retries `ConnectTimeout` — it subclasses the generic timeout
+    class, so a dead host was being retried, doubling the cost. `/health`'s
+    `embedding_chain` shows per-endpoint `tripped` / `consecutive_failures` /
+    `cooldown_remaining`. It deliberately does **not** feed the top-level `degraded`:
+    every search path falls back to keyword matching, so Octavius still answers.
+  - **Message embeds are detached from the turn path.** `add_message_async` commits the
+    row and then *spawns* the embed (`history_enrichment.spawn_embedding`) instead of
+    awaiting it — awaiting put a network round-trip in front of the LLM call for the
+    user message and in front of `audio_done` for the assistant message, which is what
+    made a dead embedder cost ~10 s twice per turn. The spawned task is a **root** task,
+    so cancelling a turn (`handle_reset`) cannot lose it, and it does its sqlite write
+    via `asyncio.to_thread` on its own connection. Cap: 8 in flight;
+    `drain_inflight()` runs at shutdown. Consequence: message-level semantic search is
+    **eventually consistent**.
+  - **`history_sweeper.py`** re-embeds anything that never landed (startup + every
+    15 min, behind `OCTAVIUS_EMBEDDING_SWEEPER`). The pending marker is simply the
+    absence of a row in the vec0 table. Two non-obvious rules: the `role IN
+    ('user','assistant')` filter is load-bearing (tool results are never embedded, and
+    without it the sweeper re-selects the whole tool-call history forever), and a pass
+    **aborts on the first `None`** rather than burning the timeout budget per row
+    against a dead chain.
+  - **`conversations.indexed`** (added 2026-08-10, additive migration) records the
+    summariser's index decision, which was previously unpersisted — so "skipped on
+    purpose" and "the embedder was down" looked identical and the summary sweeper
+    couldn't tell which rows to repair. `NULL` = legacy/unknown, never swept.
+    `_write_summary` also **deletes any existing summary vector** in the same
+    transaction: conversations are resumed in place (every Matrix thread), so a rewrite
+    whose re-embed fails would otherwise leave a vector for superseded text that looks
+    complete forever.
 - **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`) with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-q4-general`) as fallback — the `:8010` entry is **behind auth** (see "Configuration and secrets"). The primary is now the *same endpoint and model as the main chain*, since `:8020` gained image input; the chain stays separate purely so image turns can't fail over onto the main chain's text-only fallbacks on lilbuddy/triplestuffed. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
@@ -297,7 +330,8 @@ Reader pipeline:
 History and inbox:
 
 - `history.py` - DB bootstrap, conversation/session recording, and compatibility re-exports for history/inbox helpers
-- `history_enrichment.py` - embeddings, summaries, topic tags
+- `history_enrichment.py` - embeddings, summaries, topic tags; also the detached-embed helpers (`spawn_embedding` / `drain_inflight`)
+- `history_sweeper.py` - background re-embed of rows whose inline embed never landed
 - `history_store.py` - conversation queries, inbox CRUD/search, memory-push watermarks, stats
 - `schema.sql` - SQLite+vec schema
 
@@ -324,7 +358,8 @@ Tests:
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
 - `tests/test_history_attach.py`
-- `tests/test_history_enrichment.py`
+- `tests/test_history_enrichment.py` - also detached-embed lifecycle (survives turn cancellation and the session connection closing)
+- `tests/test_history_sweeper.py` - sweeper filters/convergence, the `indexed` migration, and summary stale-vector invalidation
 - `tests/test_history_store.py`
 - `tests/test_local_tool_handlers.py`
 - `tests/test_local_tool_history.py` - search filters/list mode and `read_conversation` paging
@@ -480,7 +515,10 @@ wire contract both repos implement against.
 
 ### Conversation History
 
-- Conversations are recorded in `octavius_history.db`.
+- Conversations are recorded in `octavius_history.db`. **The live database is not the
+  one in the repo**: the service unit sets `OCTAVIUS_DB_PATH=/media/extra_stuff/octavius/octavius_history.db`,
+  and the repo-local file is a stale leftover. Query the former when inspecting real
+  state — `systemctl --user show octavius -p Environment` is the authority.
 - Summaries and topic tags are generated when a conversation ends. The summary
   prompt asks for a one-sentence, action-oriented summary *and* an `index`
   flag; conversations the LLM judges as purely read-only retrieval (e.g.

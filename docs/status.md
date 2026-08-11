@@ -9,25 +9,78 @@ This document holds change-oriented project status that is useful in the short t
 
 Keep durable architecture and contributor workflow in `CLAUDE.md`.
 
-## Deployment State (2026-08-10) — RESTART PENDING
+## Deployment State (2026-08-11) — DEPLOYED
 
-The working tree is **ahead of the running service**. `octavius.service` has been up
-since 2026-08-08 13:46 and is still running the pre-change configuration. Everything
-below is committed to the tree but not yet live; none of it is half-applied.
+Restarted 2026-08-11 07:20. `/health`: `ok`, ready, **not** degraded, MCP 8/8.
+This deployed both the 2026-08-10 endpoint work (a92c231) *and* the embedding-latency
+work below. The prior "RESTART PENDING" backlog — router model ids,
+`OCTAVIUS_8010_API_KEY` support, `/health` failure classification, the lilripper summary
+chain plus `SummaryClient` auth headers, and reader pasted text — is now live.
 
-Live process is running the OLD config:
+Confirmed fixed by the restart: conversation-end summaries. The stale build had been
+failing over `lilbuddy:8010 → triplestuffed:8010` (both dead) and **15 conversations
+went unsummarised and unindexed between Aug 8 and Aug 11**.
 
-- main chain `:8020` → `lilbuddy:8010` → `triplestuffed:8010` (the two fallbacks are dead — see Stability Notes)
-- summary chain `lilbuddy:8010` → `triplestuffed:8010` (both dead, so **conversation-end summaries and tags have been failing silently**)
-- no `OCTAVIUS_8010_API_KEY` support, no `/health` failure classification, no reader pasted-text
+Still outstanding: `OCTAVIUS_8010_API_KEY` is not set in `~/.config/octavius/env` (the
+old `OCTAVIUS_LLM_API_KEYS` JSON entry still works, so adopting it is optional), and
+TTS is still down with lilbuddy.
 
-Changed in the tree, waiting on a restart:
+## Embeddings off the turn path (2026-08-11)
 
-1. **Endpoint/model rewiring** for the llama.cpp routers on both lilripper ports (model ids are now load-bearing).
-2. **`OCTAVIUS_8010_API_KEY`** — dedicated env var for the lilripper:8010 token, takes precedence over the `OCTAVIUS_LLM_API_KEYS` JSON map. Not yet set in `~/.config/octavius/env`; the old JSON key still works, so this is optional to adopt.
-3. **`/health` failure classification** — `auth` / `client_error` / `server_error` / `connect` / `connect_timeout` / `timeout` / `bad_response`, plus `endpoints_rejecting_credentials`.
-4. **Summary chain moved to lilripper** + `SummaryClient` now sends auth headers (it previously sent none).
-5. **Reader accepts pasted text** end-to-end (see below).
+**Symptom.** ~10 s between send and any GPU activity, and ~10 s of stuck "Thinking..."
+after the reply was already on the client — every turn. Journal:
+`11:13:35.800` LLM 200 → `11:13:46.995` embed 200, an 11.2 s tail.
+
+**Cause — three compounding faults, not one.**
+
+1. `lilbuddy:8020` was the embedding chain *primary* and the machine is unreachable. It
+   drops packets rather than refusing connections, so each attempt burned the full
+   connect budget (`HTTP 000` after a 6 s probe, no TCP handshake).
+2. `EmbeddingClient._is_retry_worthy` **retried connect timeouts**, contradicting its own
+   docstring: `httpx.ConnectTimeout` subclasses `httpx.TimeoutException`, and
+   `requests.exceptions.ConnectTimeout` subclasses `Timeout`. So a dead host cost
+   `5 + 0.3 + 5 = 10.3 s` instead of 5 s. Same bug class as the `classify_chain_error`
+   fix on 2026-08-08.
+3. `EmbeddingClient` had **no failure memory at all** — its only state was `self.chain`,
+   so every embed re-walked from index 0 and re-paid the whole budget.
+
+And the reason it landed on the turn path: `history.add_message_async` **awaited**
+`store_embedding_async` inline — once before `stream_agent_turn` (user message) and once
+before `audio_done` (assistant message). `audio_done` is what re-arms client recording,
+so both the PWA and the Android app sat waiting on an embedding.
+
+**Fixes.** Chain reordered to workhorse-first in `settings.py` (not the env file — a
+second source of truth would drift against the committed default). `ConnectTimeout` no
+longer retries. Per-endpoint circuit breaker with single-owner half-open probing.
+Message embeds detached via `spawn_embedding`. New `history_sweeper.py` repairs anything
+that never landed. `conversations.indexed` persists the summariser's index decision.
+See CLAUDE.md's Embeddings bullet for the durable description.
+
+**Verified live.** First sweep after restart behaved exactly as designed: repaired 5
+rows, then workhorse returned two transient 500s, and the pass **aborted** rather than
+grinding 13 more rows against a failing chain. The breaker recorded one failure and did
+not trip (threshold 2); workhorse was back to 5/5 at ~0.25 s minutes later.
+
+**Two gotchas worth keeping.**
+
+- The **live database is `/media/extra_stuff/octavius/octavius_history.db`** (set by
+  `OCTAVIUS_DB_PATH` in the unit, *not* in `~/.config/octavius/env`). The repo-local
+  `octavius_history.db` is a stale leftover and will happily answer queries with wrong
+  numbers.
+- `main.py`'s lifespan calls `app.state.db_init()` with **no argument**, so an injected
+  `db_path` never reaches the initializer. Tests that only patch `db_init` leave
+  `app.state.db_path` pointing at the real database — which now matters, because the
+  lifespan hands `db_path` to the sweeper. `tests/test_main.py::_isolated_app` patches
+  all three.
+
+**Follow-ups, deliberately not done here.**
+
+- `tools.py:112-121` dispatches sync local-tool handlers directly on the event loop, so
+  `search_conversation_history` still blocks it during its query embed. Fixing it means
+  touching the shared dispatch contract for every local tool.
+- `end_async` still awaits four remote calls (summary LLM, summary embed, tags LLM,
+  memory push) on the WS control path, so New Chat / reset / attach stall behind them.
+  The real fix is detaching the whole of `end_async`, not just the embed.
 
 What a restart fixes: summaries/tags start working again, the main chain gets a
 *working* second hop (`lilripper:8010`) instead of two dead ones, and failing over

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import unittest
@@ -5,6 +6,7 @@ from unittest.mock import patch
 
 import httpx
 import numpy as np
+import requests
 
 import service_clients
 from service_clients import (
@@ -464,6 +466,232 @@ class ServiceClientsTests(unittest.IsolatedAsyncioTestCase):
     def test_embedding_client_rejects_empty_chain(self):
         with self.assertRaises(ValueError):
             EmbeddingClient([])
+
+
+PRIMARY = "http://primary/v1/embeddings"
+FALLBACK = "http://fallback/api/embeddings"
+
+
+def _embed_chain():
+    return [
+        {"url": PRIMARY, "model": "bge", "schema": "openai"},
+        {"url": FALLBACK, "model": "bge", "schema": "ollama"},
+    ]
+
+
+def _embed_ok(value=1.0, schema="ollama"):
+    """A success response in the shape the answering endpoint's schema expects."""
+    resp = _FakeResponse("ignored")
+    if schema == "ollama":
+        resp.json = lambda: {"embedding": [value]}
+    else:
+        resp.json = lambda: {"data": [{"embedding": [value]}]}
+    return resp
+
+
+class EmbeddingConnectTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """A connect timeout means no handshake — retrying the same dead socket is
+    pure latency, and it is what made a dead primary cost two connect budgets."""
+
+    async def test_async_connect_timeout_does_not_retry_same_endpoint(self):
+        client = EmbeddingClient(_embed_chain())
+        dead = httpx.ConnectTimeout("no route")
+        fake = _RecordingAsyncClient([dead, _embed_ok(9.0)])
+
+        with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+             patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+            result = await client.aembed_text("hello", timeout=5)
+
+        self.assertEqual(result, np.array([9.0], dtype=np.float32).tobytes())
+        self.assertEqual(fake.calls, [PRIMARY, FALLBACK])
+
+    def test_sync_connect_timeout_does_not_retry_same_endpoint(self):
+        client = EmbeddingClient(_embed_chain())
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(url)
+            if url == PRIMARY:
+                raise requests.exceptions.ConnectTimeout("no route")
+            return _embed_ok(4.0)
+
+        with patch("service_clients.requests.post", side_effect=fake_post):
+            result = client.embed_text("hello", timeout=5)
+
+        self.assertEqual(result, np.array([4.0], dtype=np.float32).tobytes())
+        self.assertEqual(calls, [PRIMARY, FALLBACK])
+
+    def test_read_timeout_still_retries(self):
+        """The fix must not disable retry for genuine read timeouts."""
+        self.assertTrue(EmbeddingClient._is_retry_worthy(httpx.ReadTimeout("slow")))
+        self.assertFalse(EmbeddingClient._is_retry_worthy(httpx.ConnectTimeout("dead")))
+
+    def test_sync_post_gets_split_connect_and_read_budget(self):
+        client = EmbeddingClient([{"url": PRIMARY, "model": "bge", "schema": "openai"}])
+        captured = {}
+
+        def fake_post(url, json=None, timeout=None):
+            captured["timeout"] = timeout
+            resp = _FakeResponse("ignored")
+            resp.json = lambda: {"data": [{"embedding": [1.0]}]}
+            return resp
+
+        with patch("service_clients.requests.post", side_effect=fake_post):
+            client.embed_text("hello", timeout=5)
+
+        self.assertEqual(captured["timeout"], (1.5, 5))
+
+
+class EmbeddingCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
+    """Per-endpoint failure memory: without it, a dead primary re-pays its full
+    connect budget on every single embed."""
+
+    async def _fail_primary_until_tripped(self, client):
+        """Drive the primary to its threshold; the fallback answers each time."""
+        for _ in range(EmbeddingClient.ENDPOINT_FAILURE_THRESHOLD):
+            fake = _RecordingAsyncClient([httpx.ConnectTimeout("dead"), _embed_ok()])
+            with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+                 patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+                await client.aembed_text("x", timeout=5)
+
+    async def test_tripped_endpoint_is_skipped_entirely(self):
+        client = EmbeddingClient(_embed_chain())
+        await self._fail_primary_until_tripped(client)
+
+        fake = _RecordingAsyncClient([_embed_ok(7.0)])
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.aembed_text("x", timeout=5)
+
+        self.assertEqual(result, np.array([7.0], dtype=np.float32).tobytes())
+        self.assertEqual(fake.calls, [FALLBACK])
+
+    async def test_success_resets_only_that_endpoints_counter(self):
+        client = EmbeddingClient(_embed_chain())
+        fake = _RecordingAsyncClient([httpx.ConnectTimeout("dead"), _embed_ok()])
+        with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+             patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+            await client.aembed_text("x", timeout=5)
+
+        self.assertEqual(client._consecutive_failures.get(PRIMARY), 1)
+        self.assertEqual(client._consecutive_failures.get(FALLBACK, 0), 0)
+
+        # The primary now succeeds; its counter clears and it never trips.
+        fake = _RecordingAsyncClient([_embed_ok(schema="openai")])
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            await client.aembed_text("x", timeout=5)
+        self.assertEqual(client._consecutive_failures.get(PRIMARY, 0), 0)
+        self.assertNotIn(PRIMARY, client._skip_until)
+
+    async def test_all_tripped_returns_none_with_zero_http_calls(self):
+        client = EmbeddingClient(_embed_chain())
+        now = time.monotonic()
+        client._skip_until = {PRIMARY: now + 300, FALLBACK: now + 300}
+
+        fake = _RecordingAsyncClient([])  # any call would IndexError
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.aembed_text("x", timeout=5)
+
+        self.assertIsNone(result)
+        self.assertEqual(fake.calls, [])
+
+    async def test_half_open_probe_closes_breaker_on_success(self):
+        client = EmbeddingClient(_embed_chain())
+        client._skip_until = {PRIMARY: time.monotonic() - 1}  # cooldown elapsed
+        client._consecutive_failures = {PRIMARY: 2}
+
+        fake = _RecordingAsyncClient([_embed_ok(5.0, schema="openai")])
+        with patch("service_clients.httpx.AsyncClient", return_value=fake):
+            result = await client.aembed_text("x", timeout=5)
+
+        self.assertEqual(result, np.array([5.0], dtype=np.float32).tobytes())
+        self.assertEqual(fake.calls, [PRIMARY])
+        self.assertNotIn(PRIMARY, client._skip_until)
+        self.assertNotIn(PRIMARY, client._probe_in_flight)
+
+    async def test_only_one_caller_claims_the_half_open_probe(self):
+        """Concurrent callers must not stampede a host that is still down."""
+        client = EmbeddingClient(_embed_chain())
+        client._skip_until = {PRIMARY: time.monotonic() - 1}
+
+        first_allowed, first_probing = client._claim_endpoint(PRIMARY)
+        second_allowed, second_probing = client._claim_endpoint(PRIMARY)
+
+        self.assertEqual((first_allowed, first_probing), (True, True))
+        self.assertEqual((second_allowed, second_probing), (False, False))
+
+        client._release_probe(PRIMARY)
+        third_allowed, third_probing = client._claim_endpoint(PRIMARY)
+        self.assertEqual((third_allowed, third_probing), (True, True))
+
+    def test_breaker_state_is_shared_between_sync_and_async(self):
+        """One singleton serves both paths; a trip on one must be seen by the other."""
+        client = EmbeddingClient(_embed_chain())
+        client._skip_until = {PRIMARY: time.monotonic() + 300}
+        calls = []
+
+        with patch("service_clients.requests.post", side_effect=lambda url, **kw: (
+            calls.append(url), _embed_ok(2.0))[1]
+        ):
+            result = client.embed_text("x", timeout=5)
+
+        self.assertEqual(result, np.array([2.0], dtype=np.float32).tobytes())
+        self.assertEqual(calls, [FALLBACK])
+
+    async def test_failed_half_open_probe_retrips_before_the_probe_is_released(self):
+        """The failure must be recorded before the probe slot frees, or another
+        caller can slip in and probe an endpoint that just failed again."""
+        client = EmbeddingClient(_embed_chain())
+        client._skip_until = {PRIMARY: time.monotonic() - 1}
+        client._consecutive_failures = {PRIMARY: 2}
+
+        fake = _RecordingAsyncClient([httpx.ConnectTimeout("still dead"), _embed_ok()])
+        with patch("service_clients.httpx.AsyncClient", return_value=fake), \
+             patch("service_clients.asyncio.sleep", new=_AsyncNoop()):
+            await client.aembed_text("x", timeout=5)
+
+        # Re-armed for another full cooldown, and the probe slot is free again.
+        self.assertGreater(client._skip_until[PRIMARY], time.monotonic())
+        self.assertEqual(client._probe_in_flight, set())
+        # A follow-up caller is refused rather than allowed to probe again.
+        self.assertEqual(client._claim_endpoint(PRIMARY), (False, False))
+
+    async def test_cancellation_releases_the_probe_without_recording_a_failure(self):
+        """A turn cancelled mid-embed is no evidence the endpoint is unhealthy,
+        and it must not leave the endpoint stuck as 'probe in flight' forever."""
+        client = EmbeddingClient(_embed_chain())
+        client._skip_until = {PRIMARY: time.monotonic() - 1}  # half-open
+
+        class _Hanging:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None):
+                await asyncio.sleep(10)
+
+        with patch("service_clients.httpx.AsyncClient", return_value=_Hanging()):
+            task = asyncio.create_task(client.aembed_text("x", timeout=5))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(client._probe_in_flight, set())
+        self.assertEqual(client._consecutive_failures, {})
+
+    async def test_get_health_reports_tripped_endpoints(self):
+        client = EmbeddingClient(_embed_chain())
+        await self._fail_primary_until_tripped(client)
+
+        health = client.get_health()
+        by_url = {e["url"]: e for e in health["endpoints"]}
+        self.assertEqual(health["configured_endpoints"], 2)
+        self.assertFalse(health["all_tripped"])
+        self.assertTrue(by_url[PRIMARY]["tripped"])
+        self.assertGreater(by_url[PRIMARY]["cooldown_remaining"], 0)
+        self.assertFalse(by_url[FALLBACK]["tripped"])
 
 
 KEYED = "http://lilripper:8010/v1/chat/completions"

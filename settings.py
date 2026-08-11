@@ -82,6 +82,7 @@ class Settings:
     summary_timeout: int
     embedding_chain: list[dict]
     embedding_timeout: int
+    embedding_sweeper_enabled: bool
     result_summary_max_chars: int
     tag_generation_min_messages: int
     memory_service_url: str
@@ -577,22 +578,28 @@ def load_settings() -> Settings:
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8010/v1/chat/completions"),
         summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
+        # workhorse is primary as of 2026-08-10: lilbuddy went unreachable and,
+        # because a dead host drops packets rather than refusing them, every
+        # embed burned the full connect timeout on it before failing over.
+        # Restore lilbuddy to the front only if it is both up and preferred.
         embedding_chain=_env_json(
             "OCTAVIUS_EMBEDDING_CHAIN",
             [
-                {
-                    "url": "http://lilbuddy:8020/v1/embeddings",
-                    "model": "bge-m3",
-                    "schema": "openai",
-                },
                 {
                     "url": "http://workhorse:11434/api/embeddings",
                     "model": "bge-m3",
                     "schema": "ollama",
                 },
+                {
+                    "url": "http://lilbuddy:8020/v1/embeddings",
+                    "model": "bge-m3",
+                    "schema": "openai",
+                },
             ],
         ),
         embedding_timeout=_env_int("OCTAVIUS_EMBEDDING_TIMEOUT", 5),
+        embedding_sweeper_enabled=_env_str("OCTAVIUS_EMBEDDING_SWEEPER", "1").lower()
+        in {"1", "true", "yes", "on"},
         result_summary_max_chars=_env_int("OCTAVIUS_RESULT_SUMMARY_MAX_CHARS", 500),
         tag_generation_min_messages=_env_int("OCTAVIUS_TAG_GENERATION_MIN_MESSAGES", 4),
         # Shared memory service (v2): Octavius is a loopback HTTP client of the

@@ -15,6 +15,7 @@ from history_enrichment import (
     generate_summary,
     generate_tags_async,
     generate_tags,
+    spawn_embedding,
     store_embedding_async,
     store_embedding,
 )
@@ -71,6 +72,14 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             "ALTER TABLE conversations ADD COLUMN last_extracted_message_id INTEGER"
         )
         log.info("Migration: added conversations.last_extracted_message_id")
+    if "indexed" not in cols:
+        # Records whether the summariser judged this conversation worth indexing.
+        # Without it a missing summary_embeddings row is ambiguous — "skipped on
+        # purpose" and "the embedder was down" look identical, so the sweeper
+        # can't tell which rows to repair. NULL means legacy/unknown and is
+        # never swept.
+        conn.execute("ALTER TABLE conversations ADD COLUMN indexed INTEGER")
+        log.info("Migration: added conversations.indexed")
 
 
 # -- Core recording API --------------------------------------------------------
@@ -201,7 +210,9 @@ class ConversationSession:
             tts_model=tts_model,
         )
 
-        # Embed user and assistant messages (best-effort, non-blocking)
+        # Embeds inline and therefore blocks. That is left as-is: there is no
+        # running loop to detach into from a sync caller. Anything on the voice
+        # turn path must use add_message_async, which spawns the embed instead.
         if role in ("user", "assistant") and content:
             store_embedding(self.conn, "message_embeddings", "message_id", msg_id, content)
 
@@ -240,7 +251,14 @@ class ConversationSession:
         )
 
         if role in ("user", "assistant") and content:
-            await store_embedding_async(self.conn, "message_embeddings", "message_id", msg_id, content)
+            # Detached on purpose. The message row is already committed, and the
+            # vector is not needed by this turn — awaiting it here put a network
+            # round-trip in front of the LLM call (user message) and in front of
+            # audio_done (assistant message). A dropped embed leaves no
+            # message_embeddings row, which is exactly what the sweeper looks
+            # for. Note there is no await between the insert and this spawn, so
+            # a cancelled turn cannot lose the embed.
+            spawn_embedding(self.db_path, "message_embeddings", "message_id", msg_id, content)
 
         return msg_id
 
@@ -346,6 +364,26 @@ class ConversationSession:
         self.conn.commit()
         return cursor.lastrowid
 
+    def _write_summary(self, result) -> None:
+        """Persist the summary and the index decision, dropping any stale vector.
+
+        The DELETE is what keeps "no summary_embeddings row" an honest pending
+        marker. Conversations are resumed in place (every Matrix thread), so this
+        runs repeatedly on one conversation_id and rewrites `summary`. If the
+        re-embed then fails, store_embedding_bytes never reaches its own DELETE,
+        the previous vector survives, and a sweeper keyed on absence would call
+        the row done forever while it points at superseded text. Dropping it here
+        also un-indexes a conversation whose `indexed` flips 1 -> 0.
+        """
+        self.conn.execute(
+            "UPDATE conversations SET summary = ?, indexed = ? WHERE id = ?",
+            (result.summary, 1 if result.index else 0, self.conv_id),
+        )
+        self.conn.execute(
+            "DELETE FROM summary_embeddings WHERE conversation_id = ?", (self.conv_id,)
+        )
+        self.conn.commit()
+
     def end(self):
         """Finalize the conversation: set ended_at, generate summary and tags."""
         if self._closed:
@@ -355,11 +393,7 @@ class ConversationSession:
         # Generate summary
         result = generate_summary(self._messages_for_summary)
         if result.summary:
-            self.conn.execute(
-                "UPDATE conversations SET summary = ? WHERE id = ?",
-                (result.summary, self.conv_id),
-            )
-            self.conn.commit()
+            self._write_summary(result)
             if result.index:
                 store_embedding(
                     self.conn, "summary_embeddings", "conversation_id", self.conv_id, result.summary
@@ -391,11 +425,7 @@ class ConversationSession:
 
         result = await generate_summary_async(self._messages_for_summary)
         if result.summary:
-            self.conn.execute(
-                "UPDATE conversations SET summary = ? WHERE id = ?",
-                (result.summary, self.conv_id),
-            )
-            self.conn.commit()
+            self._write_summary(result)
             if result.index:
                 await store_embedding_async(
                     self.conn, "summary_embeddings", "conversation_id", self.conv_id, result.summary

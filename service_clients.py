@@ -672,14 +672,39 @@ class EmbeddingClient:
     - `openai`  — POST `{url}` with `{"model", "input"}`, response `{"data": [{"embedding": [...]}]}`
 
     On each endpoint the client retries once for transient errors (HTTP 5xx,
-    timeout). Connection errors (endpoint down) and programmer errors (bad
+    read timeout). Connection errors (endpoint down) and programmer errors (bad
     response shape) do not retry — the chain moves on to the next endpoint
     immediately. Terminal failures after the whole chain is exhausted are
     logged at WARNING so they show up in journalctl without debug logging.
+
+    Circuit breaker (per endpoint, keyed by URL). After
+    ENDPOINT_FAILURE_THRESHOLD consecutive failures an endpoint is "tripped" and
+    skipped entirely for ENDPOINT_COOLDOWN_SECONDS. Without this, a chain whose
+    primary is a dead host re-pays the full connect budget on *every* embed —
+    there is no other failure memory. When the cooldown elapses the endpoint is
+    half-open: exactly one caller claims the probe (`_probe_in_flight`) while
+    everyone else keeps skipping, so concurrent callers can't stampede a host
+    that is still down. A success closes the breaker, a failure re-trips it.
+
+    Known race, deliberately accepted: a failure recorded by a slow call can
+    re-trip an endpoint just after a newer call succeeded. The cost is one
+    cooldown spent on an equivalent fallback model, which is not worth a
+    generation counter.
+
+    When every endpoint is tripped the call returns None with no HTTP traffic.
+    That is safe because all callers degrade: the search paths fall back to
+    LIKE, and the store paths write no row (which is exactly what the embedding
+    sweeper looks for).
     """
 
     PER_ENDPOINT_ATTEMPTS = 2
     RETRY_BACKOFF_SECONDS = 0.3
+    ENDPOINT_FAILURE_THRESHOLD = 2
+    ENDPOINT_COOLDOWN_SECONDS = 300.0
+    # A LAN TCP handshake is milliseconds; only a genuinely unreachable host
+    # gets near this. Capped separately from the read budget so a dead endpoint
+    # is detected fast instead of burning the full timeout.
+    CONNECT_TIMEOUT_SECONDS = 1.5
     _VALID_SCHEMAS = ("ollama", "openai")
 
     def __init__(self, chain: list[dict]):
@@ -694,6 +719,80 @@ class EmbeddingClient:
             if not entry.get("url") or not entry.get("model"):
                 raise ValueError(f"embedding endpoint missing url or model: {entry!r}")
         self.chain = list(chain)
+        # threading.Lock, not asyncio.Lock: this is a module singleton reached
+        # from the event loop *and* from asyncio.to_thread workers (agent.py's
+        # episodic recall). Critical sections are dict reads/writes with no I/O.
+        self._breaker_lock = threading.Lock()
+        self._consecutive_failures: dict[str, int] = {}
+        self._skip_until: dict[str, float] = {}  # monotonic; absent means closed
+        self._probe_in_flight: set[str] = set()
+
+    def _connect_timeout(self, timeout: float) -> float:
+        return min(self.CONNECT_TIMEOUT_SECONDS, timeout)
+
+    def _claim_endpoint(self, url: str) -> tuple[bool, bool]:
+        """Returns (may_try, claimed_probe). Caller must release a claimed probe."""
+        now = time.monotonic()
+        with self._breaker_lock:
+            skip_until = self._skip_until.get(url)
+            if skip_until is None:
+                return True, False
+            if now < skip_until:
+                return False, False
+            # Cooldown elapsed: half-open. Exactly one caller probes.
+            if url in self._probe_in_flight:
+                return False, False
+            self._probe_in_flight.add(url)
+            return True, True
+
+    def _release_probe(self, url: str) -> None:
+        with self._breaker_lock:
+            self._probe_in_flight.discard(url)
+
+    def _record_endpoint_success(self, url: str) -> None:
+        with self._breaker_lock:
+            recovered = bool(self._consecutive_failures.get(url) or self._skip_until.get(url))
+            self._consecutive_failures.pop(url, None)
+            self._skip_until.pop(url, None)
+        if recovered:
+            log.info("Embedding endpoint %s recovered, closing breaker", url)
+
+    def _record_endpoint_failure(self, url: str) -> None:
+        with self._breaker_lock:
+            failures = self._consecutive_failures.get(url, 0) + 1
+            self._consecutive_failures[url] = failures
+            tripped = failures >= self.ENDPOINT_FAILURE_THRESHOLD
+            if tripped:
+                self._skip_until[url] = time.monotonic() + self.ENDPOINT_COOLDOWN_SECONDS
+        if tripped:
+            log.warning(
+                "Embedding endpoint %s tripped breaker after %d consecutive "
+                "failures; skipping it for %.0fs",
+                url,
+                failures,
+                self.ENDPOINT_COOLDOWN_SECONDS,
+            )
+
+    def get_health(self) -> dict:
+        now = time.monotonic()
+        with self._breaker_lock:
+            endpoints = []
+            for entry in self.chain:
+                url = entry["url"]
+                skip_until = self._skip_until.get(url, 0.0)
+                endpoints.append({
+                    "url": url,
+                    "model": entry["model"],
+                    "schema": entry["schema"],
+                    "tripped": now < skip_until,
+                    "consecutive_failures": self._consecutive_failures.get(url, 0),
+                    "cooldown_remaining": round(max(0.0, skip_until - now), 1),
+                })
+        return {
+            "configured_endpoints": len(endpoints),
+            "all_tripped": all(e["tripped"] for e in endpoints),
+            "endpoints": endpoints,
+        }
 
     @staticmethod
     def _build_payload(entry: dict, text: str) -> dict:
@@ -710,6 +809,12 @@ class EmbeddingClient:
     @staticmethod
     def _is_retry_worthy(exc: Exception) -> bool:
         """Should we retry the same endpoint? Only transient server-side issues."""
+        # Must precede the timeout checks: ConnectTimeout subclasses
+        # httpx.TimeoutException (and requests' subclasses Timeout), so without
+        # this a host that swallows SYNs was retried and cost two full connect
+        # budgets per embed instead of one.
+        if isinstance(exc, (httpx.ConnectTimeout, requests.exceptions.ConnectTimeout)):
+            return False
         if isinstance(exc, httpx.TimeoutException):
             return True
         if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
@@ -722,50 +827,90 @@ class EmbeddingClient:
 
     def embed_text(self, text: str, *, timeout: int) -> bytes | None:
         last_exc: Exception | None = None
+        tried_any = False
         for entry in self.chain:
-            for attempt in range(1, self.PER_ENDPOINT_ATTEMPTS + 1):
-                try:
-                    resp = requests.post(
-                        entry["url"],
-                        json=self._build_payload(entry, text),
-                        timeout=timeout,
-                    )
-                    resp.raise_for_status()
-                    vec = np.array(self._extract_vector(entry, resp.json()), dtype=np.float32)
-                    return vec.tobytes()
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < self.PER_ENDPOINT_ATTEMPTS and self._is_retry_worthy(exc):
-                        log.debug("Embedding %s attempt %d failed (%s), retrying", entry["url"], attempt, exc)
-                        time.sleep(self.RETRY_BACKOFF_SECONDS)
-                        continue
-                    log.debug("Embedding endpoint %s failed: %s", entry["url"], exc)
-                    break
-        log.warning("All embedding endpoints failed: %s", last_exc)
-        return None
-
-    async def aembed_text(self, text: str, *, timeout: int) -> bytes | None:
-        last_exc: Exception | None = None
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            for entry in self.chain:
+            url = entry["url"]
+            may_try, probing = self._claim_endpoint(url)
+            if not may_try:
+                continue
+            tried_any = True
+            try:
                 for attempt in range(1, self.PER_ENDPOINT_ATTEMPTS + 1):
                     try:
-                        resp = await client.post(
-                            entry["url"],
+                        resp = requests.post(
+                            url,
                             json=self._build_payload(entry, text),
+                            timeout=(self._connect_timeout(timeout), timeout),
                         )
                         resp.raise_for_status()
                         vec = np.array(self._extract_vector(entry, resp.json()), dtype=np.float32)
+                        self._record_endpoint_success(url)
                         return vec.tobytes()
                     except Exception as exc:
                         last_exc = exc
                         if attempt < self.PER_ENDPOINT_ATTEMPTS and self._is_retry_worthy(exc):
-                            log.debug("Async embedding %s attempt %d failed (%s), retrying", entry["url"], attempt, exc)
-                            await asyncio.sleep(self.RETRY_BACKOFF_SECONDS)
+                            log.debug("Embedding %s attempt %d failed (%s), retrying", url, attempt, exc)
+                            time.sleep(self.RETRY_BACKOFF_SECONDS)
                             continue
-                        log.debug("Async embedding endpoint %s failed: %s", entry["url"], exc)
+                        log.debug("Embedding endpoint %s failed: %s", url, exc)
                         break
-        log.warning("All async embedding endpoints failed: %s", last_exc)
+                # Reached only when the attempts were exhausted — a success
+                # returns above. One failure per call, not per attempt, so the
+                # retry budget and the breaker threshold stay independent knobs.
+                # Recorded before the probe is released so a half-open probe
+                # can't be re-claimed against an endpoint that just failed.
+                # A cancellation propagates past this, and rightly so: an
+                # abandoned call is no evidence the endpoint is unhealthy.
+                self._record_endpoint_failure(url)
+            finally:
+                if probing:
+                    self._release_probe(url)
+        if not tried_any:
+            log.warning("All embedding endpoints are tripped; skipping embed")
+        else:
+            log.warning("All embedding endpoints failed: %s", last_exc)
+        return None
+
+    async def aembed_text(self, text: str, *, timeout: int) -> bytes | None:
+        last_exc: Exception | None = None
+        tried_any = False
+        client_timeout = httpx.Timeout(timeout, connect=self._connect_timeout(timeout))
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
+            for entry in self.chain:
+                url = entry["url"]
+                may_try, probing = self._claim_endpoint(url)
+                if not may_try:
+                    continue
+                tried_any = True
+                try:
+                    for attempt in range(1, self.PER_ENDPOINT_ATTEMPTS + 1):
+                        try:
+                            resp = await client.post(
+                                url,
+                                json=self._build_payload(entry, text),
+                            )
+                            resp.raise_for_status()
+                            vec = np.array(self._extract_vector(entry, resp.json()), dtype=np.float32)
+                            self._record_endpoint_success(url)
+                            return vec.tobytes()
+                        except Exception as exc:
+                            last_exc = exc
+                            if attempt < self.PER_ENDPOINT_ATTEMPTS and self._is_retry_worthy(exc):
+                                log.debug("Async embedding %s attempt %d failed (%s), retrying", url, attempt, exc)
+                                await asyncio.sleep(self.RETRY_BACKOFF_SECONDS)
+                                continue
+                            log.debug("Async embedding endpoint %s failed: %s", url, exc)
+                            break
+                    # See embed_text: recorded inside the try so a cancellation
+                    # skips it, and before the probe is released.
+                    self._record_endpoint_failure(url)
+                finally:
+                    if probing:
+                        self._release_probe(url)
+        if not tried_any:
+            log.warning("All embedding endpoints are tripped; skipping embed")
+        else:
+            log.warning("All async embedding endpoints failed: %s", last_exc)
         return None
 
 

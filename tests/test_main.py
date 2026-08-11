@@ -1,6 +1,7 @@
 import unittest
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -112,19 +113,32 @@ def _init_inbox_delete_db(db_path: Path):
     return conn
 
 
+@contextmanager
+def _isolated_app(factory):
+    """Point the module-global app at a throwaway DB for the duration.
+
+    db_path matters as much as db_init here: the lifespan hands db_path to
+    background work (the embedding sweeper), so leaving it at DEFAULT_DB_PATH
+    would run sweeps against the real octavius_history.db during unit tests.
+    """
+    state = main.app.state
+    originals = (state.mcp_manager_factory, state.db_init, state.db_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state.mcp_manager_factory = factory
+        state.db_init = lambda: _FakeConn()
+        state.db_path = Path(tmpdir) / "history.db"
+        try:
+            yield
+        finally:
+            (state.mcp_manager_factory, state.db_init, state.db_path) = originals
+
+
 @unittest.skipIf(TestClient is None or main is None, "fastapi dependency not installed")
 class MainTests(unittest.TestCase):
     def test_health_reports_runtime_state(self):
-        original_factory = main.app.state.mcp_manager_factory
-        original_db_init = main.app.state.db_init
-        main.app.state.mcp_manager_factory = _FakeMCPManager
-        main.app.state.db_init = lambda: _FakeConn()
-        try:
+        with _isolated_app(_FakeMCPManager):
             with TestClient(main.app) as client:
                 response = client.get("/health")
-        finally:
-            main.app.state.mcp_manager_factory = original_factory
-            main.app.state.db_init = original_db_init
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -139,18 +153,23 @@ class MainTests(unittest.TestCase):
         self.assertEqual(body["mcp"]["connected_servers"], 2)
         self.assertIn("llm_chain", body)
         self.assertEqual(body["llm_chain"]["configured_endpoints"], 3)
+        # Embedding chain is reported so a tripped embedder is visible without
+        # grepping journalctl. It deliberately does NOT feed `degraded`: search
+        # falls back to keyword matching, so Octavius still answers.
+        self.assertIn("embedding_chain", body)
+        embedding = body["embedding_chain"]
+        self.assertEqual(embedding["configured_endpoints"], 2)
+        self.assertFalse(embedding["all_tripped"])
+        self.assertEqual(
+            [e["url"] for e in embedding["endpoints"]],
+            ["http://workhorse:11434/api/embeddings", "http://lilbuddy:8020/v1/embeddings"],
+        )
+        self.assertFalse(embedding["endpoints"][0]["tripped"])
 
     def test_health_reports_degraded_when_only_partial_runtime_is_ready(self):
-        original_factory = main.app.state.mcp_manager_factory
-        original_db_init = main.app.state.db_init
-        main.app.state.mcp_manager_factory = _DegradedMCPManager
-        main.app.state.db_init = lambda: _FakeConn()
-        try:
+        with _isolated_app(_DegradedMCPManager):
             with TestClient(main.app) as client:
                 response = client.get("/health")
-        finally:
-            main.app.state.mcp_manager_factory = original_factory
-            main.app.state.db_init = original_db_init
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -161,16 +180,9 @@ class MainTests(unittest.TestCase):
         self.assertEqual(body["mcp"]["connected_servers"], 1)
 
     def test_health_reports_starting_when_runtime_not_ready(self):
-        original_factory = main.app.state.mcp_manager_factory
-        original_db_init = main.app.state.db_init
-        main.app.state.mcp_manager_factory = _StartingMCPManager
-        main.app.state.db_init = lambda: _FakeConn()
-        try:
+        with _isolated_app(_StartingMCPManager):
             with TestClient(main.app) as client:
                 response = client.get("/health")
-        finally:
-            main.app.state.mcp_manager_factory = original_factory
-            main.app.state.db_init = original_db_init
 
         self.assertEqual(response.status_code, 200)
         body = response.json()

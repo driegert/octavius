@@ -1,10 +1,13 @@
+import asyncio
 import json
 import logging
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
+from db import connect_db
 from service_clients import embedding_client, summary_client
 from settings import settings
 
@@ -63,23 +66,29 @@ async def embed_text_async(text: str) -> bytes | None:
 
 def store_embedding(conn: sqlite3.Connection, table: str, id_col: str, row_id: int, text: str):
     emb = embed_text(text)
-    _store_embedding_bytes(conn, table, id_col, row_id, emb)
+    store_embedding_bytes(conn, table, id_col, row_id, emb)
 
 
 async def store_embedding_async(conn: sqlite3.Connection, table: str, id_col: str, row_id: int, text: str):
     emb = await embed_text_async(text)
-    _store_embedding_bytes(conn, table, id_col, row_id, emb)
+    store_embedding_bytes(conn, table, id_col, row_id, emb)
 
 
-def _store_embedding_bytes(
+def store_embedding_bytes(
     conn: sqlite3.Connection,
     table: str,
     id_col: str,
     row_id: int,
     emb: bytes | None,
-):
+) -> bool:
+    """Write a vector, replacing any existing one. Returns whether a row landed.
+
+    DELETE-then-INSERT makes this idempotent, so the sweeper can safely re-run it
+    over a row a live embed is also handling. A False return is the signal the
+    sweeper keys on: no row means "still pending".
+    """
     if emb is None:
-        return
+        return False
     try:
         conn.execute(f"DELETE FROM {table} WHERE {id_col} = ?", (row_id,))
         conn.execute(
@@ -87,8 +96,83 @@ def _store_embedding_bytes(
             (row_id, emb),
         )
         conn.commit()
+        return True
     except Exception:
         log.debug("Failed to store embedding in %s", table, exc_info=True)
+        return False
+
+
+# --- Detached embedding -----------------------------------------------------
+# Embedding is a network round-trip; awaiting it inline put it on the voice
+# turn's critical path (before the LLM call for the user message, before
+# audio_done for the assistant message). These helpers move it off that path.
+
+MAX_INFLIGHT_EMBEDS = 8
+_inflight: set[asyncio.Task] = set()
+
+
+def _store_sync(db_path, table: str, id_col: str, row_id: int, emb: bytes) -> bool:
+    """Open a connection, write, close — all on one thread.
+
+    Runs via asyncio.to_thread. sqlite3 connections are bound to their creating
+    thread (check_same_thread), so the connection is created *here* rather than
+    handed in. Writing off the loop also means a WAL writer-lock wait (up to
+    sqlite3's 5s default) stalls one worker instead of every session.
+    """
+    with connect_db(Path(db_path)) as conn:
+        return store_embedding_bytes(conn, table, id_col, row_id, emb)
+
+
+async def _embed_and_store_detached(db_path, table: str, id_col: str, row_id: int, text: str) -> None:
+    try:
+        emb = await embed_text_async(text)
+        if emb is None:
+            # No row written: that absence is exactly what the sweeper looks for.
+            log.warning("Embedding unavailable for %s row %d; left for the sweeper", table, row_id)
+            return
+        if not await asyncio.to_thread(_store_sync, db_path, table, id_col, row_id, emb):
+            log.warning("Could not persist embedding for %s row %d; left for the sweeper", table, row_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Detached embedding failed for %s row %d", table, row_id)
+    finally:
+        _inflight.discard(asyncio.current_task())
+
+
+def spawn_embedding(db_path, table: str, id_col: str, row_id: int, text: str) -> "asyncio.Task | None":
+    """Fire-and-forget an embed. Returns the task, or None if it wasn't started.
+
+    The task is a root task, not a child of the caller's: asyncio has no
+    parent/child cancellation, so cancelling the turn (handle_reset) does not
+    kill an in-flight embed. A strong reference is held in `_inflight` because
+    the loop only keeps a weak one.
+    """
+    if len(_inflight) >= MAX_INFLIGHT_EMBEDS:
+        log.warning(
+            "Embedding backlog at capacity (%d); skipping %s row %d, sweeper will retry",
+            MAX_INFLIGHT_EMBEDS, table, row_id,
+        )
+        return None
+    try:
+        task = asyncio.create_task(_embed_and_store_detached(db_path, table, id_col, row_id, text))
+    except RuntimeError:
+        # No running loop (sync context) — the caller's own path should embed.
+        log.debug("No running loop; not spawning embed for %s row %d", table, row_id)
+        return None
+    _inflight.add(task)
+    return task
+
+
+async def drain_inflight(timeout: float = 5.0) -> int:
+    """Wait for detached embeds to finish. Returns how many were still pending."""
+    if not _inflight:
+        return 0
+    pending = list(_inflight)
+    done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    if still_pending:
+        log.warning("%d embedding task(s) unfinished at shutdown; sweeper will retry", len(still_pending))
+    return len(still_pending)
 
 
 def build_transcript(messages: list[dict], *, max_content_chars: int) -> str:
