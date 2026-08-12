@@ -21,9 +21,11 @@ Confirmed fixed by the restart: conversation-end summaries. The stale build had 
 failing over `lilbuddy:8010 → triplestuffed:8010` (both dead) and **15 conversations
 went unsummarised and unindexed between Aug 8 and Aug 11**.
 
-Still outstanding: `OCTAVIUS_8010_API_KEY` is not set in `~/.config/octavius/env` (the
-old `OCTAVIUS_LLM_API_KEYS` JSON entry still works, so adopting it is optional), and
-TTS is still down with lilbuddy.
+TTS came back with lilbuddy on 2026-08-12.
+
+Still outstanding: **`OCTAVIUS_8010_API_KEY` is not set in `~/.config/octavius/env`.**
+Runbook to adopt it, and the drift to resolve first, are under "Adopt
+`OCTAVIUS_8010_API_KEY`" in Near-Term Work.
 
 ## Embeddings off the turn path (2026-08-11)
 
@@ -320,7 +322,33 @@ Likely refactor targets, in rough priority order:
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
 4. Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input, which no non-lilripper endpoint currently does. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
-5. Transcription/dictation mode (Dave, 2026-07-12): capture speech (Android app first), transcribe, and save the transcript to the `saved_items` stash — deliberately NOT the vault. No agent turn, no TTS. Revives the stash write path for non-note payloads; needs a WS message or REST route for STT-to-stash (the unwired `save_to_stash` helper in `local_tool_inbox.py` is a starting point). App-side sketch in `../octavius-android/docs/HANDOFF.md` NEXT WORK #3.
+5. **Adopt `OCTAVIUS_8010_API_KEY` (Dave to action; 2026-08-12).** The service authenticates to `lilripper:8010` through the older `OCTAVIUS_LLM_API_KEYS` JSON map. That works, so this is hygiene, not an outage — the point is that the bare var is the one that rotates, has no JSON quoting to get wrong, and has a name that survives rotations.
+
+   **Resolve the drift first.** Dave's interactive shell exports an `OCTAVIUS_8010_API_KEY` whose value **differs** from the token in `~/.config/octavius/env` (fingerprints `32173c2e…` vs `94745832…`). Probed 2026-08-12: `/v1/models` returns **401 unauthenticated and 200 for *both* tokens** — lilripper:8010 accepts them both, so nothing is broken today, but two live keys for one endpoint is exactly the drift shape that turns into a silent 401 the moment one is revoked. Decide which token is canonical before copying anything. The shell export is not in any dotfile (`.bashrc`/`.profile`/`environment.d`/systemd user env are all clean), so it came from an ad-hoc `export` and will vanish with that terminal.
+
+   Then:
+
+   ```bash
+   # 1. add the chosen token (single line, no quotes needed — it is not JSON)
+   printf 'OCTAVIUS_8010_API_KEY=%s\n' "$TOKEN" >> ~/.config/octavius/env
+   chmod 600 ~/.config/octavius/env
+
+   # 2. the unit reads this file via EnvironmentFile; no daemon-reload needed
+   #    unless the drop-in itself changed
+   systemctl --user restart octavius
+
+   # 3. verify: the var must actually reach the process
+   systemctl --user show octavius -p Environment | tr ' ' '\n' | grep -c OCTAVIUS_8010_API_KEY
+
+   # 4. verify auth is live — after a turn that hits :8010 (a consult, a reader
+   #    doc, or an image), this must stay empty and auth_failures must stay 0
+   curl -s localhost:8030/health | jq '.llm_chain
+     | {rejecting: .endpoints_rejecting_credentials, auth_failures}'
+   ```
+
+   Keep the `OCTAVIUS_LLM_API_KEYS` line in place: the bare var **wins** over the map (`settings._llm_api_keys`), so leaving the map is a working fallback, not a conflict. Delete it only after step 4 passes. Watch for two traps: a blank/whitespace value is ignored by design rather than sending `Bearer ` (there is a test), and **nothing loads a `.env` file** — a key put there is silently ignored.
+
+6. Transcription/dictation mode (Dave, 2026-07-12): capture speech (Android app first), transcribe, and save the transcript to the `saved_items` stash — deliberately NOT the vault. No agent turn, no TTS. Revives the stash write path for non-note payloads; needs a WS message or REST route for STT-to-stash (the unwired `save_to_stash` helper in `local_tool_inbox.py` is a starting point). App-side sketch in `../octavius-android/docs/HANDOFF.md` NEXT WORK #3.
 
 ## Planned: `deep_research` domain via headless pi (2026-08-08)
 
