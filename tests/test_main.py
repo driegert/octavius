@@ -162,7 +162,7 @@ class MainTests(unittest.TestCase):
         self.assertFalse(embedding["all_tripped"])
         self.assertEqual(
             [e["url"] for e in embedding["endpoints"]],
-            ["http://workhorse:11434/api/embeddings", "http://lilbuddy:8020/v1/embeddings"],
+            ["http://lilbuddy:8020/v1/embeddings", "http://workhorse:11434/api/embeddings"],
         )
         self.assertFalse(embedding["endpoints"][0]["tripped"])
 

@@ -76,6 +76,19 @@ Two fixes, both pinned by tests:
 Worth remembering as a general shape: **a per-item failure and a whole-dependency
 outage look identical when the item is the thing you retry first.**
 
+**Chain order restored to lilbuddy-first (2026-08-12).** lilbuddy came back (a tailscale
+fault, not the machine). The reorder above was a workaround for a *cost* problem — a dead
+primary burning the full connect budget on every embed — and that problem no longer
+exists: the `ConnectTimeout` fix plus the breaker cap a dead primary at two failures and
+then 300 s of silence. So the order is now decided on speed alone. Measured on a
+realistic ~1800-char payload, three calls each: **lilbuddy 0.107 / 0.107 / 0.109 s,
+workhorse 2.67 (cold) / 0.326 / 0.304 s** — ~3x, plus a cold-start penalty after idling.
+Note this is *not* visible in turn latency any more, since embeds are off the turn path;
+it shows up in sweeper throughput and in search-query embeds.
+
+`EMBED_MAX_CHARS = 4000` stays as it is. The cap has to suit the weakest endpoint in the
+chain, and workhorse (Ollama, `num_ctx=2048`) is still in it as the fallback.
+
 **Two gotchas worth keeping.**
 
 - The **live database is `/media/extra_stuff/octavius/octavius_history.db`** (set by
@@ -286,9 +299,9 @@ Operational assumptions worth keeping in mind during debugging:
 
   Net: **lilripper is a single point of failure for consults, image turns, and the reader.** The main text chain is the only LLM path with cross-host redundancy on paper (`lilbuddy:8010`, `triplestuffed:8010`) — but see below, both were dead when measured.
 
-- **lilbuddy is fully down (2026-08-08), and it is expected to stay down for some days** — Dave can't ping or ssh it and isn't physically near the machine. No ICMP response; `:8010`, `:8020`, `:8880` all unreachable. This is the highest-impact outage in the fleet because of what lilbuddy carries:
-  - **`:8880` Kokoro — the live TTS path.** `TTSSettings.voxtral_enabled` is False, so *every* synth call goes straight to this "fallback" and the Voxtral primary is never attempted. With lilbuddy gone there is **no working TTS at all**: Octavius is mute on the voice UI, the Android client, and continuous conversation. Text/Matrix turns are unaffected. `lilripper:8030` (the configured Voxtral primary) 502s — Caddy is up, no upstream behind it — so flipping `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` does not help. Restoring voice needs a Kokoro instance somewhere reachable; running one on triplestuffed (co-located with Octavius, no network hop) is the obvious candidate.
-  - **`:8020` bge-m3 — the embedding primary.** Degrades cleanly: the `workhorse:11434` Ollama fallback is up and verified returning 1024-dim vectors, so semantic history/inbox search still works.
+- **lilbuddy was fully down 2026-08-08 → 2026-08-12 (RESOLVED — it was a tailscale fault, not the machine).** Dave couldn't ping or ssh it and wasn't physically near it; no ICMP response, `:8010`/`:8020`/`:8880` all unreachable. Re-verified 2026-08-12: embeddings `200` in 0.11 s, Kokoro `200` in 1.4 s. Keep the breakdown below — it is the record of what a lilbuddy outage actually costs, and the TTS single-point-of-failure it exposes is still unfixed. **General lesson: "host unreachable" was a tailnet-layer fault the whole time. Check the overlay network before concluding hardware is dead.** What lilbuddy carries:
+  - **`:8880` Kokoro — the live TTS path. This is the unfixed structural risk.** `TTSSettings.voxtral_enabled` is False, so *every* synth call goes straight to this "fallback" and the Voxtral primary is never attempted. With lilbuddy gone there was **no working TTS at all**: Octavius was mute on the voice UI, the Android client, and continuous conversation, and text/Matrix turns were the only unaffected paths. `lilripper:8030` (the configured Voxtral primary) 502s — Caddy is up, no upstream behind it — so flipping `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` does not help. Kokoro answers again as of 2026-08-12, but nothing about the topology changed: **one host going away still means no voice.** A Kokoro instance on triplestuffed (co-located with Octavius, no network hop) remains the obvious fix.
+  - **`:8020` bge-m3 — the embedding primary.** Degraded cleanly: the `workhorse:11434` Ollama fallback stayed up returning 1024-dim vectors, so semantic history/inbox search kept working. It was promoted to primary for the outage and demoted back on 2026-08-12 (see below).
   - **`:8010` — main-chain fallback.** Now the third hop; costs only a fast connect failure while down.
 
 - **triplestuffed:8010 is a zombie (2026-08-08).** `/v1/models` answers `200` in ~1 ms, but `/v1/chat/completions` never returns (>30 s by hand, 120 s `ReadTimeout` in the app) — its GPUs are serving Positron IDE autocomplete/NES models. Reachability checks pass while generation is dead, the same failure shape as the reader's stale `qwen3.5-9b`: **do not treat a `/v1/models` probe as proof an endpoint works.** Removed from the main chain and from the summary chain as a result.

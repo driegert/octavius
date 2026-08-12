@@ -710,6 +710,17 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # Clear the real auth vars for every test in this class. `_llm_api_keys`
+        # reads os.environ directly, so a developer who has exported either var
+        # in their shell would otherwise see ambient credentials leak in — and
+        # because OCTAVIUS_8010_API_KEY deliberately *wins* over the JSON map,
+        # the leak looks like a logic failure rather than a dirty environment.
+        env_patcher = patch.dict(os.environ, {}, clear=False)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
+        os.environ.pop("OCTAVIUS_8010_API_KEY", None)
+
     def test_env_keys_are_normalized_to_origin(self):
         env = {"OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-abc"}}'}
         with patch.dict(os.environ, env):

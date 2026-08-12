@@ -578,22 +578,27 @@ def load_settings() -> Settings:
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8010/v1/chat/completions"),
         summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
-        # workhorse is primary as of 2026-08-10: lilbuddy went unreachable and,
-        # because a dead host drops packets rather than refusing them, every
-        # embed burned the full connect timeout on it before failing over.
-        # Restore lilbuddy to the front only if it is both up and preferred.
+        # lilbuddy is primary as of 2026-08-12. It was demoted on 2026-08-10 for
+        # being unreachable (a tailscale fault, since fixed) — and because a dead
+        # host drops packets rather than refusing them, every embed burned the
+        # full connect timeout on it before failing over. That is no longer a
+        # reason to keep it second: the connect-timeout fix plus the per-endpoint
+        # breaker in EmbeddingClient cap a dead primary at two failures and then
+        # 300 s of nothing. So order is now purely about speed, and measured on a
+        # realistic ~1800-char payload lilbuddy wins ~3x (0.11 s vs 0.30 s, plus
+        # workhorse pays a ~2.7 s cold start after an idle period).
         embedding_chain=_env_json(
             "OCTAVIUS_EMBEDDING_CHAIN",
             [
                 {
-                    "url": "http://workhorse:11434/api/embeddings",
-                    "model": "bge-m3",
-                    "schema": "ollama",
-                },
-                {
                     "url": "http://lilbuddy:8020/v1/embeddings",
                     "model": "bge-m3",
                     "schema": "openai",
+                },
+                {
+                    "url": "http://workhorse:11434/api/embeddings",
+                    "model": "bge-m3",
+                    "schema": "ollama",
                 },
             ],
         ),

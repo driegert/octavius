@@ -188,15 +188,19 @@ External services currently expected:
 - **Reader LLM**: `qwen3.6-35b-a3b-mtp-q4-general` at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets"). `qwen3.5-9b` is still in `:8010`'s catalog but went stale — it lists in `/v1/models` and then hangs on completion, which silently degraded every math chunk to dollar-stripping. Alias deliberately matches the subagent chain's `:8010` entry.
 - **Summary/tag generation**: `lilripper:8020` with fallback `lilripper:8010`, model `qwen3.6-35b-a3b-mtp-general` (moved off the dead lilbuddy/triplestuffed pair 2026-08-08). `SummaryClient` is **not** an `LLMChainClient`: it sends one model to both URLs, so the alias must exist on both ports. It does attach `auth_headers` (added 2026-08-08 — previously it sent none, so any authed endpoint here would have 401'd silently). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
-  - primary: `workhorse:11434/api/embeddings` (Ollama schema)
-  - fallback: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
-  - **Order reversed 2026-08-10.** lilbuddy was primary and went unreachable; because a
-    dead host drops packets rather than refusing them, every embed burned the full
-    connect budget on it first. `EmbeddingClient` now also has a **per-endpoint circuit
-    breaker** (2 consecutive failures → skipped for 300 s, then a single half-open
-    probe) and no longer retries `ConnectTimeout` — it subclasses the generic timeout
-    class, so a dead host was being retried, doubling the cost. `/health`'s
-    `embedding_chain` shows per-endpoint `tripped` / `consecutive_failures` /
+  - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
+  - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
+  - **Order reversed 2026-08-10, restored 2026-08-12.** lilbuddy was demoted for being
+    unreachable (a tailscale fault, since fixed): because a dead host drops packets
+    rather than refusing them, every embed burned the full connect budget on it first.
+    That is no longer a reason to keep it second — `EmbeddingClient` now has a
+    **per-endpoint circuit breaker** (2 consecutive failures → skipped for 300 s, then a
+    single half-open probe) and no longer retries `ConnectTimeout` (it subclasses the
+    generic timeout class, so a dead host was being retried, doubling the cost). With a
+    dead primary capped at two failures and then 300 s of nothing, **order is now purely
+    a speed choice**, and lilbuddy measures ~3x faster on a realistic ~1800-char payload
+    (0.11 s vs 0.30 s; workhorse also pays ~2.7 s on a cold start after idling).
+    `/health`'s `embedding_chain` shows per-endpoint `tripped` / `consecutive_failures` /
     `cooldown_remaining`. It deliberately does **not** feed the top-level `degraded`:
     every search path falls back to keyword matching, so Octavius still answers.
   - **Message embeds are detached from the turn path.** `add_message_async` commits the
@@ -209,7 +213,8 @@ External services currently expected:
     `drain_inflight()` runs at shutdown. Consequence: message-level semantic search is
     **eventually consistent**.
   - **Embed input is capped at `EMBED_MAX_CHARS` (4000)** in `history_enrichment`, the
-    choke point every embed call goes through. Embedders reject over-long input
+    choke point every embed call goes through. The cap is sized for the *weakest*
+    endpoint in the chain, not the primary. Embedders reject over-long input
     outright — Ollama's default `num_ctx` is 2048 tokens and workhorse 500s somewhere
     between 4000 and 6000 characters. Raising `num_ctx` is not a fix: bge-m3 tops out at
     8192 tokens (a 20k-char input still 500s), and a full-context embed took 4.5 s versus
