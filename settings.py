@@ -507,11 +507,13 @@ def load_settings() -> Settings:
     # capacity: 3 VERIFIED 2026-08-13 against the live server, not assumed:
     # /v1/models returns each model's full launch argv under status.args, so
     # `--parallel` is readable directly (see the Runbook recipe in CLAUDE.md).
-    # NOTE :8020 reports --parallel 3 as well. It is described elsewhere in this
-    # repo as "single-slot", which was the stated reason for moving consults
-    # here in the first place; that is no longer accurate. The split is still
-    # worth keeping (it isolates consults from the main agent's turn), but do
-    # not reason from :8020 having one slot.
+    # NOTE :8020 reports --parallel 3 as well, as of 2026-08-13 — Dave raised it
+    # that day. ":8020 is single-slot" was TRUE when the 2026-07-30 tier swap was
+    # made, so that reasoning was sound; it just expired. The split is still worth
+    # keeping (it isolates consults from the main agent's turn, and :8010 no longer
+    # has to swap models for them), but do not reason from :8020 having one slot.
+    # With both endpoints at --parallel 3 the tiers are now near-interchangeable,
+    # which makes collapsing them a live option — measure before assuming it helps.
     #
     # Model choice: this was the q4 MTP variant, picked because consult_specialist
     # is the dominant first-turn latency cost and speculative decoding buys more

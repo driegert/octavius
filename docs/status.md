@@ -72,11 +72,15 @@ Reading it properly corrected three things:
 | lilbuddy qwen3-vl-30b-a3b | unloaded | ? | 32768 | yes |
 
 1. **`capacity: 3` is right** — see item 1 above.
-2. **`:8020` is not single-slot.** It is `--parallel 3`, same as `:8010`. "The single-slot
-   `:8020`" was the stated rationale for the 2026-07-30 subagent tier swap and appears in
-   `settings.py`, `CLAUDE.md`, and here. Whether it was ever true or changed in the
-   rebuild is unknown from this side, but it is false now. The tier split is still worth
-   keeping — it isolates consults from the main agent's turn — just not for that reason.
+2. **`:8020` is not single-slot any more.** It is `--parallel 3`, same as `:8010`.
+   Dave confirmed he raised it **on 2026-08-13** — it is in fact why this whole review
+   started. So "the single-slot `:8020`", the stated rationale for the 2026-07-30
+   subagent tier swap, was *correct when written* and simply expired; it is not a
+   documentation error, it is a fact with a shelf life. It appears in `settings.py`,
+   `CLAUDE.md`, and here, all now dated. The tier split still earns its keep (consults
+   stay isolated from the main agent's turn), but with both endpoints at `--parallel 3`
+   the two tiers are near-interchangeable, so **collapsing them is now a live option** —
+   worth measuring, not worth assuming.
 3. **lilbuddy:8010 is not text-only.** `CLAUDE.md` described it as a "plain single-model
    server, text-only", which was the stated reason the vision chain must stay separate
    from the main chain. It is a 14-alias router and `qwen3.6-35b-a3b` takes images. The
