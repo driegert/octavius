@@ -114,6 +114,30 @@ After changes to request routing, WebSocket behavior, reader flows, or inbox flo
 
 When touching external-service boundaries, verify the configured endpoints are reachable before assuming an application bug.
 
+### Inspecting a llama.cpp router
+
+`/v1/models` on the lilripper/lilbuddy routers returns far more than model ids —
+each entry carries the model's **full launch argv** under `status.args`, its
+`status.value` (`loaded`/`unloaded`), and `architecture.input_modalities`. So
+`--parallel`, `--ctx-size`, and image support are all readable without probing,
+and without asking Dave. Do not list only `data[].id` and conclude that is all
+there is (this cost a wrong answer on 2026-08-13):
+
+```bash
+curl -s -H "Authorization: Bearer $OCTAVIUS_8010_API_KEY" http://lilripper:8010/v1/models \
+| python3 -c "
+import json,sys
+for m in json.load(sys.stdin)['data']:
+    a = (m.get('status') or {}).get('args') or []
+    g = lambda f: a[a.index(f)+1] if f in a else '?'
+    mods = ','.join((m.get('architecture') or {}).get('input_modalities') or ['?'])
+    print(f\"{m['id']:34s} {(m.get('status') or {}).get('value','?'):9s} par={g('--parallel'):>2s} ctx={g('--ctx-size'):>7s} in={mods}\")"
+```
+
+What it still cannot tell you: whether a listed model actually *generates*.
+`triplestuffed:8010` (2026-08-08) and the stale `qwen3.5-9b` both listed fine and
+hung on completion. For that, send a real completion.
+
 ## Architecture
 
 High-level path:
@@ -167,7 +191,7 @@ External services currently expected:
 - **LLM chain (main agent)**: via `OCTAVIUS_LLM_CHAIN`, defaulting to:
   - primary: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general` — a llama.cpp **router**, so the model id selects the model (see "Router model ids" below). Accepts image input. No auth. Shared with pi-agent (which pulls the 27B), and that contention has produced a live `500 model ... failed to load`.
   - first fallback: `lilripper:8010/v1/chat/completions` (`qwen3.6-35b-a3b-mtp-general`) — the same alias `:8020` serves. The invariant is that every `:8010` consumer names ONE alias, so interleaving a consult with a document read can't thrash the router between resident models; now that both ports serve the same one, there is nothing left to thrash. This was `qwen3.6-35b-a3b-mtp-q4-general` until 2026-08-13, when a lilripper reconfiguration removed the q4 aliases from both ports. Behind auth.
-  - second fallback: `lilbuddy:8010/v1/chat/completions` (`qwen3.6-35b-a3b`) — plain single-model server, text-only, so an image turn must never land on it (hence the separate vision chain below).
+  - second fallback: `lilbuddy:8010/v1/chat/completions` (`qwen3.6-35b-a3b`). **This entry's description was wrong until 2026-08-13**: lilbuddy:8010 is not a plain text-only single-model server any more, it is a router with 14 aliases, and `qwen3.6-35b-a3b` *does* accept image input. The vision chain still stays separate — not every main-chain fallback is image-capable, and a separate chain is the only thing keeping an image turn off the ones that aren't — but "lilbuddy is text-only" is no longer the reason.
   - `triplestuffed:8010` was **removed** from this chain on 2026-08-08: its GPUs serve Positron autocomplete/NES models, and it accepts connections without ever generating, so failing into it burned the full 120 s read timeout. See `docs/status.md`.
 - **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
   - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general`, `capacity: 3` — served with `--parallel 3`, so consults no longer queue behind the main agent's own turn on the single-slot `:8020`. `consult_specialist` is the dominant Matrix first-turn cost (~15 s average, 50 s worst), and it reserves a dispatcher ticket, so the old `capacity: 1` also serialised concurrent consults against each other. This ran on `qwen3.6-35b-a3b-mtp-q4-general` (chosen for speculative-decoding speed — on tool-calling work latency beats Q5 weights) until the 2026-08-13 lilripper reconfiguration removed the q4 aliases; it now follows the rest of `:8010` onto `mtp-general`. **`capacity: 3` assumes `--parallel 3` is still how `:8010` is served — that is not visible in `/v1/models`, so re-check it after any lilripper change.** If consult latency regresses, the q4 variant now lives on `lilbuddy:8010`, but that is a different host and trades this endpoint's parallelism for a network hop. Same alias as the reader, so sharing `:8010` costs no extra model swap.
@@ -238,7 +262,7 @@ External services currently expected:
     transaction: conversations are resumed in place (every Matrix thread), so a rewrite
     whose re-embed fails would otherwise leave a vector for superseded text that looks
     complete forever.
-- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`) with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general`) as fallback — the `:8010` entry is **behind auth** (see "Configuration and secrets"). The primary is now the *same endpoint and model as the main chain*, since `:8020` gained image input; the chain stays separate purely so image turns can't fail over onto the main chain's text-only fallbacks on lilbuddy/triplestuffed. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
+- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting to `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`) with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general`) as fallback — the `:8010` entry is **behind auth** (see "Configuration and secrets"). The primary is now the *same endpoint and model as the main chain*, since `:8020` gained image input; the chain stays separate so image turns can't fail over onto main-chain fallbacks that lack image input. (Careful: as of 2026-08-13 `lilbuddy:8010` *does* take images on several aliases — see the main-chain bullet. The separation is still right, but check `architecture.input_modalities` rather than assuming.) Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
 Configured MCP servers:

@@ -29,9 +29,9 @@ had it gone unnoticed, worst first:
   from 2026-08-08, different cause, same silence.
 - **Subagent primary — every `consult_specialist` 400s on hop 1** and lands on the
   `:8020` fallback. It still *answers*, which is what makes this nasty: the visible
-  symptom is only that consults got slower, and `:8020` is the single-slot endpoint the
-  2026-07-30 work moved them *off*, so concurrent consults re-serialise behind the main
-  agent's turn.
+  symptom is only that consults got slower, and they'd pile onto `:8020`, the endpoint
+  the 2026-07-30 work moved them *off*. (That work's stated reason — `:8020` being
+  single-slot — no longer holds; see below.)
 - **Main chain hop 2** — 400 burns the hop, falls through to `lilbuddy:8010`. Works.
 - **Vision fallback** — 400; image turns lose their only fallback.
 
@@ -44,15 +44,48 @@ tool-calling — is noted in `settings.py` against the day it matters again.
 
 Three things this surfaced that are **not** fixed:
 
-1. **`capacity: 3` on the subagent primary is now an unverified assumption.** It encodes
-   `--parallel 3` on `:8010`, which `/v1/models` cannot tell you. If the rebuild changed
-   it, the dispatcher will over-admit and consults will queue inside llama.cpp instead of
-   in the dispatcher. Ask Dave or check the server invocation.
+1. ~~`capacity: 3` is an unverified assumption.~~ **VERIFIED, and the claim that it
+   couldn't be checked was wrong.** `/v1/models` on this llama.cpp build returns each
+   model's full launch argv under `status.args`, plus `status.value` and
+   `architecture.input_modalities`. `:8010`'s `qwen3.6-35b-a3b-mtp-general` is
+   `--parallel 3`, so `capacity: 3` is correct. The original claim came from listing only
+   `data[].id` and generalising from the parser rather than the payload — recipe now in
+   CLAUDE.md's Runbook so it isn't repeated.
 2. **The q4 aliases moved to `lilbuddy:8010`**, which also now serves
    `qwen3.6-35b-a3b-q6` and `qwen3-vl-30b-a3b`.
 3. **`qwen3-vl-30b-a3b` accepts image input on a non-lilripper host.** Near-Term Work #4
    says cross-host vision failover is blocked because no non-lilripper endpoint takes
    images. **That is no longer true** — the prerequisite it was waiting on now exists.
+
+### What the full `/v1/models` payload showed (2026-08-13)
+
+Dave curled `:8020` directly and the response was far richer than the id list above.
+Reading it properly corrected three things:
+
+| endpoint / alias | state | `--parallel` | ctx | image in |
+|---|---|---|---|---|
+| `:8020` qwen3.6-35b-a3b-mtp-general | loaded | **3** | 614400 | yes |
+| `:8010` qwen3.6-35b-a3b-mtp-general | loaded | **3** | 614400 | yes |
+| `:8020` muse-glimmer-30b | unloaded | 1 | 131072 | yes |
+| lilbuddy qwen3.6-35b-a3b | loaded | ? | 153600 | **yes** |
+| lilbuddy qwen3.6-35b-a3b-mtp-q4-general | unloaded | 3 | 460800 | yes |
+| lilbuddy qwen3-vl-30b-a3b | unloaded | ? | 32768 | yes |
+
+1. **`capacity: 3` is right** — see item 1 above.
+2. **`:8020` is not single-slot.** It is `--parallel 3`, same as `:8010`. "The single-slot
+   `:8020`" was the stated rationale for the 2026-07-30 subagent tier swap and appears in
+   `settings.py`, `CLAUDE.md`, and here. Whether it was ever true or changed in the
+   rebuild is unknown from this side, but it is false now. The tier split is still worth
+   keeping — it isolates consults from the main agent's turn — just not for that reason.
+3. **lilbuddy:8010 is not text-only.** `CLAUDE.md` described it as a "plain single-model
+   server, text-only", which was the stated reason the vision chain must stay separate
+   from the main chain. It is a 14-alias router and `qwen3.6-35b-a3b` takes images. The
+   separation is still correct (not every fallback is image-capable) but the reason was
+   wrong.
+
+Also: `:8010` and `:8020` now serve the **identical** `mtp-general` — same gguf, same
+614400 ctx, same `--parallel 3`, both resident. That is a stronger argument for the
+retarget above than the probe that motivated it.
 
 General lesson, and the second time this shape has bitten in a week: **a model alias is
 a distributed config dependency with no compile-time check.** `/v1/models` drift is

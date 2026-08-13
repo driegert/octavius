@@ -500,9 +500,18 @@ def load_settings() -> Settings:
     )
     # Subagents (inline consult_specialist + backgrounded delegations) run on
     # lilripper:8010, which is served with --parallel 3, so they no longer queue
-    # behind the main agent's own turn on the single-slot :8020. `capacity`
-    # matches that --parallel, letting SubagentDispatcher run three consults at
-    # once instead of serialising them. :8020 stays as the HTTP-level fallback.
+    # behind the main agent's own turn on :8020. `capacity` matches that
+    # --parallel, letting SubagentDispatcher run three consults at once instead
+    # of serialising them. :8020 stays as the HTTP-level fallback.
+    #
+    # capacity: 3 VERIFIED 2026-08-13 against the live server, not assumed:
+    # /v1/models returns each model's full launch argv under status.args, so
+    # `--parallel` is readable directly (see the Runbook recipe in CLAUDE.md).
+    # NOTE :8020 reports --parallel 3 as well. It is described elsewhere in this
+    # repo as "single-slot", which was the stated reason for moving consults
+    # here in the first place; that is no longer accurate. The split is still
+    # worth keeping (it isolates consults from the main agent's turn), but do
+    # not reason from :8020 having one slot.
     #
     # Model choice: this was the q4 MTP variant, picked because consult_specialist
     # is the dominant first-turn latency cost and speculative decoding buys more
@@ -523,9 +532,14 @@ def load_settings() -> Settings:
     )
     # Vision-capable chain for turns carrying image content (image_input WS
     # frames from the Matrix sidecar). Still separate from llm_chain even though
-    # its primary is now the same endpoint: llm_chain's two fallbacks are
-    # text-only single-model servers on other hosts, so an image turn must never
-    # be allowed to fail over onto them. Both entries here accept image input.
+    # its primary is now the same endpoint: llm_chain's fallbacks are not all
+    # image-capable, so an image turn must never be allowed to fail over onto
+    # them. Both entries here accept image input (confirmed via each model's
+    # architecture.input_modalities in /v1/models).
+    # NOTE lilbuddy:8010 is no longer the text-only single-model server this
+    # rationale was written against — it is a router now, and several of its
+    # aliases take images. See docs/status.md; cross-host vision failover is
+    # newly possible.
     vision_llm_chain = _env_json(
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
