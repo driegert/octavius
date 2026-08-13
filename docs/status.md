@@ -9,6 +9,57 @@ This document holds change-oriented project status that is useful in the short t
 
 Keep durable architecture and contributor workflow in `CLAUDE.md`.
 
+## lilripper rebuilt its model catalogs (2026-08-13) — four chains were pointing at a dead alias
+
+Dave reconfigured lilripper. `qwen3.6-35b-a3b-mtp-q4-general` **no longer exists on
+either lilripper port**, and four config sites named it. Verified by probe, not by
+reading `/v1/models`:
+
+```
+POST lilripper:8010 model=qwen3.6-35b-a3b-mtp-q4-general
+  -> 400 {"error":{"message":"model 'qwen3.6-35b-a3b-mtp-q4-general' not found"}}
+```
+
+Caught before it bit: the journal shows subagent consults succeeding on `:8010` at
+07:49 that day and **no 400s anywhere**, so the rebuild landed after that. Blast radius
+had it gone unnoticed, worst first:
+
+- **Reader LLM — hard broken.** The reader has no failover at all, so every math chunk
+  would 400 and silently degrade to dollar-stripping. Exactly the `qwen3.5-9b` failure
+  from 2026-08-08, different cause, same silence.
+- **Subagent primary — every `consult_specialist` 400s on hop 1** and lands on the
+  `:8020` fallback. It still *answers*, which is what makes this nasty: the visible
+  symptom is only that consults got slower, and `:8020` is the single-slot endpoint the
+  2026-07-30 work moved them *off*, so concurrent consults re-serialise behind the main
+  agent's turn.
+- **Main chain hop 2** — 400 burns the hop, falls through to `lilbuddy:8010`. Works.
+- **Vision fallback** — 400; image turns lose their only fallback.
+
+**Fix.** All four sites retargeted to `qwen3.6-35b-a3b-mtp-general`, which exists on
+`:8010` and is *also* what `:8020` serves. The old invariant ("every `:8010` consumer
+names one alias, or a consult interleaved with a document read thrashes the router")
+now holds more cheaply than before: both ports share one alias, so there is nothing
+left to thrash. The old q4 rationale — speculative decoding beating Q5 weights on
+tool-calling — is noted in `settings.py` against the day it matters again.
+
+Three things this surfaced that are **not** fixed:
+
+1. **`capacity: 3` on the subagent primary is now an unverified assumption.** It encodes
+   `--parallel 3` on `:8010`, which `/v1/models` cannot tell you. If the rebuild changed
+   it, the dispatcher will over-admit and consults will queue inside llama.cpp instead of
+   in the dispatcher. Ask Dave or check the server invocation.
+2. **The q4 aliases moved to `lilbuddy:8010`**, which also now serves
+   `qwen3.6-35b-a3b-q6` and `qwen3-vl-30b-a3b`.
+3. **`qwen3-vl-30b-a3b` accepts image input on a non-lilripper host.** Near-Term Work #4
+   says cross-host vision failover is blocked because no non-lilripper endpoint takes
+   images. **That is no longer true** — the prerequisite it was waiting on now exists.
+
+General lesson, and the second time this shape has bitten in a week: **a model alias is
+a distributed config dependency with no compile-time check.** `/v1/models` drift is
+invisible until a request fails, and `LLMChainClient` treats the resulting 400 as an
+ordinary failure to fail over past, so a missing alias degrades quietly instead of
+erroring loudly. Re-probe both ports after any lilripper work.
+
 ## Deployment State (2026-08-11) — DEPLOYED
 
 Restarted 2026-08-11 07:20. `/health`: `ok`, ready, **not** degraded, MCP 8/8.
@@ -295,7 +346,7 @@ Operational assumptions worth keeping in mind during debugging:
 - **Memory push was silently dead 2026-07-02 → 2026-07-13 (fixed; should not regress).** When the memory service was extracted to the `agent-memory` repo, `history.py`'s push path kept doing `import memory` for three watermark helpers, so every conversation end logged "Memory client unavailable; skipping push" and skipped the push. The helpers (`get_memory_watermark` / `set_memory_watermark` / `messages_after_watermark`) now live in `history_store.py` — they only touch Octavius's own tables (`conversations.last_extracted_message_id` + `messages`), so Octavius no longer imports anything from agent-memory except over HTTP via `memory_client.py`. Conversations that *ended* during the gap were never mined for facts (push happens at conversation end; watermarks stayed put but closed conversations don't re-push) — a backfill would need a one-off script.
 - **WS disconnects arrive as messages, not exceptions (fixed; should not regress).** Starlette's `ws.receive()` returns a `websocket.disconnect` message; calling `receive()` again raises `RuntimeError`. The run loop used to reach cleanup *through* that RuntimeError, which chained the traceback into every `exc_info` warning logged during cleanup (confusing journal noise). `websocket_session.run` now breaks on the disconnect message itself.
 - **Caddy leaks upstream WS sockets when a client stalls silently (mitigated 2026-07-13).** A downstream client that freezes without dying (phone in Doze: app stops reading, kernel keeps ACKing) blocks Caddy's copy goroutines; when uvicorn's WS ping timeout then closes the upstream leg, Caddy never reaps its side — one CLOSE_WAIT socket to `127.0.0.1:8030` per stalled client (~3/day observed; clean closes and RSTs do NOT leak — verified by live probe). Mitigation: `stream_timeout 24h` in the octavius `reverse_proxy` block in the Caddyfile (safe because the app and PWA both auto-reconnect). A Caddy restart clears any backlog.
-- **Subagent chain has no cross-host failover — and as of 2026-08-08 neither does the vision chain.** `consult_specialist` routes primary `lilripper:8010` (`qwen3.6-35b-a3b-mtp-q4-general`, `--parallel 3`, `capacity: 3`) → fallback `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`). The tiers swapped on 2026-07-30 to get consults off the main agent's single-slot `:8020` (see `HANDOFF-matrix-latency.md`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`.
+- **Subagent chain has no cross-host failover — and as of 2026-08-08 neither does the vision chain.** `consult_specialist` routes primary `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general` since the 2026-08-13 rebuild, `--parallel 3`, `capacity: 3`) → fallback `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`). The tiers swapped on 2026-07-30 to get consults off the main agent's single-slot `:8020` (see `HANDOFF-matrix-latency.md`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`.
 
   The **vision chain** now has the same shape: `lilripper:8020` → `lilripper:8010`. It gained a second entry on 2026-08-08 (it was previously a single `:8010` entry with no failover at all, so this is an improvement, not a regression) — but both are on lilripper. Restoring cross-host vision failover is harder than for subagents: the remote host must accept **image input**, and neither `lilbuddy:8010` nor `triplestuffed:8010` currently does. Until one of them serves a multimodal alias, the third entry doesn't exist to add. The reader (`:8010`) has no failover either and never has.
 
@@ -321,7 +372,7 @@ Likely refactor targets, in rough priority order:
 1. Further narrow `main.py` so it remains a routing layer rather than a coordination module.
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
-4. Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input, which no non-lilripper endpoint currently does. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
+4. Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input. **(b) was unblocked on 2026-08-13**: `lilbuddy:8010` now serves `qwen3-vl-30b-a3b`. Verify it actually generates on an image payload before wiring it in — `/v1/models` is not proof. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
 5. **Adopt `OCTAVIUS_8010_API_KEY` (Dave to action; 2026-08-12).** The service authenticates to `lilripper:8010` through the older `OCTAVIUS_LLM_API_KEYS` JSON map. That works, so this is hygiene, not an outage — the point is that the bare var is the one that rotates, has no JSON quoting to get wrong, and has a name that survives rotations.
 
    **Resolve the drift first.** Dave's interactive shell exports an `OCTAVIUS_8010_API_KEY` whose value **differs** from the token in `~/.config/octavius/env` (fingerprints `32173c2e…` vs `94745832…`). Probed 2026-08-12: `/v1/models` returns **401 unauthenticated and 200 for *both* tokens** — lilripper:8010 accepts them both, so nothing is broken today, but two live keys for one endpoint is exactly the drift shape that turns into a silent 401 the moment one is revoked. Decide which token is canonical before copying anything. The shell export is not in any dotfile (`.bashrc`/`.profile`/`environment.d`/systemd user env are all clean), so it came from an ad-hoc `export` and will vanish with that terminal.

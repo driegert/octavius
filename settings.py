@@ -476,15 +476,17 @@ def load_settings() -> Settings:
     #  1. :8020 — primary. Shared with pi-agent, which pulls the 27B; contention
     #     there produced a live `500 model ... failed to load` on this alias, so
     #     a working second hop on lilripper matters more than it used to.
-    #  2. :8010 — second hop, deliberately on the alias ALREADY RESIDENT there
-    #     (the subagent + reader alias, not the Q6 mtp-general). Failing over to
-    #     a different alias would pin :8010 to it for the duration of a :8020
-    #     outage and make every consult_specialist / reader call swap the model
-    #     back — turning one degraded endpoint into three. Quality is the right
-    #     thing to trade here: this only serves turns whose primary already died.
+    #  2. :8010 — second hop. The rule is that every :8010 consumer (this hop,
+    #     the subagent primary, the vision fallback, the reader) names ONE alias,
+    #     so interleaving a consult with a document read can't thrash the router
+    #     between resident models. That alias used to be the q4 MTP variant;
+    #     lilripper was reconfigured on 2026-08-13 and `qwen3.6-35b-a3b-mtp-q4-*`
+    #     no longer exists on either port, so it is now `mtp-general` — which is
+    #     also what :8020 serves, meaning both ports share one alias and there is
+    #     nothing left to thrash. Re-verify with /v1/models before changing.
     #  3. lilbuddy:8010 — plain single-model server (model id ignored).
-    #     UNREACHABLE as of 2026-08-08 and expected to stay down for some days;
-    #     kept because it costs only the 5 s connect timeout while down.
+    #     Reachable again as of 2026-08-12 (the 08-08 outage was a tailscale
+    #     fault); costs only the connect timeout when it is down.
     # triplestuffed:8010 was REMOVED: its GPUs serve Positron autocomplete/NES
     # models, and it currently accepts connections without ever generating, so a
     # failover into it burned the full 120 s read timeout. See docs/status.md.
@@ -492,7 +494,7 @@ def load_settings() -> Settings:
         "OCTAVIUS_LLM_CHAIN",
         [
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
         ],
     )
@@ -502,15 +504,20 @@ def load_settings() -> Settings:
     # matches that --parallel, letting SubagentDispatcher run three consults at
     # once instead of serialising them. :8020 stays as the HTTP-level fallback.
     #
-    # Model choice: the q4 MTP variant. consult_specialist is the dominant
-    # first-turn latency cost, and speculative decoding buys more here than Q5
-    # weights do on tool-calling work. NOTE the model is resolved per ENDPOINT
-    # URL (subagent.py::_model_for_url), not per domain — all three specialist
-    # domains on :8010 share this one model.
+    # Model choice: this was the q4 MTP variant, picked because consult_specialist
+    # is the dominant first-turn latency cost and speculative decoding buys more
+    # there than Q5 weights do on tool-calling work. lilripper was reconfigured on
+    # 2026-08-13 and that alias is gone from both ports (it now lives only on
+    # lilbuddy:8010), so this follows the rest of :8010 onto `mtp-general`.
+    # If consult latency regresses noticeably, the q4 variant on lilbuddy:8010 is
+    # the obvious thing to reach for — but it is a different HOST, so it trades
+    # the --parallel 3 capacity here for a network hop. Measure before switching.
+    # NOTE the model is resolved per ENDPOINT URL (subagent.py::_model_for_url),
+    # not per domain — all three specialist domains on :8010 share this one model.
     subagent_llm_chain = _env_json(
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general", "role": "primary", "capacity": 3},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "primary", "capacity": 3},
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "fallback"},
         ],
     )
@@ -523,7 +530,7 @@ def load_settings() -> Settings:
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
         ],
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
@@ -551,7 +558,7 @@ def load_settings() -> Settings:
         # Deliberately the SAME alias the subagent chain uses on :8010: reading a
         # document and running a consult otherwise thrash the router between two
         # resident models.
-        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-q4-general"),
+        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-general"),
     )
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
