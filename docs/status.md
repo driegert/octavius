@@ -9,6 +9,71 @@ This document holds change-oriented project status that is useful in the short t
 
 Keep durable architecture and contributor workflow in `CLAUDE.md`.
 
+## START HERE (2026-08-13)
+
+Everything below this section is history. This is the live picture.
+
+**State.** `main` is current at `eb196b0`; nothing unmerged, tree clean, 448 tests
+passing, service healthy (`ok`, MCP 8/8). Both lilbuddy and lilripper are up.
+
+**The embedding-latency work is done and now VERIFIED IN PRODUCTION**, not just by
+tests. 14 real voice turns on 2026-08-13 morning, measuring VAD end-of-speech → LLM
+response complete:
+
+| | |
+|---|---|
+| median | **0.29 s** |
+| min / max | 0.11 s / 9.82 s |
+
+That gap was **~10 s on every turn** before. The 9.82 s outlier is turn 1 only — a cold
+model load on `:8020`, not the embed path; turns 2-14 all fall between 0.11 s and 0.61 s.
+The mechanism is visible in the journal: at `07:50:08.210` VAD ends, `.241` the detached
+embed returns (31 ms, concurrent), `.344` the LLM returns, `.897` TTS is speaking. Both
+halves of the original fault are gone, embed backlog is 0/0, and conversation 1770
+summarised → tagged → indexed → pushed cleanly.
+
+**Where the time goes now** (this is the useful part for whoever picks this up):
+
+1. **`consult_specialist` is the latency frontier.** Simple turns reach speech in
+   0.7-1.4 s. Tool turns ran 8-51 s to first audio on 2026-08-13, entirely tool rounds
+   (5-6 rounds per consult against `:8010`), matching the "~15 s average, 50 s worst"
+   already in CLAUDE.md. Embeddings are no longer anywhere in this picture. Dave raised
+   `:8020` to `--parallel 3` on 2026-08-13, which is the most likely lever.
+2. **`end_async` costs ~8.8 s on the WS control path**, now measured rather than
+   theorised. Conversation 1770's last turn ended `07:50:08`; summary landed
+   `07:50:13.5` (+5.2 s), tags `07:50:14.7` (+1.1 s), memory push `07:50:17.0` (+2.4 s),
+   session closed `07:50:17.02`. Four blocking remote calls in a row on "New Chat".
+   **Same shape as the embedding bug — none of it needs to be on the turn path.** This is
+   the obvious next piece of work.
+
+**Open items, in the order they're worth doing** (details live in the task list, which
+carries full runbooks — read the task before starting):
+
+- **Task #8 — cross-host vision failover.** Model DECIDED with Dave:
+  `qwen3.6-35b-a3b` on `lilbuddy:8010` (already loaded there, ctx 153600, takes images,
+  already the main chain's 3rd hop on that host so no extra model swap). Ready to build.
+  Today one lilripper outage means no image turns at all. Probe with a real image first —
+  `input_modalities` is not proof a model generates.
+- **Task #6 — `OCTAVIUS_8010_API_KEY`. Needs Dave, nobody else can do it.** His shell
+  exports a *different* token than `~/.config/octavius/env` holds. Both authenticate
+  today, so nothing is broken; the risk is a silent 401 when one is revoked.
+- **`end_async` detach** — see item 2 above.
+- **TTS is still a single point of failure.** Kokoro lives only on lilbuddy; the four
+  days it was unreachable Octavius was mute everywhere. A Kokoro on triplestuffed is the
+  fix. Note TTS may still be toggled OFF in Dave's UI settings from that outage.
+- Deferred, unchanged: `tools.py` dispatches sync local tools on the event loop;
+  `/health` latches `degraded` until restart (`terminal_failures` is a lifetime counter);
+  the subagent chain has the same single-host problem vision does, and a `secondary`
+  entry won't fix it — cross-host resilience needs the `fallback` slot.
+
+**Two habits this week earned.** (a) Re-probe both lilripper ports after any lilripper
+work — a model alias is a distributed config dependency with no compile-time check, and
+`LLMChainClient` treats the resulting 400 as an ordinary failure to fail past, so it
+degrades quietly. (b) Read the *whole* `/v1/models` payload, not just `data[].id` — it
+carries each model's launch argv (`--parallel`, `--ctx-size`), load state, and
+`input_modalities`. Recipe is in CLAUDE.md's Runbook. Assuming it didn't cost a wrong
+answer on 2026-08-13.
+
 ## lilripper rebuilt its model catalogs (2026-08-13) — four chains were pointing at a dead alias
 
 Dave reconfigured lilripper. `qwen3.6-35b-a3b-mtp-q4-general` **no longer exists on
