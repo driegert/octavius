@@ -74,6 +74,69 @@ carries each model's launch argv (`--parallel`, `--ctx-size`), load state, and
 `input_modalities`. Recipe is in CLAUDE.md's Runbook. Assuming it didn't cost a wrong
 answer on 2026-08-13.
 
+## Email and paper search cost 10-73 s per call (2026-08-14) — none of it was Octavius
+
+Dave asked why email search felt slow and whether the folder defaults needed tuning.
+Folder scope turned out to be **irrelevant to latency**: every `search_emails` call took
+~10.4 s whether it matched 0 emails or 17, one folder or all 107. The cost was two
+unrelated full scans in `mcp-tools`, and the same class of bug was costing far more in the
+paper library.
+
+**Fault 1 — `_index_health()` ran on every search.** It counted mail with content but no
+embedding via an unscoped `LEFT JOIN` over 28k rows / ~500 MB of `body_text` plus a vec0
+point lookup per row: 10.35 s, to produce a number that is always 0. `_attach_health` only
+*attaches* it when unhealthy, so it was computed and discarded nearly every call. Now
+scoped to a 30-day window on `idx_emails_date` (~5 ms); the emitted key became
+`unembedded_recent_emails` so it doesn't claim more than it checks.
+
+**Fault 2 — the dense arm was O(N).** `hybrid_search` and `search_papers` brute-forced
+`vec_distance_cosine` over every stored vector through a JOIN. Both now use vec0's native
+KNN (`WHERE embedding MATCH ? AND k = ?`).
+
+| | before | after |
+|---|---|---|
+| `search_emails` | 10.4 s | **0.15 s** |
+| `semantic_search` | 10.6 s | **0.24 s** |
+| `hybrid_search` | 40.1 s | **0.21 s** |
+| `search_papers` | 72.9 s | **0.41 s** |
+
+**The trap, and the reason this is worth reading.** Swapping in the KNN operator alone
+would have silently corrupted results. **vec0 defaults to L2**, and these bge-m3 vectors
+are stored *unnormalized* — stored norm ~26 against a unit-norm query vector — so L2 and
+cosine rank almost nothing alike: measured **3/50 overlap**, no error raised. The fix is
+declaring `distance_metric=cosine` on the embedding *column* (as a *table* option
+sqlite-vec v0.1.7 errors "Unknown table option"). Both vec0 tables were rebuilt to declare
+it; the vectors themselves were untouched, so no re-embedding. Post-rebuild the KNN
+matches the old cosine ranking: top-10 identical, 50/50 candidate overlap, across 4 email
+and 3 paper queries, plus folder-filtered cases.
+
+Rebuild mechanics, learned the hard way: **`ALTER TABLE ... RENAME` reports success and
+leaves a broken vec0 table** — the shadow tables (`_info`, `_chunks`, `_rowids`,
+`_vector_chunks00`) keep the old name, and the next query dies with
+`no such table: <name>_rowids`. So: stage rows into a plain table → `DROP` → recreate under
+the final name with the metric → refill. 18 s for 28,466 email vectors, 120 s for 174,876
+chunk vectors. Backups at `evangeline.db.bak-20260814-premetric` and
+`papers.db.bak-20260814-premetric`. Both sync timers were stopped during the rebuild —
+`evangeline-sync.timer` fires every 20 min and would otherwise have written mid-migration.
+
+Filtered KNN was the one semantic worth verifying: vec0 applies an `id IN (subquery)`
+filter *during* the search, not after, so a folder holding fewer than `k` rows returns all
+of them rather than a slice of a global top-k (Todo 24/24, Follow-Up 8/8, Read Later 9/9).
+
+**Two bugs that were ours** (`subagent.py`): the email prompt told the model to scope to
+`folder="INBOX"`, which matches **nothing** — folder comparison is case-sensitive and the
+folder is `Inbox`. And it had no folder vocabulary, so "my to-do folder" cost 38 s guessing
+`"To Do"` → `email_stats` → `"Todo"`. Scope is now constrained to five values — `Inbox`
+(default), `Read Later`, `Follow-Up`, `Todo`, or All (`folder=null`) — with All gated
+behind an explicit request from Dave.
+
+**Still open:** `find_similar_responses` is dead for an unrelated, pre-existing reason —
+it resolves the sent folder from a `folders` table that is **empty** (confirmed empty in
+the pre-migration backup too, so it is not a regression from this work). The
+`hybrid-search-db` skill in `pi_harness` documents the KNN swap as its scale-up path
+without mentioning the metric requirement — that is task #11, and it would hand the same
+silent corruption to the next corpus built from it.
+
 ## lilripper rebuilt its model catalogs (2026-08-13) — four chains were pointing at a dead alias
 
 Dave reconfigured lilripper. `qwen3.6-35b-a3b-mtp-q4-general` **no longer exists on

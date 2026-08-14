@@ -181,9 +181,27 @@ orchestrator. Re-enabling it is one tool spec + one registry line. Quick
 domains (email/tasks/research) deliberately stay inline (low voice latency,
 warm MCP sessions); only long-running deep research is backgrounded.
 
-The email subagent prompt defaults to evangeline's `hybrid_search` (RRF fusion
-of semantic + BM25) and passes `folder=null` / `date_after="1970-01-01"` to
-defeat the Inbox-only and 6-month-lookback defaults on the other search tools.
+The email subagent prompt uses evangeline's `hybrid_search` (RRF fusion of
+semantic + BM25) for anything matching on body text. **Folder scope is a closed
+set of five values** — `"Inbox"` (the default), `"Read Later"`, `"Follow-Up"`,
+`"Todo"`, or All (`folder=null`) — and All requires Dave to ask for it
+explicitly ("search all my email", "look in every folder"). Changed 2026-08-14:
+the prompt previously told the model to pass `folder=null` on everything, which
+searched all 107 folders / 28k messages for questions Dave meant about his
+Inbox. Age is deliberately not scope: "it's an old one" means pass
+`date_after="1970-01-01"` and *keep* `folder="Inbox"`.
+
+Two traps the prompt now names, both of which cost real turns:
+
+- **Folder names are matched exactly and case-sensitively, and a wrong name
+  returns zero results rather than an error** — indistinguishable from "no such
+  mail". The prompt used to say `folder="INBOX"`, which matches **nothing**
+  (the folder is `Inbox`). A zero-result folder search should be read as a
+  suspected typo first.
+- The tools disagree on their own defaults (`hybrid_search` defaults to all
+  folders; `search_emails` / `semantic_search` default to Inbox *and* a 6-month
+  lookback), so the prompt requires `folder` to be passed explicitly on every
+  call rather than relying on any tool's default.
 
 External services currently expected:
 
