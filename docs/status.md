@@ -74,6 +74,86 @@ carries each model's launch argv (`--parallel`, `--ctx-size`), load state, and
 `input_modalities`. Recipe is in CLAUDE.md's Runbook. Assuming it didn't cost a wrong
 answer on 2026-08-13.
 
+## `:8010` promoted to primary on every lilripper chain (2026-08-18)
+
+**Change.** `settings.py` — the main, vision, and summary chains all swapped so
+`lilripper:8010` is the first hop and `:8020` the fallback. The subagent chain
+was already `:8010`-first and is unchanged; the reader was already `:8010`.
+Mirrored in `.env.example`. No env override exists for any of these
+(`~/.config/octavius/env` holds only `OCTAVIUS_LLM_API_KEYS`), so the committed
+defaults are what runs — no drift to reconcile.
+
+| chain | was | now |
+|---|---|---|
+| `OCTAVIUS_LLM_CHAIN` | `:8020` → `:8010` → `lilbuddy:8010` | `:8010` → `:8020` → `lilbuddy:8010` |
+| `OCTAVIUS_VISION_LLM_CHAIN` | `:8020` → `:8010` | `:8010` → `:8020` |
+| summary URL / fallback | `:8020` / `:8010` | `:8010` / `:8020` |
+
+**Why.** Dave's reason, and it is an operational one rather than a latency one:
+`:8020` is the port he loads other models onto by hand, and with `:8020` as the
+main primary *every Octavius turn evicted whatever he had there*. Confirmed live
+at the time of the swap — `/v1/models` showed `qwen3.8-27b` **loaded** on `:8020`
+and `qwen3.6-35b-a3b-mtp-general` **loaded** on `:8010`, i.e. the next voice turn
+would have thrown away the 27B to reload a model that was already resident one
+port over. The two supporting facts that make the demotion free: `:8010` has been
+`--parallel 3` since 2026-08-13 (so it is no longer the narrower endpoint), and
+the specialist subagents already live there.
+
+The consolidation is the real win. `:8010` now serves the main turn, consults,
+vision, the reader, and summaries, **all naming the same alias**, so a
+turn → consult → document read sequence keeps one model resident for the whole
+sequence with zero router swaps.
+
+**Two things to watch.**
+
+1. **Auth is now load-bearing on the first hop.** `:8010` is the only endpoint
+   behind auth. A missing or stale key used to 401 a *fallback*; it now 401s the
+   primary of every turn, and a 401 burns a failover hop like any other error.
+   `/health` → `llm_chain.endpoints_rejecting_credentials` is the first thing to
+   check if the chain looks flaky. Verified working against the live endpoint
+   before the swap.
+2. **Concurrency on `:8010`.** Three slots now absorb main turns + consults +
+   reader + summaries. Single-user this is fine and `consult_specialist` is
+   *inline* (the main agent is blocked awaiting it, so they never contend at the
+   same instant), but if several sessions run at once, measure rather than reason.
+
+**Found while checking the above: the main chain's third hop was silently
+dead.** `lilbuddy:8010` was configured with the bare `qwen3.6-35b-a3b`, and a
+real completion returns `400 model 'qwen3.6-35b-a3b' not found` in 2 ms — that
+alias is gone from lilbuddy's catalog too (now 10 aliases, down from 14), so it
+exists on **no** host in the fleet. Repointed at `qwen3.6-35b-a3b-mtp-q4-general`,
+which lilbuddy does carry.
+
+This is worth remembering because of how quietly it fails. A missing alias 400s
+*instantly*, `LLMChainClient` buckets it as `client_error` like any other
+failover, and `/health` cheerfully lists three configured endpoints — so the
+chain looked like it had a cross-host last resort when it had none. It would
+only have surfaced during a full lilripper outage, i.e. exactly when it mattered.
+Same bug class as the 08-13 catalog rebuild below; the lesson is that
+**lilbuddy's catalog churns too**, and its hop needs the same re-verification the
+lilripper ones get. Not fixed by the reorder — found by it.
+
+Also corrected: the note that the vision chain stays separate because the main
+chain's third hop "might not support images". That was a hedge, and the real
+reason is different — the third hop is chosen for *availability*, and separate
+chains are what stop a future "add a fallback so voice survives a lilripper
+outage" edit from widening where an image turn can land. It is a guard against a
+future edit, not a claim about today's catalog. Today the q4 MTP alias on
+lilbuddy *does* take images, which means **cross-host vision failover is
+currently available** — still the open item from 2026-08-13.
+
+**Catalogs re-curled the same day** (they churn; CLAUDE.md's list was 08-13):
+`:8020` gained `qwen3.8-27b` + `qwen3.8-27b-non-thinking` (5 aliases);
+`:8010` gained the same pair and lost `qwen3.6-27b-mtp-{code,general}`
+(9 aliases). Notably **every alias on both ports now reports `text,image`**, so
+"that fallback is text-only" is no longer a safe assumption on lilripper in
+either direction — read `architecture.input_modalities`. The vision chain is
+still kept separate from the main chain, but the reason has narrowed to the
+main chain's *third* hop (`lilbuddy:8010`), whose image support is not
+guaranteed across rebuilds.
+
+448 tests pass unchanged; no test pinned the chain order.
+
 ## Email and paper search cost 10-73 s per call (2026-08-14) — none of it was Octavius
 
 Dave asked why email search felt slow and whether the folder defaults needed tuning.

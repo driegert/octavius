@@ -467,42 +467,64 @@ def _llm_api_keys() -> dict[str, str]:
 
 
 def load_settings() -> Settings:
-    # lilripper:8020 is a llama.cpp *router* now, not a single-model server, so
-    # the model id is load-bearing: it selects which model the router serves.
-    # The bare "qwen3.6-35b-a3b" alias is gone there — every router alias carries
-    # a variant suffix. No auth on :8020 (OCTAVIUS_LLM_API_KEYS keys :8010 only).
+    # Both lilripper ports are llama.cpp *routers*, so the model id is
+    # load-bearing: it selects which model the router serves, loading it (and
+    # evicting the incumbent) on demand. The bare "qwen3.6-35b-a3b" alias exists
+    # on NEITHER lilripper port — every alias there carries a variant suffix.
     #
-    # Chain shape as of 2026-08-08:
-    #  1. :8020 — primary. Shared with pi-agent, which pulls the 27B; contention
-    #     there produced a live `500 model ... failed to load` on this alias, so
-    #     a working second hop on lilripper matters more than it used to.
-    #  2. :8010 — second hop. The rule is that every :8010 consumer (this hop,
-    #     the subagent primary, the vision fallback, the reader) names ONE alias,
-    #     so interleaving a consult with a document read can't thrash the router
-    #     between resident models. That alias used to be the q4 MTP variant;
-    #     lilripper was reconfigured on 2026-08-13 and `qwen3.6-35b-a3b-mtp-q4-*`
-    #     no longer exists on either port, so it is now `mtp-general` — which is
-    #     also what :8020 serves, meaning both ports share one alias and there is
-    #     nothing left to thrash. Re-verify with /v1/models before changing.
-    #  3. lilbuddy:8010 — plain single-model server (model id ignored).
-    #     Reachable again as of 2026-08-12 (the 08-08 outage was a tailscale
-    #     fault); costs only the connect timeout when it is down.
+    # Chain shape as of 2026-08-18 (:8010 promoted to primary, was :8020):
+    #  1. :8010 — primary. Served with --parallel 3, and it is already where the
+    #     subagent primary, the vision chain, and the reader live, all naming
+    #     THIS SAME alias. So a normal turn, a consult, and a document read now
+    #     share one resident model on one endpoint: no swap, no eviction, and
+    #     three slots to share. Behind auth — see KEYED_8010_ORIGIN below; a
+    #     missing key 401s the PRIMARY now, so check /health's
+    #     `endpoints_rejecting_credentials` first if the chain looks flaky.
+    #  2. :8020 — second hop, HTTP-level failover only. Deliberately demoted on
+    #     2026-08-18: Dave runs other models there by hand (qwen3.8-27b was
+    #     resident at the time of the swap), and with :8020 as primary every
+    #     Octavius turn evicted whatever he had loaded. As a fallback it only
+    #     pulls the 35B when :8010 is actually broken. It also has --parallel 3
+    #     and is shared with pi-agent, whose 27B contention has produced a live
+    #     `500 model ... failed to load` on this alias.
+    #  3. lilbuddy:8010 — cross-host last resort, and the only entry that keeps
+    #     this chain alive if lilripper is down. A router too, despite older
+    #     notes calling it a single-model server. Reachable again as of
+    #     2026-08-12 (the 08-08 outage was a tailscale fault); costs only the
+    #     connect timeout when it is down.
+    #     Alias was the bare `qwen3.6-35b-a3b` until 2026-08-18, when a real
+    #     completion returned `400 model 'qwen3.6-35b-a3b' not found` — that
+    #     alias is gone from lilbuddy's catalog too, so this hop had been
+    #     silently dead. Now the q4 MTP variant, which is the same model family
+    #     and is what lilbuddy actually carries. VERIFY THIS ONE against
+    #     /v1/models after any lilbuddy rebuild: a wrong alias here hard-400s
+    #     instantly and looks like an ordinary failover, so the chain reports
+    #     "tried three endpoints" while only two could ever have worked.
     # triplestuffed:8010 was REMOVED: its GPUs serve Positron autocomplete/NES
     # models, and it currently accepts connections without ever generating, so a
     # failover into it burned the full 120 s read timeout. See docs/status.md.
     llm_chain = _env_json(
         "OCTAVIUS_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
             {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general"},
         ],
     )
     # Subagents (inline consult_specialist + backgrounded delegations) run on
-    # lilripper:8010, which is served with --parallel 3, so they no longer queue
-    # behind the main agent's own turn on :8020. `capacity` matches that
+    # lilripper:8010, served with --parallel 3. `capacity` matches that
     # --parallel, letting SubagentDispatcher run three consults at once instead
     # of serialising them. :8020 stays as the HTTP-level fallback.
+    #
+    # As of 2026-08-18 the MAIN chain's primary is this same endpoint and alias,
+    # so consults no longer sit on a separate endpoint from the turn that spawned
+    # them. That is fine and was the point of the swap: consult_specialist is
+    # INLINE, so the main agent is blocked awaiting it and the two are not
+    # competing for slots at the same instant; sharing the endpoint means the
+    # 35B stays resident across turn -> consult -> turn with no model swap. The
+    # thing to watch is total concurrency on :8010, which is now main turns +
+    # consults + reader against three slots — re-measure if several sessions run
+    # at once, not from first principles.
     #
     # capacity: 3 VERIFIED 2026-08-13 against the live server, not assumed:
     # /v1/models returns each model's full launch argv under status.args, so
@@ -533,20 +555,23 @@ def load_settings() -> Settings:
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS
-    # frames from the Matrix sidecar). Still separate from llm_chain even though
-    # its primary is now the same endpoint: llm_chain's fallbacks are not all
-    # image-capable, so an image turn must never be allowed to fail over onto
-    # them. Both entries here accept image input (confirmed via each model's
-    # architecture.input_modalities in /v1/models).
-    # NOTE lilbuddy:8010 is no longer the text-only single-model server this
-    # rationale was written against — it is a router now, and several of its
-    # aliases take images. See docs/status.md; cross-host vision failover is
-    # newly possible.
+    # frames from the Matrix sidecar). Identical to llm_chain's first two hops
+    # since 2026-08-18 (both reordered :8010-first together, for the same
+    # keep-:8020-free reason), and kept as a separate chain anyway: llm_chain
+    # has a THIRD hop, on another host, chosen for AVAILABILITY rather than for
+    # modality. Keeping the chains separate is what stops a future "add another
+    # fallback so voice survives a lilripper outage" edit to llm_chain from
+    # silently widening where an image turn can land. It is a guard against a
+    # future edit, not a claim about today's catalog: as of 2026-08-18 every
+    # alias on both lilripper ports AND lilbuddy's q4 MTP aliases all report
+    # text,image, so a cross-host vision hop is now actually possible (see
+    # docs/status.md). Read architecture.input_modalities before adding one —
+    # lilbuddy does still carry text-only aliases (DEFAULT, nemotron-nano-30b).
     vision_llm_chain = _env_json(
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
             {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
         ],
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
@@ -595,10 +620,16 @@ def load_settings() -> Settings:
         # silently — a failed summary is invisible to the user, it just leaves
         # history unsummarised and untagged. Moved onto lilripper.
         # SummaryClient sends ONE model to both URLs, so the alias must exist on
-        # both ports: qwen3.6-35b-a3b-mtp-general does, and it is already the
-        # resident alias on :8020, so the primary costs no model swap.
-        summary_url=_env_str("OCTAVIUS_SUMMARY_URL", "http://lilripper:8020/v1/chat/completions"),
-        summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8010/v1/chat/completions"),
+        # both ports: qwen3.6-35b-a3b-mtp-general does.
+        # Reordered :8010-first on 2026-08-18 with the main and vision chains.
+        # This one matters more than its traffic suggests: summaries fire at
+        # conversation END, long after Dave has moved on, so with :8020 primary
+        # a background summary could silently evict a model he had loaded there
+        # by hand. On :8010 it lands on the already-resident alias — no swap.
+        # SummaryClient is NOT an LLMChainClient but it does send auth_headers,
+        # so the now-primary authed endpoint is fine.
+        summary_url=_env_str("OCTAVIUS_SUMMARY_URL", "http://lilripper:8010/v1/chat/completions"),
+        summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8020/v1/chat/completions"),
         summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
         # lilbuddy is primary as of 2026-08-12. It was demoted on 2026-08-10 for
