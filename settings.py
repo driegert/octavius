@@ -495,11 +495,26 @@ def load_settings() -> Settings:
     #     Alias was the bare `qwen3.6-35b-a3b` until 2026-08-18, when a real
     #     completion returned `400 model 'qwen3.6-35b-a3b' not found` — that
     #     alias is gone from lilbuddy's catalog too, so this hop had been
-    #     silently dead. Now the q4 MTP variant, which is the same model family
-    #     and is what lilbuddy actually carries. VERIFY THIS ONE against
-    #     /v1/models after any lilbuddy rebuild: a wrong alias here hard-400s
-    #     instantly and looks like an ordinary failover, so the chain reports
-    #     "tried three endpoints" while only two could ever have worked.
+    #     silently dead. VERIFY THIS HOP against /v1/models after any lilbuddy
+    #     rebuild: a wrong alias hard-400s instantly and looks like an ordinary
+    #     failover, so the chain reports "tried three endpoints" while only two
+    #     could ever have worked.
+    #     Now `gemma4-26b-a4b` (Dave's pick, 2026-08-18), measured on lilbuddy:
+    #     cold load 16 s, then 0.5-0.9 s for short replies; tool calls come back
+    #     in correct OpenAI shape (finish_reason=tool_calls) in ~0.9 s; takes
+    #     image input. It briefly held `qwen3.6-35b-a3b-mtp-q4-general` instead,
+    #     which is NOT a good idea: asking lilbuddy to load that 35B took the
+    #     whole router down (25 s of nothing, then 502 on every alias) until it
+    #     restarted. A4B is a much better fit for a 128 GB unified-memory box.
+    #     GOTCHA: gemma4 is a THINKING model that returns its reasoning in a
+    #     separate `reasoning_content` field, not inline <think> tags — so the
+    #     <think> stripper never sees it and agent.py's delta.get("content", "")
+    #     ignores it for free. But it thinks *hard*: 714 reasoning deltas against
+    #     30 content deltas on a one-sentence question, ~6.5 s before the first
+    #     visible token. Fine for a third fallback that only runs when lilripper
+    #     is down. It does mean anything that ever sets max_tokens must budget
+    #     for reasoning tokens: at max_tokens=120 this model produced ZERO
+    #     visible content. Octavius sends no max_tokens today, so it is safe.
     # triplestuffed:8010 was REMOVED: its GPUs serve Positron autocomplete/NES
     # models, and it currently accepts connections without ever generating, so a
     # failover into it burned the full 120 s read timeout. See docs/status.md.
@@ -508,7 +523,7 @@ def load_settings() -> Settings:
         [
             {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-q4-general"},
+            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
         ],
     )
     # Subagents (inline consult_specialist + backgrounded delegations) run on

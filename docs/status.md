@@ -121,8 +121,33 @@ sequence with zero router swaps.
 dead.** `lilbuddy:8010` was configured with the bare `qwen3.6-35b-a3b`, and a
 real completion returns `400 model 'qwen3.6-35b-a3b' not found` in 2 ms — that
 alias is gone from lilbuddy's catalog too (now 10 aliases, down from 14), so it
-exists on **no** host in the fleet. Repointed at `qwen3.6-35b-a3b-mtp-q4-general`,
-which lilbuddy does carry.
+exists on **no** host in the fleet. Repointed — after one wrong turn — at
+`gemma4-26b-a4b`, Dave's pick.
+
+**The wrong turn is the useful part.** The hop first went to
+`qwen3.6-35b-a3b-mtp-q4-general`, the closest same-family alias lilbuddy
+carries. Asking lilbuddy to actually load it gave 25 s of nothing and then
+**502 on every alias and every port on the box at once** — the `:8010` router,
+the `:8020` bge-m3 embedding server, and `:8880` Kokoro TTS all went down
+together, which is a much wider blast radius than one bad model id. Caddy stayed
+up (hence 502 rather than connection-refused), and everything came back on its
+own about two minutes later with the router holding nothing. Reading it as an
+OOM cascade on a 128 GB unified-memory box fits: an A4B was already resident and
+a dense 35B was requested on top. **So lilbuddy's third-hop alias is a capacity
+decision, not just a naming one** — the fleet-wide consequence of getting it
+wrong is that Octavius loses TTS and embeddings too, not merely a fallback.
+
+`gemma4-26b-a4b` measured after recovery: 16 s cold load, then 0.5-0.9 s for
+short replies, tool calls in correct OpenAI shape in ~0.9 s, image input
+supported. It is a thinking model that puts reasoning in a separate
+`reasoning_content` field instead of inline `<think>` tags, which costs nothing
+— `agent.py` reads `delta.get("content", "")` and the reasoning simply never
+appears. It does think hard (714 reasoning deltas to 30 content deltas on a
+one-sentence question, ~6.5 s to first visible token), which is fine for a hop
+that only runs during a lilripper outage. The one latent trap: at
+`max_tokens=120` it burned the whole budget on reasoning and returned
+`finish_reason: length` with empty content. Octavius sets `max_tokens` nowhere
+today, so nothing is broken — but anything that starts to must budget for it.
 
 This is worth remembering because of how quietly it fails. A missing alias 400s
 *instantly*, `LLMChainClient` buckets it as `client_error` like any other
