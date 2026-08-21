@@ -54,7 +54,7 @@ carries full runbooks — read the task before starting):
   already the main chain's 3rd hop on that host so no extra model swap). Ready to build.
   Today one lilripper outage means no image turns at all. Probe with a real image first —
   `input_modalities` is not proof a model generates.
-- **Task #6 — `OCTAVIUS_8010_API_KEY`. Needs Dave, nobody else can do it.** His shell
+- **Task #6 — `OCTAVIUS_LR_API_KEY` (renamed from `OCTAVIUS_8010_API_KEY` 2026-08-21). Needs Dave, nobody else can do it.** His shell
   exports a *different* token than `~/.config/octavius/env` holds. Both authenticate
   today, so nothing is broken; the risk is a silent 401 when one is revoked.
 - **`end_async` detach** — see item 2 above.
@@ -73,6 +73,63 @@ degrades quietly. (b) Read the *whole* `/v1/models` payload, not just `data[].id
 carries each model's launch argv (`--parallel`, `--ctx-size`), load state, and
 `input_modalities`. Recipe is in CLAUDE.md's Runbook. Assuming it didn't cost a wrong
 answer on 2026-08-13.
+
+## lilbuddy's whole-box outage root-caused: `max_models=3` (2026-08-21)
+
+Closes the open item from the 2026-08-18 section below.
+
+**Symptom (2026-08-18).** Repointing the main chain's third hop at
+`qwen3.6-35b-a3b-mtp-q4-general` and asking lilbuddy to load it gave 25 s of
+nothing, then **502 on every port on the box at once** — `:8010` (llama.cpp
+router), `:8020` (bge-m3 embeddings), `:8880` (Kokoro TTS). Caddy stayed up, so
+it read as 502 rather than connection-refused. Everything recovered on its own
+~2 min later with the router holding no model.
+
+**Root cause (Dave, 2026-08-21).** The router was configured `max_models=3` with
+over-generous per-model `--ctx-size`, so it kept up to three models resident
+simultaneously. The dense 35B landing on top of two incumbents exhausted the
+128 GB of unified memory; the OOM killer took the neighbouring services with it,
+which is why three unrelated processes died together. **Now `max_models=2`.**
+
+**The Octavius-side lesson is bigger than the third hop.** `:8020` and `:8880`
+are separate processes from the router, but both are on the **live** turn path:
+
+| lilbuddy port | Octavius role | fallback if it dies |
+|---|---|---|
+| `:8010` | main LLM chain, **third** hop | n/a — it *is* the last resort |
+| `:8020` | embedding chain **primary** | `workhorse:11434` (breaker demotes after 2 failures) |
+| `:8880` | Kokoro TTS — **the live default** | **none** |
+
+So memory pressure created by a rarely-used *LLM fallback* silently breaks every
+turn's audio. That last row is the residual risk: `TTSSettings.voxtral_enabled`
+is `False`, so `service_clients.py:931` disables the Voxtral primary and every
+synth call goes to the Kokoro fallback on lilbuddy. **TTS is single-homed with no
+cross-host failover.** Not changing it here — Voxtral was disabled for output-level
+reasons, not availability ones — but it is the one dependency the embedding chain's
+breaker pattern has no analogue for.
+
+Rule going forward: size a lilbuddy hop against the *box's* residency budget, not
+against the model in isolation.
+
+**Verified after the fix (2026-08-21), all three ports:**
+
+| probe | result |
+|---|---|
+| `:8010` `/v1/models` | 200, 10 aliases, all `unloaded` |
+| `:8020` embeddings | 200 in 0.014 s |
+| `:8880` Kokoro | 200 in 1.40 s, 67 KB wav |
+| `gemma4-26b-a4b` cold load + reply | **9.6 s** (was 16 s on 08-18) |
+| warm short reply | **0.44 s** |
+| warm tool call | **1.02 s**, `finish_reason: tool_calls`, correct shape |
+
+`/health`: `alive`/`ready` true, `degraded` false, MCP 8/8, both embedding
+endpoints untripped with zero consecutive failures, no `last_error_kind` on any
+LLM hop. The cold-load improvement (16 s → 9.6 s) is presumably the trimmed
+context budgets.
+
+Deliberately **not** re-run: loading a dense 35B on lilbuddy. That is the only
+test that would actually prove the cascade is gone, and it risks a second outage
+of the live TTS/embedding path, so it needs Dave's go-ahead.
 
 ## `:8010` promoted to primary on every lilripper chain (2026-08-18)
 
@@ -344,9 +401,10 @@ went unsummarised and unindexed between Aug 8 and Aug 11**.
 
 TTS came back with lilbuddy on 2026-08-12.
 
-Still outstanding: **`OCTAVIUS_8010_API_KEY` is not set in `~/.config/octavius/env`.**
+Still outstanding: **`OCTAVIUS_LR_API_KEY` (renamed from `OCTAVIUS_8010_API_KEY`
+2026-08-21) is not set in `~/.config/octavius/env`.**
 Runbook to adopt it, and the drift to resolve first, are under "Adopt
-`OCTAVIUS_8010_API_KEY`" in Near-Term Work.
+`OCTAVIUS_LR_API_KEY`" in Near-Term Work.
 
 ## Embeddings off the turn path (2026-08-11)
 
@@ -582,13 +640,27 @@ These behaviors were fixed recently and should not regress:
 
 - The main-agent web search moved from the varlabz `searxng-mcp` (`search` tool,
   SearXNG-only, no fallback) to mcp-tools' `server_serper.py`, registered as the
-  `web-search` MCP server exposing `web_search` (SearXNG-first → Serper.dev
-  fallback; page reading stays on Crawl4AI via `web-reader`). The agent scopes it
-  by the `web-search` server key in `agent.py`. See CLAUDE.md "Configured MCP
-  servers".
-- The Serper fallback needs `SERPER_API_KEY` in `mcp-tools/.env`; without it,
-  `web_search` degrades to SearXNG-only. The stdio subprocess reads `.env` at
-  spawn, so a service restart is required to pick up a newly-added key.
+  `web-search` MCP server exposing `web_search` (page reading stays on Crawl4AI
+  via `web-reader`). The agent scopes it by the `web-search` server key in
+  `agent.py`. See CLAUDE.md "Configured MCP servers".
+- **Provider order inverted 2026-08-20 — Serper.dev (Google) is now primary and
+  SearXNG is the backstop.** It answers only when Serper *errors*; an empty
+  Serper result is a valid answer to an obscure query and is not retried. The
+  old order was silently serving junk: SearXNG's `bing` engine had started
+  returning topic-unrelated pages while reporting HTTP 200 with
+  `unresponsive_engines: []` (AutoZone for "Slepian sequences prolate"), and
+  because results interleave bing/ddg, roughly two hits in three were unrelated
+  while the fallback never fired — its trigger was "SearXNG returned nothing".
+  The backstop is now pinned to `engines=duckduckgo,wikipedia` (`SEARX_ENGINES`)
+  so the degraded path has no scraper to babysit. A degraded answer is
+  self-identifying: `provider: "searxng"` plus a `fallback_reason` field.
+- `SERPER_API_KEY` in `mcp-tools/.env` is now load-bearing rather than a
+  nice-to-have: without it the primary arm is inert and every search runs on the
+  degraded backstop. The stdio subprocess reads `.env` at spawn, so a service
+  restart is required to pick up a newly-added key.
+- The same inversion lives in `pi_harness/extensions/web-search/src/index.ts`
+  (pi's native tool). The two are deliberate mirrors — change one, change the
+  other.
 - **Cert gotcha (should not regress):** SearXNG is fronted by Caddy's internal CA,
   which Python's bundled certifi does not trust. The SearXNG client must point at
   the system CA bundle (`/etc/ssl/certs/ca-certificates.crt`), NOT
@@ -610,7 +682,7 @@ Operational assumptions worth keeping in mind during debugging:
 - the browser UIs are less script-heavy than before, but layout and markup are still concentrated in large static HTML files
 - Silero VAD requires `models/silero_vad.onnx` to be present; if the file is missing, VAD is skipped and auto-stop will not work
 - STT failover (lilripper primary, lilbuddy fallback) is not yet implemented — switching requires a settings change
-- **`lilripper:8010` is behind auth (2026-07-13).** It 401s without a bearer token. The key lives in `~/.config/octavius/env` and reaches the service through the `EnvironmentFile` drop-in. As of 2026-08-08 the preferred variable is **`OCTAVIUS_8010_API_KEY`** (a bare token, no JSON quoting to get wrong) which takes precedence over the older `OCTAVIUS_LLM_API_KEYS` JSON map; the token rotates but the variable name does not. It is bound to `lilripper:8010` specifically (`settings.KEYED_8010_ORIGIN`) — `lilbuddy:8010` and `triplestuffed:8010` share the port, are open, and must stay unkeyed. `service_clients.auth_headers()` attaches it by URL on every `LLMChainClient` request path. Three consumers depend on it: the reader LLM, the vision chain, and — since 2026-07-30 — the subagent **primary** tier, so a bad key breaks every `consult_specialist` on its first hop rather than only on failover. Two failure modes to keep apart when debugging: a **missing/wrong key** is a 401 → `HTTPStatusError` → burns a failover hop, while **empty content with no failover** is usually Qwen think-mode eating a small `max_tokens`, not auth. Nothing loads a `.env` file, so a key placed there is silently ignored.
+- **`lilripper:8010` is behind auth (2026-07-13).** It 401s without a bearer token. The key lives in `~/.config/octavius/env` and reaches the service through the `EnvironmentFile` drop-in. As of 2026-08-08 the preferred variable is a dedicated bare token (no JSON quoting to get wrong), now **`OCTAVIUS_LR_API_KEY`** (renamed from `OCTAVIUS_8010_API_KEY` 2026-08-21) which takes precedence over the older `OCTAVIUS_LLM_API_KEYS` JSON map; the token rotates but the variable name does not. It is bound to `lilripper:8010` specifically (`settings.KEYED_8010_ORIGIN`) — `lilbuddy:8010` and `triplestuffed:8010` share the port, are open, and must stay unkeyed. `service_clients.auth_headers()` attaches it by URL on every `LLMChainClient` request path. Three consumers depend on it: the reader LLM, the vision chain, and — since 2026-07-30 — the subagent **primary** tier, so a bad key breaks every `consult_specialist` on its first hop rather than only on failover. Two failure modes to keep apart when debugging: a **missing/wrong key** is a 401 → `HTTPStatusError` → burns a failover hop, while **empty content with no failover** is usually Qwen think-mode eating a small `max_tokens`, not auth. Nothing loads a `.env` file, so a key placed there is silently ignored.
 
   **Since 2026-08-08 a 401 identifies itself.** `/health`'s `llm_chain` now carries `endpoints_rejecting_credentials` (URLs whose most recent attempt was 401/403), `auth_failures`, `last_failure_kind`, and per-endpoint `last_error_kind` / `last_error_status` / `authenticated`; a 401 also logs at ERROR naming the origin and the env var to check. Triage order when a chain looks flaky: `endpoints_rejecting_credentials` non-empty → key problem; `last_error_kind` of `connect`/`connect_timeout` → host down (no TCP handshake); `timeout` → host accepted the connection but never generated (zombie); `last_error_kind == "client_error"` with 400/404 → the model alias isn't in that endpoint's catalog. `last_error_*` clears on the endpoint's next success, so it reflects current belief, not history.
 - **Memory push was silently dead 2026-07-02 → 2026-07-13 (fixed; should not regress).** When the memory service was extracted to the `agent-memory` repo, `history.py`'s push path kept doing `import memory` for three watermark helpers, so every conversation end logged "Memory client unavailable; skipping push" and skipped the push. The helpers (`get_memory_watermark` / `set_memory_watermark` / `messages_after_watermark`) now live in `history_store.py` — they only touch Octavius's own tables (`conversations.last_extracted_message_id` + `messages`), so Octavius no longer imports anything from agent-memory except over HTTP via `memory_client.py`. Conversations that *ended* during the gap were never mined for facts (push happens at conversation end; watermarks stayed put but closed conversations don't re-push) — a backfill would need a one-off script.
@@ -643,7 +715,7 @@ Likely refactor targets, in rough priority order:
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
 4. Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input. **(b) was unblocked on 2026-08-13**: `lilbuddy:8010` now serves `qwen3-vl-30b-a3b`. Verify it actually generates on an image payload before wiring it in — `/v1/models` is not proof. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
-5. **Adopt `OCTAVIUS_8010_API_KEY` (Dave to action; 2026-08-12).** The service authenticates to `lilripper:8010` through the older `OCTAVIUS_LLM_API_KEYS` JSON map. That works, so this is hygiene, not an outage — the point is that the bare var is the one that rotates, has no JSON quoting to get wrong, and has a name that survives rotations.
+5. **Adopt `OCTAVIUS_LR_API_KEY` (Dave to action; 2026-08-12; var renamed from `OCTAVIUS_8010_API_KEY` 2026-08-21).** The service authenticates to `lilripper:8010` through the older `OCTAVIUS_LLM_API_KEYS` JSON map. That works, so this is hygiene, not an outage — the point is that the bare var is the one that rotates, has no JSON quoting to get wrong, and has a name that survives rotations.
 
    **Resolve the drift first.** Dave's interactive shell exports an `OCTAVIUS_8010_API_KEY` whose value **differs** from the token in `~/.config/octavius/env` (fingerprints `32173c2e…` vs `94745832…`). Probed 2026-08-12: `/v1/models` returns **401 unauthenticated and 200 for *both* tokens** — lilripper:8010 accepts them both, so nothing is broken today, but two live keys for one endpoint is exactly the drift shape that turns into a silent 401 the moment one is revoked. Decide which token is canonical before copying anything. The shell export is not in any dotfile (`.bashrc`/`.profile`/`environment.d`/systemd user env are all clean), so it came from an ad-hoc `export` and will vanish with that terminal.
 
@@ -651,7 +723,7 @@ Likely refactor targets, in rough priority order:
 
    ```bash
    # 1. add the chosen token (single line, no quotes needed — it is not JSON)
-   printf 'OCTAVIUS_8010_API_KEY=%s\n' "$TOKEN" >> ~/.config/octavius/env
+   printf 'OCTAVIUS_LR_API_KEY=%s\n' "$TOKEN" >> ~/.config/octavius/env
    chmod 600 ~/.config/octavius/env
 
    # 2. the unit reads this file via EnvironmentFile; no daemon-reload needed
@@ -659,7 +731,7 @@ Likely refactor targets, in rough priority order:
    systemctl --user restart octavius
 
    # 3. verify: the var must actually reach the process
-   systemctl --user show octavius -p Environment | tr ' ' '\n' | grep -c OCTAVIUS_8010_API_KEY
+   systemctl --user show octavius -p Environment | tr ' ' '\n' | grep -c OCTAVIUS_LR_API_KEY
 
    # 4. verify auth is live — after a turn that hits :8010 (a consult, a reader
    #    doc, or an image), this must stay empty and auth_failures must stay 0

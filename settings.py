@@ -217,16 +217,22 @@ DEFAULT_MCP_SERVERS = {
     },
     "web-search": {
         "transport": "stdio",
-        # mcp-tools' server_serper.py exposes a single `web_search` tool that
-        # tries self-hosted SearXNG first (free/private) and falls back to the
-        # Serper.dev Google API when SearXNG is unreachable, rate-limited, or
-        # returns nothing. It reads SERPER_API_KEY from mcp-tools/.env
-        # (load_dotenv) and trusts the system CA bundle for SearXNG's Caddy
-        # cert on its own (honors SSL_CERT_FILE, else /etc/ssl/certs/
-        # ca-certificates.crt), so no env is needed here. SEARX_HOST defaults
-        # to https://searxng.riegert.xyz. Reading pages stays on web-reader
-        # (Crawl4AI). Replaced the old varlabz searxng-mcp (`search` tool,
-        # SearXNG-only, no fallback).
+        # mcp-tools' server_serper.py exposes a single `web_search` tool.
+        # Serper.dev (Google) is the PRIMARY arm; self-hosted SearXNG is a
+        # backstop that answers only when Serper *errors* (an empty Serper
+        # result is a valid answer to an obscure query, not a failure). Order
+        # was inverted 2026-08-20: SearXNG's bing engine had been returning
+        # topic-unrelated pages while reporting HTTP 200 success, so a large
+        # share of every result set was junk and the old "SearXNG returned
+        # nothing" fallback trigger never fired. The backstop is pinned to
+        # engines=duckduckgo,wikipedia (SEARX_ENGINES) so nothing needs
+        # babysitting. **No SERPER_API_KEY means the degraded arm only.**
+        # It reads SERPER_API_KEY from mcp-tools/.env (load_dotenv) and trusts
+        # the system CA bundle for SearXNG's Caddy cert on its own (honors
+        # SSL_CERT_FILE, else /etc/ssl/certs/ca-certificates.crt), so no env is
+        # needed here. SEARX_HOST defaults to https://searxng.riegert.xyz.
+        # Reading pages stays on web-reader (Crawl4AI). Replaced the old
+        # varlabz searxng-mcp (`search` tool, SearXNG-only, no fallback).
         "command": "/home/dave/git_repos/mcp-tools/.venv/bin/python",
         "args": [
             "/home/dave/git_repos/mcp-tools/server_serper.py",
@@ -355,7 +361,7 @@ fuss and the occasional understated wit. Think Jarvis, but self-hosted. You know
 your name is Octavius and you're not shy about it.
 
 You have access to tools:
-- Web search via SearXNG for GENERAL web lookups ONLY — news, recipes,
+- Web search (Google) for GENERAL web lookups ONLY — news, recipes,
   product info, how-to, definitions, current events. NEVER use web search
   for academic papers, journal articles, citations, authors, or scholarly
   research; those ALWAYS go through consult_specialist(domain="research").
@@ -433,8 +439,8 @@ DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
 
 
 # Origin whose bearer token may be supplied by the dedicated
-# OCTAVIUS_8010_API_KEY env var. The var is named for the port, but it is bound
-# to lilripper specifically on purpose: `lilbuddy:8010` (main-chain fallback,
+# OCTAVIUS_LR_API_KEY env var ("LR" = lilripper). It is bound to lilripper
+# specifically on purpose: `lilbuddy:8010` (main-chain fallback,
 # summary primary) and `triplestuffed:8010` (main-chain fallback, summary
 # fallback) also listen on 8010 and are OPEN — they must never receive this
 # header. Only lilripper:8010 is behind auth.
@@ -449,7 +455,7 @@ def _llm_api_keys() -> dict[str, str]:
     1. ``OCTAVIUS_LLM_API_KEYS`` — a JSON object of endpoint URL -> token,
        normalized to origins. Still the general mechanism; use it if another
        endpoint ever goes behind auth.
-    2. ``OCTAVIUS_8010_API_KEY`` — a bare token for ``KEYED_8010_ORIGIN``.
+    2. ``OCTAVIUS_LR_API_KEY`` — a bare token for ``KEYED_8010_ORIGIN``.
        This is the one that rotates, so it wins on conflict. A dedicated var
        exists because rotating a value nested inside single-quoted JSON in a
        systemd EnvironmentFile is easy to get subtly wrong (and a mangled key
@@ -460,7 +466,7 @@ def _llm_api_keys() -> dict[str, str]:
     if not isinstance(raw, dict):
         raise ValueError("OCTAVIUS_LLM_API_KEYS must be a JSON object of origin -> key")
     keys = {endpoint_origin(url): key for url, key in raw.items() if key}
-    direct = _env_str("OCTAVIUS_8010_API_KEY", "").strip()
+    direct = _env_str("OCTAVIUS_LR_API_KEY", "").strip()
     if direct:
         keys[KEYED_8010_ORIGIN] = direct
     return keys
@@ -499,13 +505,21 @@ def load_settings() -> Settings:
     #     rebuild: a wrong alias hard-400s instantly and looks like an ordinary
     #     failover, so the chain reports "tried three endpoints" while only two
     #     could ever have worked.
-    #     Now `gemma4-26b-a4b` (Dave's pick, 2026-08-18), measured on lilbuddy:
-    #     cold load 16 s, then 0.5-0.9 s for short replies; tool calls come back
-    #     in correct OpenAI shape (finish_reason=tool_calls) in ~0.9 s; takes
-    #     image input. It briefly held `qwen3.6-35b-a3b-mtp-q4-general` instead,
-    #     which is NOT a good idea: asking lilbuddy to load that 35B took the
-    #     whole router down (25 s of nothing, then 502 on every alias) until it
-    #     restarted. A4B is a much better fit for a 128 GB unified-memory box.
+    #     Now `gemma4-26b-a4b` (Dave's pick, 2026-08-18), re-measured on
+    #     lilbuddy 2026-08-21: cold load 9.6 s, warm short reply 0.44 s, warm
+    #     tool call 1.02 s in correct OpenAI shape (finish_reason=tool_calls);
+    #     takes image input.
+    #     SIZING: this hop briefly held `qwen3.6-35b-a3b-mtp-q4-general`, and
+    #     asking lilbuddy to load that 35B took the ENTIRE BOX down for ~2 min —
+    #     :8010 (router), :8020 (bge-m3 embeddings) and :8880 (Kokoro TTS) all
+    #     502'd together. Root cause (2026-08-21): the router ran max_models=3
+    #     with over-generous --ctx-size, so a dense 35B landed on top of two
+    #     incumbents and exhausted 128 GB of unified memory; it is now
+    #     max_models=2. Note what that outage reached: :8020 and :8880 are
+    #     separate processes but BOTH are on Octavius's live path (embedding
+    #     primary, only TTS), so oversizing this rarely-used third LLM hop
+    #     breaks every turn, not just failover. Size against the box, not the
+    #     model; an A4B is the right shape here.
     #     GOTCHA: gemma4 is a THINKING model that returns its reasoning in a
     #     separate `reasoning_content` field, not inline <think> tags — so the
     #     <think> stripper never sees it and agent.py's delta.get("content", "")
