@@ -127,9 +127,27 @@ endpoints untripped with zero consecutive failures, no `last_error_kind` on any
 LLM hop. The cold-load improvement (16 s → 9.6 s) is presumably the trimmed
 context budgets.
 
-Deliberately **not** re-run: loading a dense 35B on lilbuddy. That is the only
-test that would actually prove the cascade is gone, and it risks a second outage
-of the live TTS/embedding path, so it needs Dave's go-ahead.
+**Cascade confirmed fixed (2026-08-21, with Dave's go-ahead).** Re-ran the exact
+request that caused the outage, in the genuine worst case: `gemma4-26b-a4b` left
+**resident** and a dense `qwen3.6-35b-a3b-mtp-q4-general` requested on top of it,
+while polling all three ports every 2 s.
+
+| | before (`max_models=3`) | after (`max_models=2`) |
+|---|---|---|
+| 35B load request | 25 s, then 502 | **200 in 12.0 s** |
+| `:8020` embeddings during load | 502 | **200 throughout** |
+| `:8880` Kokoro during load | 502 | **200 throughout** |
+| recovery | ~2 min, self-restart | n/a |
+
+Both models ended up co-resident (2 = the cap) with no eviction and no memory
+event. Warm latency under co-residency: `gemma4-26b-a4b` **0.59-0.79 s**, the 35B
+**6.0 s**. Octavius `/health` stayed `alive`/`ready`/not-degraded with both
+embedding endpoints untripped.
+
+So the box *can* now hold a 35B alongside the A4B. The sizing rule above still
+stands as the reason not to make one the configured fallback — the 35B's 6 s warm
+reply is ten times gemma's, on a hop whose whole job is to answer when lilripper
+is down — but the failure mode itself is gone, not merely avoided.
 
 ## `:8010` promoted to primary on every lilripper chain (2026-08-18)
 

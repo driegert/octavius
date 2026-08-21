@@ -519,7 +519,10 @@ def load_settings() -> Settings:
     #     separate processes but BOTH are on Octavius's live path (embedding
     #     primary, only TTS), so oversizing this rarely-used third LLM hop
     #     breaks every turn, not just failover. Size against the box, not the
-    #     model; an A4B is the right shape here.
+    #     model; an A4B is the right shape here. Re-tested 2026-08-21 after the
+    #     fix: that same 35B request now returns 200 in 12 s with gemma still
+    #     resident and :8020/:8880 unaffected, so the cascade is fixed — but
+    #     co-resident it answers in ~6 s vs gemma's ~0.6 s, so gemma stays.
     #     GOTCHA: gemma4 is a THINKING model that returns its reasoning in a
     #     separate `reasoning_content` field, not inline <think> tags — so the
     #     <think> stripper never sees it and agent.py's delta.get("content", "")
