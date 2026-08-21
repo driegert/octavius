@@ -713,13 +713,13 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
         # Clear the real auth vars for every test in this class. `_llm_api_keys`
         # reads os.environ directly, so a developer who has exported either var
         # in their shell would otherwise see ambient credentials leak in — and
-        # because OCTAVIUS_8010_API_KEY deliberately *wins* over the JSON map,
+        # because OCTAVIUS_LR_API_KEY deliberately *wins* over the JSON map,
         # the leak looks like a logic failure rather than a dirty environment.
         env_patcher = patch.dict(os.environ, {}, clear=False)
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
         os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
-        os.environ.pop("OCTAVIUS_8010_API_KEY", None)
+        os.environ.pop("OCTAVIUS_LR_API_KEY", None)
 
     def test_env_keys_are_normalized_to_origin(self):
         env = {"OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-abc"}}'}
@@ -729,11 +729,11 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
     def test_no_keys_configured_by_default(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
-            os.environ.pop("OCTAVIUS_8010_API_KEY", None)
+            os.environ.pop("OCTAVIUS_LR_API_KEY", None)
             self.assertEqual(_llm_api_keys(), {})
 
     def test_dedicated_8010_var_supplies_the_key(self):
-        with patch.dict(os.environ, {"OCTAVIUS_8010_API_KEY": "sk-direct"}):
+        with patch.dict(os.environ, {"OCTAVIUS_LR_API_KEY": "sk-direct"}):
             os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
             self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-direct"})
 
@@ -741,7 +741,7 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
         """The dedicated var is the one that rotates, so it takes precedence."""
         env = {
             "OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-stale"}}',
-            "OCTAVIUS_8010_API_KEY": "sk-fresh",
+            "OCTAVIUS_LR_API_KEY": "sk-fresh",
         }
         with patch.dict(os.environ, env):
             self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-fresh"})
@@ -749,7 +749,7 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
     def test_dedicated_8010_var_does_not_leak_to_other_8010_hosts(self):
         """lilbuddy:8010 and triplestuffed:8010 are open; they must stay unkeyed
         even though they share the port the env var is named for."""
-        with patch.dict(os.environ, {"OCTAVIUS_8010_API_KEY": "sk-direct"}):
+        with patch.dict(os.environ, {"OCTAVIUS_LR_API_KEY": "sk-direct"}):
             os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
             keys = _llm_api_keys()
         self.assertNotIn("http://lilbuddy:8010", keys)
@@ -770,7 +770,7 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
         empty token (which would send `Bearer ` and 401)."""
         env = {
             "OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-abc"}}',
-            "OCTAVIUS_8010_API_KEY": "   ",
+            "OCTAVIUS_LR_API_KEY": "   ",
         }
         with patch.dict(os.environ, env):
             self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-abc"})

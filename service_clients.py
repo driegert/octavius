@@ -336,7 +336,7 @@ class LLMChainClient:
             log.error(
                 "LLM %s rejected our credentials (HTTP %s). This is an AUTH failure, "
                 "not an outage — check the bearer token for origin %s "
-                "(OCTAVIUS_8010_API_KEY, or OCTAVIUS_LLM_API_KEYS). Sending %s.",
+                "(OCTAVIUS_LR_API_KEY, or OCTAVIUS_LLM_API_KEYS). Sending %s.",
                 url, status, origin,
                 "a key" if settings.llm_api_keys.get(origin) else "NO key",
             )
