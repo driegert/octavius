@@ -1,6 +1,7 @@
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -32,6 +33,74 @@ def _env_float(name: str, default: float) -> float:
 def _env_json(name: str, default):
     raw = os.getenv(name)
     return json.loads(raw) if raw else default
+
+
+# Optional single-file model routing. Everything else in this module reads
+# os.environ directly and that stays true — this is the ONE file the app loads,
+# and it holds no secrets, only which endpoint serves which alias with which
+# generation params. It exists because routing lived in six separate JSON-inside-
+# a-systemd-EnvironmentFile variables, which is unpleasant to hand-edit and was
+# how a stale alias survived unnoticed on :8020 until 2026-08-26.
+#
+# Precedence, lowest to highest: code defaults < models.json < environment.
+# Env still wins so tests and one-off overrides keep working unchanged, and so
+# nothing in this file can override a secret.
+MODELS_FILE = Path(
+    os.getenv("OCTAVIUS_MODELS_FILE", "~/.config/octavius/models.json")
+).expanduser()
+
+
+def _load_models_file() -> dict:
+    """Parse MODELS_FILE, or return {} if absent.
+
+    A malformed file raises: silently falling back to defaults would restart the
+    service onto routing the operator did not ask for, which is exactly the
+    class of bug this file was added to prevent.
+    """
+    if not MODELS_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(MODELS_FILE.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{MODELS_FILE} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{MODELS_FILE} must contain a JSON object")
+    roles = data.get("roles", {})
+    if not isinstance(roles, dict):
+        raise ValueError(f"{MODELS_FILE}: 'roles' must be a JSON object")
+    return roles
+
+
+_MODEL_ROLES = _load_models_file()
+
+
+def _role_chain(role: str, env_var: str, default):
+    """Chain for `role`: env var, else models.json, else the code default."""
+    raw = os.getenv(env_var)
+    if raw:
+        return json.loads(raw)
+    entries = _MODEL_ROLES.get(role)
+    if entries is None:
+        return default
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{MODELS_FILE}: roles.{role} must be a non-empty list")
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("url"):
+            raise ValueError(f"{MODELS_FILE}: every roles.{role} entry needs a 'url'")
+    return entries
+
+
+def _role_single(role: str, key: str, env_var: str, default):
+    """One field of a single-endpoint role (reader, summary), same precedence."""
+    raw = os.getenv(env_var)
+    if raw:
+        return raw
+    entries = _MODEL_ROLES.get(role)
+    if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+        value = entries[0].get(key)
+        if value:
+            return value
+    return default
 
 
 @dataclass(frozen=True)
@@ -79,6 +148,7 @@ class Settings:
     summary_url: str
     summary_fallback_url: str
     summary_model: str
+    summary_fallback_model: str
     summary_timeout: int
     embedding_chain: list[dict]
     embedding_timeout: int
@@ -438,13 +508,21 @@ DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
 )
 
 
-# Origin whose bearer token may be supplied by the dedicated
-# OCTAVIUS_LR_API_KEY env var ("LR" = lilripper). It is bound to lilripper
-# specifically on purpose: `lilbuddy:8010` (main-chain fallback,
-# summary primary) and `triplestuffed:8010` (main-chain fallback, summary
-# fallback) also listen on 8010 and are OPEN — they must never receive this
-# header. Only lilripper:8010 is behind auth.
-KEYED_8010_ORIGIN = "http://lilripper:8010"
+# Origins whose bearer token may be supplied by the dedicated
+# OCTAVIUS_LR_API_KEY env var ("LR" = lilripper). The scope is the *host*, not
+# the port: `lilbuddy:8010` (main-chain fallback) and `triplestuffed:8010` also
+# listen on 8010 and are OPEN — they must never receive this header.
+#
+# Both lilripper router ports went behind the same token: `:8020` began
+# 401ing bare requests some time before 2026-08-26, and because the key was
+# pinned to `:8010` alone, Octavius sent `:8020` no header at all and read the
+# result as an ordinary failover. One token authenticates both ports (verified
+# 2026-08-26), so widening the scope to lilripper keeps a single rotating value
+# covering every authed hop.
+KEYED_LR_ORIGINS = (
+    "http://lilripper:8010",
+    "http://lilripper:8020",
+)
 
 
 def _llm_api_keys() -> dict[str, str]:
@@ -455,7 +533,8 @@ def _llm_api_keys() -> dict[str, str]:
     1. ``OCTAVIUS_LLM_API_KEYS`` — a JSON object of endpoint URL -> token,
        normalized to origins. Still the general mechanism; use it if another
        endpoint ever goes behind auth.
-    2. ``OCTAVIUS_LR_API_KEY`` — a bare token for ``KEYED_8010_ORIGIN``.
+    2. ``OCTAVIUS_LR_API_KEY`` — a bare token applied to every origin in
+       ``KEYED_LR_ORIGINS``.
        This is the one that rotates, so it wins on conflict. A dedicated var
        exists because rotating a value nested inside single-quoted JSON in a
        systemd EnvironmentFile is easy to get subtly wrong (and a mangled key
@@ -468,7 +547,8 @@ def _llm_api_keys() -> dict[str, str]:
     keys = {endpoint_origin(url): key for url, key in raw.items() if key}
     direct = _env_str("OCTAVIUS_LR_API_KEY", "").strip()
     if direct:
-        keys[KEYED_8010_ORIGIN] = direct
+        for origin in KEYED_LR_ORIGINS:
+            keys[origin] = direct
     return keys
 
 
@@ -483,7 +563,7 @@ def load_settings() -> Settings:
     #     subagent primary, the vision chain, and the reader live, all naming
     #     THIS SAME alias. So a normal turn, a consult, and a document read now
     #     share one resident model on one endpoint: no swap, no eviction, and
-    #     three slots to share. Behind auth — see KEYED_8010_ORIGIN below; a
+    #     three slots to share. Behind auth — see KEYED_LR_ORIGINS above; a
     #     missing key 401s the PRIMARY now, so check /health's
     #     `endpoints_rejecting_credentials` first if the chain looks flaky.
     #  2. :8020 — second hop, HTTP-level failover only. Deliberately demoted on
@@ -535,18 +615,20 @@ def load_settings() -> Settings:
     # triplestuffed:8010 was REMOVED: its GPUs serve Positron autocomplete/NES
     # models, and it currently accepts connections without ever generating, so a
     # failover into it burned the full 120 s read timeout. See docs/status.md.
-    llm_chain = _env_json(
+    llm_chain = _role_chain(
+        "main",
         "OCTAVIUS_LLM_CHAIN",
         [
             {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
         ],
     )
     # Subagents (inline consult_specialist + backgrounded delegations) run on
-    # lilripper:8010, served with --parallel 3. `capacity` matches that
-    # --parallel, letting SubagentDispatcher run three consults at once instead
-    # of serialising them. :8020 stays as the HTTP-level fallback.
+    # lilripper:8010, served with --parallel 5. `capacity` sits one below that
+    # --parallel, letting SubagentDispatcher run four consults at once instead
+    # of serialising them while leaving a slot for the main turn, reader and
+    # summaries, which share this endpoint. :8020 stays the HTTP-level fallback.
     #
     # As of 2026-08-18 the MAIN chain's primary is this same endpoint and alias,
     # so consults no longer sit on a separate endpoint from the turn that spawned
@@ -558,7 +640,7 @@ def load_settings() -> Settings:
     # consults + reader against three slots — re-measure if several sessions run
     # at once, not from first principles.
     #
-    # capacity: 3 VERIFIED 2026-08-13 against the live server, not assumed:
+    # capacity: 4 VERIFIED 2026-08-26 against the live server, not assumed:
     # /v1/models returns each model's full launch argv under status.args, so
     # `--parallel` is readable directly (see the Runbook recipe in CLAUDE.md).
     # NOTE :8020 reports --parallel 3 as well, as of 2026-08-13 — Dave raised it
@@ -576,14 +658,15 @@ def load_settings() -> Settings:
     # lilbuddy:8010), so this follows the rest of :8010 onto `mtp-general`.
     # If consult latency regresses noticeably, the q4 variant on lilbuddy:8010 is
     # the obvious thing to reach for — but it is a different HOST, so it trades
-    # the --parallel 3 capacity here for a network hop. Measure before switching.
+    # the --parallel 5 capacity here for a network hop. Measure before switching.
     # NOTE the model is resolved per ENDPOINT URL (subagent.py::_model_for_url),
     # not per domain — all three specialist domains on :8010 share this one model.
-    subagent_llm_chain = _env_json(
+    subagent_llm_chain = _role_chain(
+        "subagent",
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "primary", "capacity": 3},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "fallback"},
+            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "primary", "capacity": 4},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b", "role": "fallback"},
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS
@@ -599,11 +682,12 @@ def load_settings() -> Settings:
     # text,image, so a cross-host vision hop is now actually possible (see
     # docs/status.md). Read architecture.input_modalities before adding one —
     # lilbuddy does still carry text-only aliases (DEFAULT, nemotron-nano-30b).
-    vision_llm_chain = _env_json(
+    vision_llm_chain = _role_chain(
+        "vision",
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
             {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
         ],
     )
     voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
@@ -624,14 +708,14 @@ def load_settings() -> Settings:
     )
     reader = ReaderSettings(
         directory=_env_str("OCTAVIUS_READER_DIR", "/home/dave/octavius-reader"),
-        llm_url=_env_str("OCTAVIUS_READER_LLM_URL", "http://lilripper:8010/v1/chat/completions"),
+        llm_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_URL", "http://lilripper:8010/v1/chat/completions"),
         # qwen3.5-9b went stale on the lilripper router (still listed in /v1/models,
         # but completions hang) — every reader math chunk silently fell back to
         # dollar-stripping. Keep this pointed at a model verified LIVE on :8010.
         # Deliberately the SAME alias the subagent chain uses on :8010: reading a
         # document and running a consult otherwise thrash the router between two
         # resident models.
-        llm_model=_env_str("OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-general"),
+        llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-general"),
     )
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
@@ -660,9 +744,12 @@ def load_settings() -> Settings:
         # by hand. On :8010 it lands on the already-resident alias — no swap.
         # SummaryClient is NOT an LLMChainClient but it does send auth_headers,
         # so the now-primary authed endpoint is fine.
-        summary_url=_env_str("OCTAVIUS_SUMMARY_URL", "http://lilripper:8010/v1/chat/completions"),
+        summary_url=_role_single("summary", "url", "OCTAVIUS_SUMMARY_URL", "http://lilripper:8010/v1/chat/completions"),
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8020/v1/chat/completions"),
-        summary_model=_env_str("OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
+        summary_model=_role_single("summary", "model", "OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
+        # The two routers stopped sharing an alias on 2026-08-26; :8020 serves
+        # qwen3.8-27b now, so the fallback needs its own model or it 400s.
+        summary_fallback_model=_env_str("OCTAVIUS_SUMMARY_FALLBACK_MODEL", "qwen3.8-27b"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
         # lilbuddy is primary as of 2026-08-12. It was demoted on 2026-08-10 for
         # being unreachable (a tailscale fault, since fixed) — and because a dead

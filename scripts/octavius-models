@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Validate Octavius model routing against the live routers, then restart.
+
+    octavius-models show     what routing the app would load, and from where
+    octavius-models check    probe every endpoint: reachable? alias present? authed?
+    octavius-models apply    check, then daemon-reload + restart + confirm /health
+
+`check` exists because the two failure modes that actually bite here are both
+invisible to a config file read on its own: a model alias that has vanished from
+a router's catalog (hard-400 on use, read as an ordinary failover), and a bearer
+token that has rotated out from under the config (401, likewise). Both were live
+on 2026-08-26 — every voice turn was silently running on the third fallback hop.
+
+Exit status is nonzero if any endpoint fails, so this is safe to gate a restart.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+import settings as settings_mod  # noqa: E402
+
+HEALTH_URL = os.getenv("OCTAVIUS_HEALTH_URL", "http://127.0.0.1:8030/health")
+UNIT = os.getenv("OCTAVIUS_UNIT", "octavius")
+
+GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+if not sys.stdout.isatty():
+    GREEN = RED = YELLOW = DIM = RESET = ""
+
+
+def origin(url: str) -> str:
+    p = urlsplit(url)
+    return f"{p.scheme}://{p.netloc}"
+
+
+def roles(st) -> dict[str, list[dict]]:
+    """Every routing decision the app made, flattened to {role: [entries]}."""
+    return {
+        "main": list(st.llm_chain),
+        "subagent": list(st.subagent_llm_chain),
+        "vision": list(st.vision_llm_chain),
+        "reader": [{"url": st.reader.llm_url, "model": st.reader.llm_model}],
+        "summary": [
+            {"url": st.summary_url, "model": st.summary_model},
+            {"url": st.summary_fallback_url, "model": st.summary_fallback_model},
+        ],
+    }
+
+
+def catalog(base: str, key: str | None) -> tuple[set[str] | None, str]:
+    """Model ids a router advertises, or (None, reason) if it cannot be read."""
+    req = urllib.request.Request(f"{base}/v1/models")
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+        return {m["id"] for m in data.get("data", [])}, "ok"
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}" + (" (no key sent)" if not key else " (key rejected)")
+    except Exception as exc:  # noqa: BLE001 - a down host is a normal result here
+        return None, f"unreachable: {type(exc).__name__}"
+
+
+def cmd_show(st) -> int:
+    src = settings_mod.MODELS_FILE
+    where = f"{src}" if src.is_file() else f"{src} {DIM}(absent — using code defaults){RESET}"
+    print(f"routing file: {where}")
+    print(f"{DIM}precedence: code defaults < models.json < environment{RESET}\n")
+    for role, entries in roles(st).items():
+        print(f"{role}:")
+        for i, e in enumerate(entries):
+            tier = "primary" if i == 0 else f"fallback {i}"
+            params = e.get("params")
+            extra = f"  params={json.dumps(params)}" if params else ""
+            print(f"  {tier:<11} {e['url']}")
+            print(f"  {'':<11} {DIM}model={e.get('model')}{extra}{RESET}")
+        print()
+    return 0
+
+
+def cmd_check(st) -> int:
+    keys = st.llm_api_keys
+    seen: dict[str, tuple[set[str] | None, str]] = {}
+    failures = 0
+    for role, entries in roles(st).items():
+        print(f"{role}:")
+        for e in entries:
+            url, model = e["url"], e.get("model")
+            base = origin(url)
+            key = keys.get(base)
+            if base not in seen:
+                seen[base] = catalog(base, key)
+            models, why = seen[base]
+            authed = "authed" if key else "open"
+            if models is None:
+                print(f"  {RED}FAIL{RESET} {url}  {DIM}({authed}){RESET}  {RED}{why}{RESET}")
+                failures += 1
+            elif model not in models:
+                hint = f"  catalog has: {', '.join(sorted(models)[:4])}…" if models else ""
+                print(f"  {RED}FAIL{RESET} {url}  {DIM}({authed}){RESET}  "
+                      f"{RED}alias '{model}' not in catalog{RESET}{DIM}{hint}{RESET}")
+                failures += 1
+            else:
+                params = e.get("params")
+                extra = f"  {DIM}params={json.dumps(params)}{RESET}" if params else ""
+                print(f"  {GREEN}ok{RESET}   {url}  {DIM}({authed}){RESET}  {model}{extra}")
+        print()
+    if failures:
+        print(f"{RED}{failures} endpoint(s) failed.{RESET} Fix routing before restarting.")
+    else:
+        print(f"{GREEN}All endpoints reachable and serving their configured alias.{RESET}")
+    return 1 if failures else 0
+
+
+def cmd_apply(st) -> int:
+    rc = cmd_check(st)
+    if rc:
+        return rc
+    print("\nrestarting…")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "restart", UNIT], check=True)
+    for _ in range(30):
+        try:
+            with urllib.request.urlopen(HEALTH_URL, timeout=3) as resp:
+                h = json.load(resp)
+            if h.get("ready"):
+                chain = h.get("llm_chain", {})
+                rejecting = chain.get("endpoints_rejecting_credentials") or []
+                mark = RED + "REJECTING: " + ", ".join(rejecting) + RESET if rejecting else GREEN + "none" + RESET
+                print(f"{GREEN}ready{RESET}  degraded={h.get('degraded')}  "
+                      f"mcp={h['mcp']['connected_servers']}/{h['mcp']['configured_servers']}  "
+                      f"rejecting-credentials={mark}")
+                return 1 if rejecting else 0
+        except Exception:  # noqa: BLE001 - service is still coming up
+            pass
+        import time
+        time.sleep(1)
+    print(f"{YELLOW}restarted, but /health did not report ready within 30s{RESET}")
+    return 1
+
+
+def main() -> int:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "show"
+    try:
+        st = settings_mod.load_settings()
+    except ValueError as exc:
+        print(f"{RED}config error:{RESET} {exc}")
+        return 2
+    if cmd == "show":
+        return cmd_show(st)
+    if cmd == "check":
+        return cmd_check(st)
+    if cmd == "apply":
+        return cmd_apply(st)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

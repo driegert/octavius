@@ -399,6 +399,43 @@ class LLMChainClient:
                 "endpoints": endpoints,
             }
 
+    @staticmethod
+    def _apply_entry(payload: dict, entry: dict, model: str | None = None) -> dict:
+        """Return `payload` with this endpoint's model and `params` applied.
+
+        `params` is an optional per-entry dict merged into the request body, so
+        routing config can carry generation knobs the payload never sees —
+        `chat_template_kwargs` (thinking on/off), `reasoning_effort`,
+        `temperature`, `max_tokens`. Measured 2026-08-26 on
+        qwen3.6-35b-a3b-mtp-general: `{"chat_template_kwargs":
+        {"enable_thinking": false}}` takes first content token from 2.25s to
+        0.22s with tool-call correctness unchanged.
+
+        The caller's payload wins over `params` on conflict — a request that
+        deliberately sets `temperature` must not be silently overridden by
+        routing config. `model` is the exception: it is a property of the
+        endpoint, not the request, so the entry always decides it.
+
+        A `params` value of anything other than a dict is ignored with a
+        warning rather than raised: bad routing config should degrade to
+        today's behaviour, never take a live voice turn down.
+        """
+        out = dict(payload)
+        params = entry.get("params")
+        if params:
+            if isinstance(params, dict):
+                out = {**params, **out}
+            else:
+                log.warning(
+                    "Ignoring non-dict `params` on chain entry %s (got %s)",
+                    entry.get("url"),
+                    type(params).__name__,
+                )
+        resolved = model or entry.get("model")
+        if resolved:
+            out["model"] = resolved
+        return out
+
     @asynccontextmanager
     async def stream_chat(self, payload: dict) -> AsyncIterator[httpx.Response]:
         failed_urls: list[str] = []
@@ -406,8 +443,7 @@ class LLMChainClient:
             for i, entry in enumerate(self.chain):
                 self._mark_attempt(entry["url"])
                 try:
-                    request_payload = dict(payload)
-                    request_payload["model"] = entry["model"]
+                    request_payload = self._apply_entry(payload, entry)
                     if i > 0:
                         log.warning(
                             "LLM failover attempt %d/%d via %s",
@@ -471,6 +507,10 @@ class LLMChainClient:
         model = payload.get("model") or self.chain[0]["model"]
         request_payload = dict(payload)
         request_payload["model"] = model
+        # Unlike the other two paths, `complete` keeps the CALLER's model rather
+        # than the entry's — the reader passes an explicit alias and an off-chain
+        # url. Per-entry `params` still apply where the url is a known endpoint.
+        entries_by_url = {entry["url"]: entry for entry in self.chain}
         failed_urls: list[str] = []
         async with httpx.AsyncClient(timeout=CHAIN_TIMEOUT) as client:
             for i, url in enumerate(target_urls):
@@ -483,7 +523,10 @@ class LLMChainClient:
                             len(target_urls),
                             url,
                         )
-                    resp = await client.post(url, json=request_payload, headers=auth_headers(url))
+                    url_payload = self._apply_entry(
+                        request_payload, entries_by_url.get(url, {}), model
+                    )
+                    resp = await client.post(url, json=url_payload, headers=auth_headers(url))
                     resp.raise_for_status()
                     text = resp.json()["choices"][0]["message"]["content"].strip()
                     self._record_success(
@@ -541,7 +584,7 @@ class LLMChainClient:
             for i, entry in enumerate(target_entries):
                 self._mark_attempt(entry["url"])
                 model = entry.get("model") or payload_model
-                request_payload["model"] = model
+                entry_payload = self._apply_entry(request_payload, entry, model)
                 try:
                     if i > 0:
                         log.warning(
@@ -550,7 +593,7 @@ class LLMChainClient:
                         )
                     resp = await client.post(
                         entry["url"],
-                        json=request_payload,
+                        json=entry_payload,
                         headers=auth_headers(entry["url"]),
                     )
                     resp.raise_for_status()
@@ -595,15 +638,36 @@ class LLMChainClient:
 class SummaryClient:
     """Conversation-end summary/tag generation.
 
-    Unlike LLMChainClient this carries one model for both URLs (the payload's
-    model is sent as-is), so both endpoints must serve the same alias. It does
-    attach `auth_headers` — without them an authenticated endpoint here 401s
-    silently, since a failed summary only means a missing summary, never a
+    Unlike LLMChainClient this is a plain two-URL failover with no health
+    accounting. It carries a model *per URL*, overriding `payload["model"]` on
+    each attempt: the two routers no longer serve a common alias (2026-08-26,
+    when `qwen3.6-35b-a3b-mtp-general` left `:8020`'s catalog), and sending one
+    alias to both made the fallback a guaranteed 400. A `None` model leaves the
+    payload's own model untouched, which is what the tests and any same-alias
+    deployment rely on.
+
+    It attaches `auth_headers` — without them an authenticated endpoint here
+    401s silently, since a failed summary only means a missing summary, never a
     user-visible error.
     """
 
-    def __init__(self, primary_url: str, fallback_url: str):
+    def __init__(
+        self,
+        primary_url: str,
+        fallback_url: str,
+        *,
+        primary_model: str | None = None,
+        fallback_model: str | None = None,
+    ):
         self.urls = [primary_url, fallback_url]
+        self.models = [primary_model, fallback_model]
+
+    def _payload_for(self, payload: dict, i: int) -> dict:
+        """Payload with this hop's model substituted in, if one is configured."""
+        model = self.models[i] if i < len(self.models) else None
+        if not model or payload.get("model") == model:
+            return payload
+        return {**payload, "model": model}
 
     def complete(self, payload: dict, *, timeout: int) -> str | None:
         failed_urls: list[str] = []
@@ -617,7 +681,10 @@ class SummaryClient:
                         url,
                     )
                 resp = requests.post(
-                    url, json=payload, timeout=timeout, headers=auth_headers(url)
+                    url,
+                    json=self._payload_for(payload, i),
+                    timeout=timeout,
+                    headers=auth_headers(url),
                 )
                 resp.raise_for_status()
                 text = resp.json()["choices"][0]["message"]["content"].strip()
@@ -646,7 +713,11 @@ class SummaryClient:
                             len(self.urls),
                             url,
                         )
-                    resp = await client.post(url, json=payload, headers=auth_headers(url))
+                    resp = await client.post(
+                        url,
+                        json=self._payload_for(payload, i),
+                        headers=auth_headers(url),
+                    )
                     resp.raise_for_status()
                     text = resp.json()["choices"][0]["message"]["content"].strip()
                     if failed_urls:
@@ -936,5 +1007,10 @@ subagent_llm_client = LLMChainClient(settings.subagent_llm_chain)
 # multimodal content array (image_input WS frames). See agent.py's use_vision
 # routing in stream_agent_turn.
 vision_llm_client = LLMChainClient(settings.vision_llm_chain)
-summary_client = SummaryClient(settings.summary_url, settings.summary_fallback_url)
+summary_client = SummaryClient(
+    settings.summary_url,
+    settings.summary_fallback_url,
+    primary_model=settings.summary_model,
+    fallback_model=settings.summary_fallback_model,
+)
 embedding_client = EmbeddingClient(settings.embedding_chain)

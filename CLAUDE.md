@@ -55,12 +55,15 @@ a reference for variable names and defaults, not a file the app consumes.
 for every `LLMChainClient` request path (`stream_chat`, `complete`,
 `complete_with_tools`):
 
-- **`OCTAVIUS_LR_API_KEY`** (preferred; `LR` = lilripper) — a bare token for `lilripper:8010`.
-  This is the value that rotates, so it **wins** over the JSON map. The var name
-  is stable across rotations by design. It is scoped to lilripper, *not* to port
-  8010: `lilbuddy:8010` and `triplestuffed:8010` also listen on 8010 and are
-  open, so they must never receive the header (`settings.KEYED_8010_ORIGIN`
-  pins this; there are tests).
+- **`OCTAVIUS_LR_API_KEY`** (preferred; `LR` = lilripper) — a bare token applied
+  to **both** lilripper router ports. This is the value that rotates, so it
+  **wins** over the JSON map. The var name is stable across rotations by design.
+  It is scoped to lilripper, *not* to a port: `lilbuddy:8010` and
+  `triplestuffed:8010` also listen on 8010 and are open, so they must never
+  receive the header (`settings.KEYED_LR_ORIGINS` pins this; there are tests).
+  **Widened from `:8010`-only on 2026-08-26**, when `:8020` was found to have
+  gone behind the same token — with the key pinned to `:8010`, Octavius sent
+  `:8020` no header at all and read the resulting 401 as an ordinary failover.
 - **`OCTAVIUS_LLM_API_KEYS`** — the general mechanism: a JSON object mapping
   endpoint *origin* (`scheme://host:port`) to a bearer token, e.g.
   `{"http://lilripper:8010":"sk-..."}`. Use it if another endpoint goes behind
@@ -74,6 +77,19 @@ primary**, the subagent primary, the vision primary, the reader LLM, and the
 summary primary, and the reader calls it through a client whose own chain
 doesn't list it. Its promotion to main-chain primary also means an unset or
 stale key breaks the *first* hop of every turn, not a fallback.
+
+**This is not hypothetical — it happened.** Until 2026-08-26,
+`~/.config/octavius/env` carried a *stale* token inside `OCTAVIUS_LLM_API_KEYS`
+and no `OCTAVIUS_LR_API_KEY` at all, while the live token sat in
+`~/.config/secrets.env` (which the service does not read). Result: every turn
+401'd on `:8010`, 401'd on `:8020`, and landed on the lilbuddy gemma4 hop —
+**28 s to the first spoken word instead of 3 s** — while `consult_specialist`,
+the vision chain, the reader LLM and summaries (none of which have a third hop)
+failed outright and silently. Nothing was "down", so `/health`'s
+`endpoints_rejecting_credentials` was the only thing that said so. The env file
+now carries `OCTAVIUS_LR_API_KEY` alone; `~/.config/secrets.env` is the source
+of truth, and the two must be kept in step when the token rotates. Run
+`scripts/octavius-models check` before assuming an application bug.
 
 A 401 still burns a failover hop (it is an `HTTPStatusError` like any other),
 but as of 2026-08-08 it no longer *hides*: `service_clients.classify_chain_error`
@@ -89,6 +105,61 @@ handshake); `timeout` = host accepted the connection but never generated (a
 "zombie" — `/v1/models` answers, completions hang); `client_error` (usually
 400/404) = model alias missing from that endpoint's catalog.
 
+### Model routing (`models.json`)
+
+Every LLM role — main, subagent, vision, reader, summary — is routed from one
+optional file, `~/.config/octavius/models.json` (`OCTAVIUS_MODELS_FILE` to
+relocate). This is the **only** file the app loads; `settings.py` still reads
+`os.environ` directly for everything else, and the file holds no secrets — only
+which endpoint serves which alias with which generation params.
+
+Precedence, lowest to highest: **code defaults < `models.json` < environment**.
+Env still wins so tests and one-off overrides work unchanged; a role absent from
+the file keeps its code default. Malformed JSON, an entry with no `url`, or an
+empty role list **raises** rather than falling back — restarting onto routing
+nobody asked for is the failure mode the file exists to prevent.
+
+Each entry is `{url, model, params?}` (plus `role`/`capacity` for subagent
+entries). **`params` merges into the request body**, which is the only way to
+reach generation knobs the agent path never builds:
+
+```json
+{ "url": "http://lilripper:8010/v1/chat/completions",
+  "model": "qwen3.6-35b-a3b-mtp-general",
+  "params": { "chat_template_kwargs": { "enable_thinking": false } } }
+```
+
+The caller's payload wins over `params` on conflict (a request that deliberately
+sets `temperature` is not overridden by routing config); `model` is always the
+endpoint's. A non-dict `params` logs a warning and is ignored rather than
+raising — bad routing config must degrade, never take a live voice turn down.
+
+**Thinking is the big latency knob.** Measured 2026-08-26 on
+`qwen3.6-35b-a3b-mtp-general`: baseline 2.25 s to first content token (378
+reasoning deltas); with `enable_thinking: false`, **0.22 s** (0 reasoning
+deltas), with tool selection and argument JSON unchanged on both a `web_search`
+and a `consult_specialist` prompt. So the **main chain's `:8010` entry runs
+thinking off** — voice turns are short and conversational — while subagent,
+vision and reader keep it on, since those do multi-step tool-calling and
+document reasoning where the reasoning pass earns its cost. `reasoning_effort`
+(`low`/`medium`/`high`) is the softer version, used to cap the gemma4 hop.
+Beware `max_tokens` on a thinking model: it must budget for reasoning tokens or
+the model spends the whole budget thinking and returns empty `content`.
+
+**`scripts/octavius-models`** is the operational front end:
+
+```bash
+scripts/octavius-models show     # what routing loads, and from where
+scripts/octavius-models check    # probe every endpoint: reachable? alias present? authed?
+scripts/octavius-models apply    # check, then daemon-reload + restart + confirm /health
+```
+
+`check` exists because the two failure modes that actually bite are both
+invisible to reading the config: an alias that has vanished from a router's
+catalog (hard-400 on use, logged as an ordinary failover) and a rotated token
+(401, likewise). Both were live on 2026-08-26. It exits nonzero on any failure,
+so `apply` refuses to restart onto broken routing.
+
 Primary UI routes:
 
 - `/` main voice UI
@@ -101,6 +172,12 @@ Before or after backend changes:
 
 ```bash
 python -m unittest discover -s tests
+```
+
+Before restarting after any routing or endpoint change:
+
+```bash
+scripts/octavius-models check     # nonzero exit if an alias or token is broken
 ```
 
 After changes to request routing, WebSocket behavior, reader flows, or inbox flows:
@@ -210,20 +287,20 @@ External services currently expected:
 - **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
 - **LLM chain (main agent)**: via `OCTAVIUS_LLM_CHAIN`, defaulting to:
   - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general` — a llama.cpp **router**, so the model id selects the model (see "Router model ids" below). `--parallel 3`. Accepts image input. **Behind auth**, which means a missing/stale key now 401s the *primary* rather than a fallback — check `/health`'s `endpoints_rejecting_credentials` first when the chain looks flaky. **Promoted from second hop on 2026-08-18** (see the `:8020` bullet for why); this consolidates the main turn onto the same endpoint *and* the same alias as the subagent primary, the vision chain, the reader, and summaries, so a turn → consult → document read sequence keeps one model resident with no router swap.
-  - first fallback: `lilripper:8020/v1/chat/completions` (`qwen3.6-35b-a3b-mtp-general`) — same alias, also `--parallel 3`, no auth. **Demoted from primary on 2026-08-18**: `:8020` is the port Dave loads other models onto by hand (`qwen3.8-27b` was resident at the time of the swap), and as the primary, every Octavius turn evicted whatever was there. As a fallback it only pulls the 35B when `:8010` is genuinely broken. Also shared with pi-agent, whose 27B contention has produced a live `500 model ... failed to load` on this alias.
+  - first fallback: `lilripper:8020/v1/chat/completions` (**`qwen3.8-27b`**) — repointed 2026-08-26: the `qwen3.6-35b-a3b-mtp-general` alias left this port's catalog, so the entry named a model that no longer existed and every failover into it hard-400'd. This port also **went behind the same auth as `:8010`** (it is no longer open), which is why `OCTAVIUS_LR_API_KEY` now covers both. Warm it answers in 0.67 s; a cold load costs ~26 s. **Demoted from primary on 2026-08-18**: `:8020` is the port Dave loads other models onto by hand (`qwen3.8-27b` was resident at the time of the swap), and as the primary, every Octavius turn evicted whatever was there. As a fallback it only pulls the 35B when `:8010` is genuinely broken. Also shared with pi-agent, whose 27B contention has produced a live `500 model ... failed to load` on this alias.
   - second fallback: `lilbuddy:8010/v1/chat/completions` (`gemma4-26b-a4b`) — the only hop on another host, so the only thing keeping this chain alive if lilripper is down. **This hop was silently dead until 2026-08-18**: it named the bare `qwen3.6-35b-a3b`, which a real completion proved is gone from lilbuddy's catalog too (`400 model 'qwen3.6-35b-a3b' not found`, in 2 ms), so that alias now exists on **no** host in the fleet. Re-verify **this hop specifically** after any *lilbuddy* rebuild, not just the lilripper ones — a missing alias 400s instantly, `LLMChainClient` buckets it as an ordinary failover, and `/health` still lists three configured endpoints, so the chain looks like it has a cross-host last resort when it has none.
     - **Sizing rule: an OOM on lilbuddy takes the *live* voice path down with it, not just this fallback.** The hop was briefly repointed at `qwen3.6-35b-a3b-mtp-q4-general` on 2026-08-18; asking lilbuddy to load it produced 25 s of nothing and then **502 on every alias and every port on the box** (`:8010` router, `:8020` bge-m3 embeddings, `:8880` Kokoro TTS all down together) until the services restarted themselves ~2 min later. Caddy stayed up throughout, which is why it was 502 rather than a connection refusal. **Root-caused by Dave 2026-08-21: the router was configured `max_models=3` with over-generous per-model `--ctx-size`, so it held three models resident at once; the dense 35B on top of two incumbents exhausted the 128 GB of unified memory. It is now `max_models=2`.** The part that outlives the fix: `:8020` and `:8880` are *separate processes on the same box*, and both sit on Octavius's **live** path (embedding-chain primary, and Kokoro is the only TTS since Voxtral is disabled) — so memory pressure caused by this rarely-used third *LLM* hop breaks every turn, not just failover. Size this hop against the whole box's residency budget, not against the model alone; an A4B is the right shape for it. **Re-tested 2026-08-21 after the fix:** the same 35B request, with gemma left resident, now returns **200 in 12 s** with both models co-resident and `:8020`/`:8880` serving 200 throughout — the cascade is gone, not merely avoided. Keep the A4B here anyway: co-resident, the 35B answers in ~6 s against gemma's ~0.6 s, on a hop that only runs when lilripper is already down.
     - `gemma4-26b-a4b` re-measured on lilbuddy 2026-08-21, after the `max_models=2` fix: **9.6 s cold load** (down from 16 s on 08-18), **0.44 s** warm short reply, and **1.02 s** for a warm tool call returning correct OpenAI shape (`finish_reason: tool_calls`); accepts image input.
     - **It is a thinking model, and it returns reasoning in a separate `reasoning_content` field rather than inline `<think>` tags.** The `<think>` stripper therefore never sees it, and `agent.py`'s `delta.get("content", "")` drops it for free — no code change needed. But it thinks *hard* (measured 2026-08-18): 714 reasoning deltas against 30 content deltas on a one-sentence question, ~6.5 s before the first visible token (0.5 s on a trivial prompt). Acceptable for a third fallback that only runs when lilripper is down. **The trap is `max_tokens`:** at `max_tokens=120` this model spent the entire budget on reasoning and returned `finish_reason: length` with an **empty** `content`. Octavius sends no `max_tokens` anywhere today, so it is safe — but anything that starts to must budget for reasoning tokens.
   - `triplestuffed:8010` was **removed** from this chain on 2026-08-08: its GPUs serve Positron autocomplete/NES models, and it accepts connections without ever generating, so failing into it burned the full 120 s read timeout. See `docs/status.md`.
 - **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
-  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general`, `capacity: 3` — served with `--parallel 3`, so consults no longer queue behind the main agent's own turn on the single-slot `:8020`. `consult_specialist` is the dominant Matrix first-turn cost (~15 s average, 50 s worst), and it reserves a dispatcher ticket, so the old `capacity: 1` also serialised concurrent consults against each other. This ran on `qwen3.6-35b-a3b-mtp-q4-general` (chosen for speculative-decoding speed — on tool-calling work latency beats Q5 weights) until the 2026-08-13 lilripper reconfiguration removed the q4 aliases; it now follows the rest of `:8010` onto `mtp-general`. **`capacity: 3` is verified, not assumed** — `:8010` reports `--parallel 3` in `/v1/models` (see "Inspecting a llama.cpp router"); re-check it after any lilripper change. Note `:8020` was raised to `--parallel 3` on 2026-08-13, so the "single-slot `:8020`" reasoning behind this tier swap was true when written and has now expired; the two tiers are near-interchangeable and collapsing them is a live option. **As of 2026-08-18 the main chain's primary is this same endpoint and alias**, so consults no longer sit on a different endpoint from the turn that spawned them — which is fine, and was the point: `consult_specialist` is *inline*, so the main agent is blocked awaiting it and the two never contend for a slot at the same instant, while sharing the endpoint keeps the 35B resident across turn → consult → turn. What to watch is total concurrency on `:8010` (main turns + consults + reader + summaries against three slots) if several sessions run at once — measure, don't reason from first principles. If consult latency regresses, the q4 variant now lives on `lilbuddy:8010`, but that is a different host and trades this endpoint's parallelism for a network hop. Same alias as the reader, so sharing `:8010` costs no extra model swap.
-  - fallback: `lilripper:8020/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general` — HTTP-level failover only.
+  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general`, `capacity: 4` — served with `--parallel 5`, so consults no longer queue behind the main agent's own turn on the single-slot `:8020`. **Raised from 3 on 2026-08-26**, after `/v1/models` showed `:8010` had gone to `--parallel 5`; 4 rather than 5 deliberately leaves one slot for the main turn, reader and summaries, which share this endpoint. `consult_specialist` is the dominant Matrix first-turn cost (~15 s average, 50 s worst), and it reserves a dispatcher ticket, so the old `capacity: 1` also serialised concurrent consults against each other. This ran on `qwen3.6-35b-a3b-mtp-q4-general` (chosen for speculative-decoding speed — on tool-calling work latency beats Q5 weights) until the 2026-08-13 lilripper reconfiguration removed the q4 aliases; it now follows the rest of `:8010` onto `mtp-general`. **`capacity: 4` is verified, not assumed** — `:8010` reports `--parallel 5` as of 2026-08-26 (was 3) in `/v1/models` (see "Inspecting a llama.cpp router"); re-check it after any lilripper change. Note `:8020` was raised to `--parallel 3` on 2026-08-13, so the "single-slot `:8020`" reasoning behind this tier swap was true when written and has now expired; the two tiers are near-interchangeable and collapsing them is a live option. **As of 2026-08-18 the main chain's primary is this same endpoint and alias**, so consults no longer sit on a different endpoint from the turn that spawned them — which is fine, and was the point: `consult_specialist` is *inline*, so the main agent is blocked awaiting it and the two never contend for a slot at the same instant, while sharing the endpoint keeps the 35B resident across turn → consult → turn. What to watch is total concurrency on `:8010` (main turns + consults + reader + summaries against five slots, four of which consults may take) if several sessions run at once — measure, don't reason from first principles. If consult latency regresses, the q4 variant now lives on `lilbuddy:8010`, but that is a different host and trades this endpoint's parallelism for a network hop. Same alias as the reader, so sharing `:8010` costs no extra model swap.
+  - fallback: `lilripper:8020/v1/chat/completions` running `qwen3.8-27b` — HTTP-level failover only. Repointed 2026-08-26 with the main chain; the old alias is gone from this port.
   - The dispatcher (`subagent_dispatcher.py`) routes by `role`. Only two roles matter per call: `primary` (first-try / concurrency routing, with `secondary` as an optional concurrency-overflow tier) and `fallback` (the single per-call HTTP-failover target passed alongside the assigned URL). Per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
   - **Model is per endpoint, not per domain.** `subagent.py::_model_for_url` resolves the model from the chain entry matching the assigned URL, so all three specialist domains sharing `:8010` share one model. Per-domain models would need a `model` key on `SUBAGENT_DOMAINS` overriding that lookup.
   - **Router model ids (both ports are routers now; the alias is load-bearing).** `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so an alias absent from that endpoint's catalog hard-400s and silently burns a failover hop. **The catalogs churn — Dave rebuilds them. Re-curl `/v1/models` on both ports before trusting anything below, and treat a config referencing a missing alias as the first suspect after any lilripper work.** The bare `qwen3.6-35b-a3b` alias exists on **neither** lilripper port — only on `triplestuffed:8010` and `lilbuddy:8010`. Catalogs re-curled 2026-08-18:
-    - `:8020` (5 aliases): `qwen3.6-35b-a3b-mtp-{code,general}`, `muse-glimmer-30b`, `qwen3.8-27b`, `qwen3.8-27b-non-thinking`. Gained the `qwen3.8-27b` pair since 08-13.
-    - `:8010` (9 aliases): `qwen3.6-35b-a3b-mtp-{code,general}`, `gemma4-26b-a4b`, `gemma4-31b`, `ministral-14b`, `muse-glimmer-30b`, `qwen3.5-9b`, `qwen3.8-27b`, `qwen3.8-27b-non-thinking`. Gained the `qwen3.8-27b` pair, lost `qwen3.6-27b-mtp-{code,general}` since 08-13.
+    - `:8020` (**1 alias**, re-curled 2026-08-26): `qwen3.8-27b`. Collapsed from 5 — it **lost `qwen3.6-35b-a3b-mtp-{code,general}`**, which the main/subagent/vision/summary fallbacks all still named, so every failover into this port 400'd. It also now **requires auth**. Run `scripts/octavius-models check` after any lilripper work rather than re-deriving this by hand.
+    - `:8010` (9 aliases, re-curled 2026-08-26, unchanged since 08-18): `qwen3.6-35b-a3b-mtp-{code,general}`, `gemma4-26b-a4b`, `gemma4-31b`, `ministral-14b`, `muse-glimmer-30b`, `qwen3.5-9b`, `qwen3.8-27b`, `qwen3.8-27b-non-thinking`. `qwen3.6-35b-a3b-mtp-general` is resident and now runs **`--parallel 5`** (raised from 3), `--ctx-size 614400`.
     - **Every alias on both ports currently reports `text,image`** in `architecture.input_modalities` — so "this fallback is text-only" is not a safe assumption on lilripper any more, in either direction. Read the field.
     - `lilbuddy:8010` (10 aliases, re-curled 2026-08-18, down from 14): `gemma4-26b-a4b`, `gemma4-31b`, `muse-glimmer-30b`, `nemotron-nano-30b`, `qwen3.5-4b`, `qwen3.5-9b`, `qwen3.6-35b-a3b-mtp-q4-{code,general}`, `qwen3.8-27b`, `DEFAULT`. **The bare `qwen3.6-35b-a3b` is gone from here too**, so it now exists on no host in the fleet. All of these take images except `DEFAULT` and `nemotron-nano-30b`.
     - The **q4 MTP** aliases did not disappear from the fleet — they moved to `lilbuddy:8010`, which now also carries `qwen3.6-35b-a3b-q6` and, notably, `qwen3-vl-30b-a3b` (**image input on a non-lilripper host** — see `docs/status.md`, this unblocks cross-host vision failover).
@@ -236,7 +313,7 @@ External services currently expected:
   it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` to restore
   the Voxtral-primary → Kokoro-fallback path (with circuit breaker).
 - **Reader LLM**: `qwen3.6-35b-a3b-mtp-general` at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets"). `qwen3.5-9b` is still in `:8010`'s catalog but went stale — it lists in `/v1/models` and then hangs on completion, which silently degraded every math chunk to dollar-stripping. Alias deliberately matches the subagent chain's `:8010` entry.
-- **Summary/tag generation**: `lilripper:8010` with fallback `lilripper:8020`, model `qwen3.6-35b-a3b-mtp-general` (moved off the dead lilbuddy/triplestuffed pair 2026-08-08; reordered `:8010`-first 2026-08-18). The order matters more than the traffic volume suggests: summaries fire at conversation *end*, long after Dave has moved on, so with `:8020` primary a background job could quietly evict a model he had loaded there by hand. `SummaryClient` is **not** an `LLMChainClient`: it sends one model to both URLs, so the alias must exist on both ports. It does attach `auth_headers` (added 2026-08-08 — previously it sent none, so any authed endpoint here would have 401'd silently). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
+- **Summary/tag generation**: `lilripper:8010` with fallback `lilripper:8020`, model `qwen3.6-35b-a3b-mtp-general` (moved off the dead lilbuddy/triplestuffed pair 2026-08-08; reordered `:8010`-first 2026-08-18). The order matters more than the traffic volume suggests: summaries fire at conversation *end*, long after Dave has moved on, so with `:8020` primary a background job could quietly evict a model he had loaded there by hand. `SummaryClient` is **not** an `LLMChainClient`, but as of 2026-08-26 it carries a model **per URL** (`summary_model` / `summary_fallback_model`, the latter defaulting to `qwen3.8-27b`). It previously sent one model to both URLs, which became a guaranteed 400 on the fallback the moment the two routers stopped sharing an alias. It does attach `auth_headers` (added 2026-08-08 — previously it sent none, so any authed endpoint here would have 401'd silently). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
   - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
@@ -350,7 +427,8 @@ Core runtime:
 
 - `main.py` - FastAPI app creation, startup wiring, shared top-level routes, WebSocket entrypoint
 - `db.py` - SQLite connection helpers and short-lived connection context manager
-- `settings.py` - env-backed runtime settings and defaults
+- `settings.py` - env-backed runtime settings and defaults; also loads `models.json` model routing (`_role_chain` / `_role_single`, precedence: defaults < file < env)
+- `scripts/octavius-models` - show / check / apply model routing; `check` probes every endpoint's catalog and auth before `apply` will restart
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
 - `stt.py` - thin STT wrapper
 - `tts.py` - thin TTS wrapper; `speechify` markdown→speech normalization applied at the `synthesize` choke point
@@ -436,7 +514,8 @@ Tests:
 - `tests/test_subagent.py`
 - `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
-- `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, and LLM endpoint auth headers
+- `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, LLM endpoint auth headers, and per-entry `params` merging
+- `tests/test_settings_models_file.py` - `models.json` precedence, validation, and `params` passthrough
 - `tests/test_tts.py` - `speechify` markdown→speech normalization
 - `tests/test_docproc_client.py`
 - `tests/test_local_tool_documents.py`

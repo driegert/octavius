@@ -75,6 +75,7 @@ class _RecordingAsyncClient:
         self._outcomes = list(outcomes)
         self.calls: list[str] = []
         self.headers: list[dict] = []
+        self.bodies: list[dict] = []
 
     async def __aenter__(self):
         return self
@@ -85,6 +86,7 @@ class _RecordingAsyncClient:
     async def post(self, url, json=None, headers=None):
         self.calls.append(url)
         self.headers.append(headers or {})
+        self.bodies.append(json or {})
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -234,7 +236,7 @@ class ChainErrorClassificationTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.dict(
             service_clients.settings.llm_api_keys,
-            {"http://lilripper:8010": "sk-abc"},
+            {"http://lilripper:8010": "sk-abc", "http://lilripper:8020": "sk-abc"},
             clear=True,
         ):
             health = client.get_health()
@@ -695,7 +697,7 @@ class EmbeddingCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
 
 
 KEYED = "http://lilripper:8010/v1/chat/completions"
-OPEN = "http://lilripper:8020/v1/chat/completions"
+OPEN = "http://lilbuddy:8010/v1/chat/completions"
 
 
 class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
@@ -704,7 +706,7 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         patcher = patch.dict(
             service_clients.settings.llm_api_keys,
-            {"http://lilripper:8010": "sk-abc"},
+            {"http://lilripper:8010": "sk-abc", "http://lilripper:8020": "sk-abc"},
             clear=True,
         )
         patcher.start()
@@ -732,21 +734,40 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("OCTAVIUS_LR_API_KEY", None)
             self.assertEqual(_llm_api_keys(), {})
 
-    def test_dedicated_8010_var_supplies_the_key(self):
+    def test_dedicated_lr_var_supplies_the_key_for_both_ports(self):
+        """One rotating token covers every authed lilripper origin. :8020 went
+        behind the same auth as :8010, and pinning the key to :8010 alone meant
+        Octavius sent :8020 no header and read the 401 as an ordinary failover."""
         with patch.dict(os.environ, {"OCTAVIUS_LR_API_KEY": "sk-direct"}):
             os.environ.pop("OCTAVIUS_LLM_API_KEYS", None)
-            self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-direct"})
+            self.assertEqual(
+                _llm_api_keys(),
+                {
+                    "http://lilripper:8010": "sk-direct",
+                    "http://lilripper:8020": "sk-direct",
+                },
+            )
 
-    def test_dedicated_8010_var_wins_over_json_map(self):
-        """The dedicated var is the one that rotates, so it takes precedence."""
+    def test_dedicated_lr_var_wins_over_json_map(self):
+        """The dedicated var is the one that rotates, so it takes precedence.
+
+        A stale token left in the JSON map is exactly what broke the chain on
+        2026-08-26, so precedence here is load-bearing, not cosmetic.
+        """
         env = {
             "OCTAVIUS_LLM_API_KEYS": f'{{"{KEYED}": "sk-stale"}}',
             "OCTAVIUS_LR_API_KEY": "sk-fresh",
         }
         with patch.dict(os.environ, env):
-            self.assertEqual(_llm_api_keys(), {"http://lilripper:8010": "sk-fresh"})
+            self.assertEqual(
+                _llm_api_keys(),
+                {
+                    "http://lilripper:8010": "sk-fresh",
+                    "http://lilripper:8020": "sk-fresh",
+                },
+            )
 
-    def test_dedicated_8010_var_does_not_leak_to_other_8010_hosts(self):
+    def test_dedicated_lr_var_does_not_leak_to_other_8010_hosts(self):
         """lilbuddy:8010 and triplestuffed:8010 are open; they must stay unkeyed
         even though they share the port the env var is named for."""
         with patch.dict(os.environ, {"OCTAVIUS_LR_API_KEY": "sk-direct"}):
@@ -765,7 +786,7 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
                 auth_headers("http://triplestuffed:8010/v1/chat/completions"), {}
             )
 
-    def test_blank_dedicated_8010_var_is_ignored(self):
+    def test_blank_dedicated_lr_var_is_ignored(self):
         """An unset-but-declared EnvironmentFile line must not register an
         empty token (which would send `Bearer ` and 401)."""
         env = {
@@ -994,3 +1015,78 @@ class TTSCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChainEntryParamsTests(unittest.IsolatedAsyncioTestCase):
+    """Per-entry `params` reach the request body without shadowing the caller.
+
+    The knob exists for latency: on qwen3.6-35b-a3b-mtp-general, sending
+    `chat_template_kwargs={"enable_thinking": False}` took the first content
+    token from 2.25s to 0.22s (measured 2026-08-26) with tool-call selection
+    unchanged. Routing config is the only place that can set it, since nothing
+    on the agent path builds these fields.
+    """
+
+    def _entry(self, **kw):
+        return {"url": KEYED, "model": "m1", **kw}
+
+    def test_params_merge_into_payload(self):
+        out = LLMChainClient._apply_entry(
+            {"messages": []},
+            self._entry(params={"chat_template_kwargs": {"enable_thinking": False}}),
+        )
+        self.assertEqual(out["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(out["model"], "m1")
+
+    def test_absent_params_leaves_payload_alone(self):
+        out = LLMChainClient._apply_entry({"messages": [], "stream": True}, self._entry())
+        self.assertEqual(out, {"messages": [], "stream": True, "model": "m1"})
+
+    def test_caller_payload_wins_over_params(self):
+        """Routing config must not silently override a deliberate request field."""
+        out = LLMChainClient._apply_entry(
+            {"temperature": 0.1},
+            self._entry(params={"temperature": 0.9, "top_p": 0.5}),
+        )
+        self.assertEqual(out["temperature"], 0.1)
+        self.assertEqual(out["top_p"], 0.5)
+
+    def test_entry_model_always_wins_over_params(self):
+        """model is a property of the endpoint, not of the request."""
+        out = LLMChainClient._apply_entry({"model": "caller"}, self._entry(params={"model": "sneaky"}))
+        self.assertEqual(out["model"], "m1")
+
+    def test_explicit_model_argument_overrides_entry(self):
+        out = LLMChainClient._apply_entry({}, self._entry(), "override")
+        self.assertEqual(out["model"], "override")
+
+    def test_non_dict_params_is_ignored_not_raised(self):
+        """Bad routing config must degrade, never take a live voice turn down."""
+        with self.assertLogs("service_clients", level="WARNING"):
+            out = LLMChainClient._apply_entry({"messages": []}, self._entry(params="nope"))
+        self.assertEqual(out, {"messages": [], "model": "m1"})
+
+    def test_input_payload_is_not_mutated(self):
+        payload = {"messages": []}
+        LLMChainClient._apply_entry(payload, self._entry(params={"temperature": 0.2}))
+        self.assertEqual(payload, {"messages": []})
+
+    async def test_each_hop_sends_its_own_params_not_the_primarys(self):
+        """A fallback must not inherit the primary's params — that is how a
+        thinking-off primary would silently disable reasoning on a fallback
+        chosen precisely for its reasoning."""
+        client = LLMChainClient(
+            [
+                {"url": KEYED, "model": "m1", "params": {"reasoning_effort": "low"}},
+                {"url": OPEN, "model": "m2", "params": {"reasoning_effort": "high"}},
+            ]
+        )
+        fake = _RecordingAsyncClient(
+            [_http_error(500), _FakeResponse("ok")]
+        )
+        with patch.object(service_clients.httpx, "AsyncClient", return_value=fake):
+            await client.complete_with_tools({"messages": [], "tools": []})
+        self.assertEqual(fake.bodies[0]["reasoning_effort"], "low")
+        self.assertEqual(fake.bodies[0]["model"], "m1")
+        self.assertEqual(fake.bodies[1]["reasoning_effort"], "high")
+        self.assertEqual(fake.bodies[1]["model"], "m2")
