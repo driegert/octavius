@@ -45,9 +45,22 @@ Service endpoint:
 config only reaches the app through the process environment. `.env.example` is
 a reference for variable names and defaults, not a file the app consumes.
 
-- **Service**: `~/.config/systemd/user/octavius.service.d/env.conf` adds
-  `EnvironmentFile=-/home/dave/.config/octavius/env` (mode 0600, outside the
-  repo). After editing either file: `systemctl --user daemon-reload && systemctl --user restart octavius`.
+- **Service**: `~/.config/systemd/user/octavius.service.d/env.conf`. It does two
+  things. `EnvironmentFile=-%h/.config/octavius/env` supplies **non-secret**
+  config (mode 0600, outside the repo). The lilripper bearer token is *not*
+  there: an `ExecStart=` override sources `~/.config/secrets.env` in a subshell
+  and exports `OCTAVIUS_LR_API_KEY` alone, so the token lives in exactly one
+  file fleet-wide. After editing either file: `systemctl --user daemon-reload && systemctl --user restart octavius`.
+
+  Two reasons it is a subshell and not simply a second `EnvironmentFile`, both
+  verified 2026-08-26: `secrets.env` uses `export FOO=...` lines, which
+  systemd's `EnvironmentFile` parser does **not** understand — it logs
+  `Ignoring invalid environment assignment` and sets *nothing*, which would
+  start Octavius keyless and 401 the primary on every turn, silently. And the
+  subshell keeps that file's nine other keys out of this service's environment
+  (confirmed: only `OCTAVIUS_LR_API_KEY` appears in `/proc/<pid>/environ`).
+  The value never reaches argv, so it stays out of `ps`. Same pattern as
+  `notesmd.service`.
 - **Foreground**: `set -a; source ~/.config/octavius/env; set +a; uv run python main.py`.
 
 **LLM endpoint auth**: only `lilripper:8010` is behind auth. Two env vars feed
@@ -86,9 +99,9 @@ and no `OCTAVIUS_LR_API_KEY` at all, while the live token sat in
 **28 s to the first spoken word instead of 3 s** — while `consult_specialist`,
 the vision chain, the reader LLM and summaries (none of which have a third hop)
 failed outright and silently. Nothing was "down", so `/health`'s
-`endpoints_rejecting_credentials` was the only thing that said so. The env file
-now carries `OCTAVIUS_LR_API_KEY` alone; `~/.config/secrets.env` is the source
-of truth, and the two must be kept in step when the token rotates. Run
+`endpoints_rejecting_credentials` was the only thing that said so. The duplication is
+now gone entirely: `~/.config/secrets.env` holds the token and the unit reads it
+from there at start time, so there is no second copy to go stale. Run
 `scripts/octavius-models check` before assuming an application bug.
 
 A 401 still burns a failover hop (it is an `HTTPStatusError` like any other),
