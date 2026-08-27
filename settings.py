@@ -286,27 +286,21 @@ DEFAULT_MCP_SERVERS = {
         "url": "http://triplestuffed:8251/mcp",
     },
     "web-search": {
-        "transport": "stdio",
-        # mcp-tools' server_serper.py exposes a single `web_search` tool.
-        # Serper.dev (Google) is the PRIMARY arm; self-hosted SearXNG is a
-        # backstop that answers only when Serper *errors* (an empty Serper
-        # result is a valid answer to an obscure query, not a failure). Order
-        # was inverted 2026-08-20: SearXNG's bing engine had been returning
-        # topic-unrelated pages while reporting HTTP 200 success, so a large
-        # share of every result set was junk and the old "SearXNG returned
-        # nothing" fallback trigger never fired. The backstop is pinned to
-        # engines=duckduckgo,wikipedia (SEARX_ENGINES) so nothing needs
-        # babysitting. **No SERPER_API_KEY means the degraded arm only.**
-        # It reads SERPER_API_KEY from mcp-tools/.env (load_dotenv) and trusts
-        # the system CA bundle for SearXNG's Caddy cert on its own (honors
-        # SSL_CERT_FILE, else /etc/ssl/certs/ca-certificates.crt), so no env is
-        # needed here. SEARX_HOST defaults to https://searxng.riegert.xyz.
-        # Reading pages stays on web-reader (Crawl4AI). Replaced the old
-        # varlabz searxng-mcp (`search` tool, SearXNG-only, no fallback).
-        "command": "/home/dave/git_repos/mcp-tools/.venv/bin/python",
-        "args": [
-            "/home/dave/git_repos/mcp-tools/server_serper.py",
-        ],
+        "transport": "http",
+        # mcp-tools' server_serper.py, served as a shared streamable-HTTP
+        # service on triplestuffed since 2026-08-26 (web-search.service,
+        # :8205 behind Caddy :8255) so every consumer shares one process, one
+        # set of API keys and one 15-minute result cache. Parallel.ai is the
+        # PRIMARY arm (neural index, excerpts, 5k free/month); Google via
+        # Serper answers on a Parallel error or zero hits and owns the
+        # kind="news"/"scholar" verticals. SearXNG only when named. Keys live
+        # in mcp-tools/.env on triplestuffed — nothing is needed here.
+        # Octavius runs ON triplestuffed, so talk to the unit directly over
+        # loopback; the Caddy :8255 route exists for other hosts (pi on
+        # tinkertoy etc.). An unreachable MCP server aborts connect_all() and
+        # the whole lifespan — Octavius crash-looped on 2026-08-26 for the few
+        # minutes this pointed at a Caddy port that wasn't configured yet.
+        "url": "http://127.0.0.1:8205/mcp",
         "tool_description_suffix": (
             " | SCOPE: general web lookups only (news, recipes, product info, "
             "how-to, definitions, current events). Do NOT use for academic "
@@ -316,10 +310,14 @@ DEFAULT_MCP_SERVERS = {
     },
     "web-reader": {
         "transport": "http",
-        # Crawl4AI markdown reader (mcp-tools' server_reader.py) — the "read"
-        # half of the search -> read -> reason pipeline. Same deployed instance
-        # the pi agents use (Caddy on lilripper -> localhost Crawl4AI).
-        "url": "http://lilripper:8254/mcp",
+        # Web reader (mcp-tools' server_reader.py) — the "read" half of the
+        # search -> read -> reason pipeline. Since 2026-08-26 a fetch LADDER on
+        # triplestuffed (web-reader.service, :8207 behind Caddy :8257): site
+        # recipes (Reddit threads/listings, X, arXiv, Substack) -> plain fetch
+        # + trafilatura -> Crawl4AI on lilripper in stealth mode -> archive.
+        # Same deployed instance the pi agents use; loopback for the same
+        # reason as web-search above.
+        "url": "http://127.0.0.1:8207/mcp",
         "tool_description_suffix": (
             " | Use AFTER a web search to read the full content of a specific "
             "result URL, or whenever a search snippet isn't enough. Read one "
