@@ -151,10 +151,14 @@ raising — bad routing config must degrade, never take a live voice turn down.
 `qwen3.6-35b-a3b-mtp-general`: baseline 2.25 s to first content token (378
 reasoning deltas); with `enable_thinking: false`, **0.22 s** (0 reasoning
 deltas), with tool selection and argument JSON unchanged on both a `web_search`
-and a `consult_specialist` prompt. So the **main chain's `:8010` entry runs
-thinking off** — voice turns are short and conversational — while subagent,
-vision and reader keep it on, since those do multi-step tool-calling and
-document reasoning where the reasoning pass earns its cost. `reasoning_effort`
+and a `consult_specialist` prompt. It was set on the main chain's `:8010` entry
+for two days and then **reverted 2026-08-28**: the speed was real and tool
+selection stayed correct, but Dave did not trust the *answers*. **Every role now
+runs thinking on** (the Qwen3 template default, so no `params` are needed for
+it); speed is bought on the fallbacks instead. Cost of that choice, measured
+end-to-end: first audio ~2.2-4.0 s with thinking, ~1.5-1.8 s without. If it is
+ever traded back, prefer `reasoning_effort: "low"`/`"medium"` — a dial rather
+than the `enable_thinking` switch. `reasoning_effort`
 (`low`/`medium`/`high`) is the softer version, used to cap the gemma4 hop.
 Beware `max_tokens` on a thinking model: it must budget for reasoning tokens or
 the model spends the whole budget thinking and returns empty `content`.
