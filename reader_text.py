@@ -141,28 +141,36 @@ def strip_latex(text: str) -> str:
 
 
 async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
-    payload = {
-        "model": settings.reader.llm_model,
-        "messages": [
-            {"role": "system", "content": MATH_TO_SPEECH_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        # Reasoning models burn tokens inside <think> before the rewrite; 2048 could
-        # truncate mid-think, leaving an UNCLOSED think block that THINK_RE can't strip.
-        "max_tokens": 8192,
-        "temperature": 0.1,
-        "stream": False,
-    }
-
-    try:
-        raw = await llm_client.complete(payload, urls=[settings.reader.llm_url])
-        result = THINK_RE.sub("", raw or "").strip()
+    attempts = [(settings.reader.llm_url, settings.reader.llm_model)]
+    if settings.reader.llm_fallback_url:
+        # complete() merges per-url params from the MAIN chain's entry for this
+        # url (the fallback is also main-chain hop 3), so anything set there
+        # applies to this attempt too — nothing today.
+        attempts.append((settings.reader.llm_fallback_url, settings.reader.llm_fallback_model))
+    for url, model in attempts:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": MATH_TO_SPEECH_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            # Reasoning models burn tokens inside <think> before the rewrite; 2048 could
+            # truncate mid-think, leaving an UNCLOSED think block that THINK_RE can't strip.
+            "max_tokens": 8192,
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            raw = await llm_client.complete(payload, urls=[url])
+            result = THINK_RE.sub("", raw or "").strip()
+        except Exception as exc:
+            log.warning("Reader LLM failed at %s: %s", url, exc)
+            continue
         if result and "<think>" in result:
-            log.warning("Reader LLM returned a truncated think block — using strip_latex fallback")
-        elif result:
+            log.warning("Reader LLM at %s returned a truncated think block — trying next", url)
+            continue
+        if result:
             return result
-    except Exception as exc:
-        log.warning("Reader LLM failed: %s", exc)
 
     return strip_latex(text)
 

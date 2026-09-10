@@ -23,6 +23,8 @@ CHAIN_VARS = [
     "OCTAVIUS_VISION_LLM_CHAIN",
     "OCTAVIUS_READER_LLM_URL",
     "OCTAVIUS_READER_LLM_MODEL",
+    "OCTAVIUS_READER_LLM_FALLBACK_URL",
+    "OCTAVIUS_READER_LLM_FALLBACK_MODEL",
     "OCTAVIUS_SUMMARY_URL",
     "OCTAVIUS_SUMMARY_MODEL",
 ]
@@ -106,6 +108,34 @@ class ModelsFileTests(unittest.TestCase):
         })
         self.assertEqual(st.summary_model, "primary-m")
         self.assertEqual(st.summary_fallback_model, "qwen3.8-27b")
+
+    def test_reader_fallback_reads_the_second_entry(self):
+        """The reader is single-endpoint per call, but the role's second entry
+        is its failover target (reader_text.py tries it before strip_latex)."""
+        _, st = self._load({
+            "roles": {"reader": [
+                {"url": "http://r:1/v1", "model": "primary-m"},
+                {"url": "http://r:2/v1", "model": "fallback-m"},
+            ]}
+        })
+        self.assertEqual(st.reader.llm_url, "http://r:1/v1")
+        self.assertEqual(st.reader.llm_model, "primary-m")
+        self.assertEqual(st.reader.llm_fallback_url, "http://r:2/v1")
+        self.assertEqual(st.reader.llm_fallback_model, "fallback-m")
+
+    def test_reader_single_entry_has_no_fallback(self):
+        _, st = self._load({"roles": {"reader": [{"url": "http://r:1/v1", "model": "m"}]}})
+        self.assertIsNone(st.reader.llm_fallback_url)
+        self.assertIsNone(st.reader.llm_fallback_model)
+
+    def test_reader_fallback_missing_model_is_rejected(self):
+        """A half-configured fallback would 400 on every failover — refuse to
+        start onto routing nobody asked for, same standard as the chains."""
+        with self.assertRaises(ValueError):
+            self._load({"roles": {"reader": [
+                {"url": "http://r:1/v1", "model": "primary-m"},
+                {"url": "http://r:2/v1"},
+            ]}})
 
     def test_malformed_json_raises_rather_than_silently_defaulting(self):
         """Restarting onto routing the operator did not ask for is the exact
