@@ -491,8 +491,8 @@ Reader pipeline:
 - `document_sources.py` - file/source sniffing, decoding, PDF detection
 - `reader_ingest_service.py` - narrow entrypoints for starting and retrying reader ingest jobs
 - `reader_ingest_handlers.py` - source-specific ingest handlers for files, URLs, PDFs, retry scheduling, and conversion polling
-- `reader_store.py` - reader document CRUD, speech-file lookup, and stale-job cleanup
-- `reader_text.py` - markdown chunking, math-to-speech conversion (per-endpoint failover before the local `strip_latex` degradation), and speech JSON generation
+- `reader_store.py` - reader document CRUD, speech-file lookup, stale-job cleanup, and the per-document appendix files that let a retry reproduce appended text
+- `reader_text.py` - markdown chunking, math-to-speech conversion (per-endpoint failover before the local `strip_latex` degradation), and speech JSON generation; `append_to_document` extends an existing speech file in place
 - `reader_playback.py` - sentence-by-sentence playback streaming over WebSocket
 
 History and inbox:
@@ -523,6 +523,8 @@ Tests:
 - `tests/test_reader.py` - also `_llm_convert_math` endpoint failover (primary → fallback → `strip_latex`)
 - `tests/test_reader_ingest_handlers.py`
 - `tests/test_reader_ingest_service.py`
+- `tests/test_reader_append.py` - appending to an existing document: incremental chunk append, position preservation, `replace`, retry folding appendices, status rules, tool/route wiring
+- `tests/test_reader_edit.py` - renaming a document: DB + speech JSON title update, missing speech file, validation, any-status rename, route wiring
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
 - `tests/test_history_attach.py`
@@ -630,6 +632,54 @@ Reader storage:
 - speech-ready JSON files: `/home/dave/octavius-reader/`
 - pasted-text originals: `/home/dave/octavius-reader/pasted/<doc_id>-<slug>.md`
 - metadata: `reader_documents` table
+
+Appending to an existing document (`append_to_reader_document` tool,
+`POST /api/reader/documents/{id}/append {"text"|"path", "replace"?}`) is for
+when the original pull came back partial — a sign-in pop-up, a paywall
+teaser — and Dave supplies the rest by hand. `reader_text.append_to_document`
+is **incremental**: only the new text is chunked and math-converted, and the
+existing chunks keep their bytes and indices so `last_chunk`/`last_sentence`
+still point where Dave left off (re-chunking the whole document would not
+guarantee that: a section that grows past three paragraphs is re-split).
+`replace=true` rebuilds from the new text alone, for when what the reader
+holds is the sign-in page. A `failed` document may be appended to (that is
+the sign-in-wall fix); a `processing` one 409s, and the status flip is a
+conditional UPDATE (`reader_store.claim_document_for_processing`) so two
+concurrent appends cannot both launch a job.
+
+Renaming a document (`PATCH /api/reader/documents/{id} {"title": "..."}`, via
+`reader_ingest_service.rename_reader_document` → `reader_text.rename_document`)
+is allowed in any status, including `processing`. The title is stripped,
+rejected if blank or over 200 characters, and written to the DB row; if a
+speech JSON exists its stored title is rewritten too (temp + `os.replace`,
+the same atomic-write helper `_write_speech` uses), but a missing or
+unreadable speech file is not an error — the rename still succeeds. Nothing
+reads the JSON title (playback and both clients use the row), so it is kept
+consistent cheaply rather than transactionally: while the document is
+`processing` the rename leaves the JSON to the running job, and `_write_speech`
+re-reads the row's title just before it writes, so a rename that lands mid-job
+is neither clobbered by the job's final write nor able to clobber the job's
+freshly converted chunks. Both the /reader page and the Android client expose
+append / replace / rename directly (an edit panel on each ready or failed card
+and in the player), polling the document until it settles; a failed append on
+a previously-ready document comes back `ready` with `error` set, which the
+clients must treat as a failure, not a no-op.
+
+The append is **atomic from the document's point of view**: the appendix file
+is written only after conversion succeeds and just before the speech file is
+replaced (temp file + `os.replace`), so a failed append — reader LLM down,
+disk full — leaves a `ready` document `ready` with the failure in `error`, and
+no orphaned appendix on disk. Each appended block lives at
+`<reader_dir>/appendices/<id>/<seq>-<stamp>.md`; `ingest_document` folds them
+onto the end of the base text, which is what keeps a **retry** (which replays
+the original source) from silently dropping appended text — so persistence is
+mandatory, not best-effort. A `replace` leaves a `REPLACED` marker in that
+directory: `with_appendices` then drops the base text, and `start_retry_task`
+skips the source replay entirely (for a URL, replaying it would fail on the
+sign-in wall again before the real text was ever folded in). A `path` is read
+the way file ingest reads one (HTML through trafilatura); PDFs are refused —
+read them as their own document. `replace` is parsed strictly (`"false"` is
+false), because `bool("false")` would have destructively rebuilt the document.
 
 Pasted text (`source: "text"`) is the one source with no file or URL behind it,
 so `start_text_ingest` writes it out and records the path as `source_path`.

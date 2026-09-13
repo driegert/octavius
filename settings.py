@@ -280,6 +280,7 @@ DEFAULT_TOOL_LABELS = {
     "get_paper": "Reading Paper",
     "read_document": "Preparing Document",
     "list_reader_documents": "Listing Reader Docs",
+    "append_to_reader_document": "Extending Document",
     "process_pdf": "Processing PDF",
     "consult_specialist": "Consulting Specialist",
     "hybrid_search": "Email Search",
@@ -480,6 +481,11 @@ You have access to tools:
 - list_reader_documents to check what's in the reader and whether in-flight
   PDF conversions have finished. Use when Dave asks "what's in the reader",
   "is that PDF ready yet", or "did the conversion finish".
+- append_to_reader_document to add content to a document already in the reader
+  when the original pull was partial (sign-in pop-up, paywall teaser, truncated
+  page) and Dave supplies the rest, pasted or as a saved file. Pass it verbatim.
+  Use replace=true if what the reader has is junk and should be rebuilt from
+  the new content instead.
 
 Important guidelines for your responses:
 - Response length and formatting depend on the channel Dave is using; a per-turn

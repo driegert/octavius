@@ -600,6 +600,50 @@ Note the Android client depends on WS behaviour the server did NOT change this s
 (STT/VAD/`audio_done`/empty-transcription semantics are untouched — see CLAUDE.md "Native
 Android client"), so a protocol regression from this session's work is unlikely.
 
+## Reader: append to an existing document (2026-09-13)
+
+A URL pull that hits a sign-in pop-up or paywall teaser used to leave Dave with a
+stub (or a `failed` row) and no way to add the real text short of a new document.
+
+- New agent tool `append_to_reader_document(document_id, text|path, replace?)` and
+  `POST /api/reader/documents/{id}/append`, both through
+  `reader_ingest_service.append_reader_document` → `reader_ingest_handlers.start_append_ingest`.
+- `reader_text.append_to_document` is incremental: only the new text is chunked and
+  math-converted; existing chunks and indices are untouched, so playback position
+  survives. `replace=true` rebuilds from the new text (for when the stub is the sign-in
+  page itself) and resets position.
+- `failed` documents accept appends (that *is* the fix for a failed pull); `processing`
+  ones 409, via a conditional UPDATE so concurrent appends cannot race.
+- Atomic: the appendix file and the speech file are written only after conversion
+  succeeds, so a failed append (LLM down) leaves a `ready` document `ready`, with the
+  failure in `error`, and nothing orphaned on disk. Speech JSON is written temp+rename.
+- Appended blocks persist to `<reader_dir>/appendices/<id>/`, and `ingest_document`
+  folds them onto the base text — so a retry, which replays the original source, no
+  longer drops them. A `REPLACED` marker makes retry skip the discarded source
+  entirely. No schema change.
+- No `/reader` UI affordance yet; the tool and REST route are the surface.
+- Reviewed by the tri-council (Codex / Gemini / pi) before landing; the atomic-append
+  shape, the `REPLACED` marker, the conditional claim, and the strict `replace` parse
+  all came out of that review.
+- Tests: `tests/test_reader_append.py`.
+
+### Reader edit from the UIs (2026-09-13)
+
+Added `PATCH /api/reader/documents/{id} {"title": "..."}` (`rename_reader_document` /
+`reader_text.rename_document`) so a document can be renamed in any status, updating the
+DB row and the speech JSON's stored title (missing speech file is not an error; while
+`processing` the JSON is left to the running job, and `_write_speech` re-reads the row's
+title before writing, so a mid-job rename can neither be clobbered nor clobber). The
+`/reader` page (edit panel on each ready/failed card and in the player, `static/reader-app.js`)
+and the Android client (`EditDocumentDialog`, on `feature/markdown-math` in
+`../octavius-android`) now expose append / replace / rename directly with no agent turn;
+the text still goes through the normal reader pipeline, so it reads like the rest of the
+document. Both clients poll the document until it settles and treat `ready` + `error` as a
+failed append. A tri-council review (Codex + Gemini + pi) drove: the rename race fix, the
+ready-with-error handling, bounded poll retries on both clients, list-view offline-cache
+reconciliation and a dialog that stays open on failure on Android. Tests:
+`tests/test_reader_edit.py` (20). Android is compile-validated only.
+
 ## Reader: pasted text (2026-08-10)
 
 The reader now accepts raw text alongside files, URLs, and inbox items.

@@ -11,7 +11,12 @@ from local_tool_downloads import download_file
 from local_tool_history import read_conversation, search_conversation_history
 from local_tool_memory import correct, forget, remember, what_do_you_know
 from local_tool_vault import commit_edit, edit_note, read_note, save_note
-from local_tool_reader import list_reader_documents, process_pdf_background, read_document
+from local_tool_reader import (
+    append_to_reader_document,
+    list_reader_documents,
+    process_pdf_background,
+    read_document,
+)
 from local_tool_specs import TOOLS
 
 if TYPE_CHECKING:
@@ -65,6 +70,7 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "commit_edit": commit_edit,
         "read_document": read_document,
         "list_reader_documents": list_reader_documents,
+        "append_to_reader_document": append_to_reader_document,
         "process_pdf": process_pdf_background,
         "check_document_status": check_document_status,
         "search_conversation_history": search_conversation_history,

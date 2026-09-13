@@ -3,7 +3,13 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from db import connect_db
 from reader_store import delete_document, get_document, list_documents, load_speech_data
-from reader_ingest_service import ReaderIngestError, retry_reader_document, start_reader_ingest
+from reader_ingest_service import (
+    ReaderIngestError,
+    append_reader_document,
+    rename_reader_document,
+    retry_reader_document,
+    start_reader_ingest,
+)
 
 router = APIRouter()
 
@@ -60,6 +66,36 @@ async def reader_retry(doc_id: int, request: Request):
     mcp_manager = request.app.state.mcp_manager
     try:
         result = await retry_reader_document(request.app.state.db_path, mcp_manager, doc_id)
+        return JSONResponse(result)
+    except ReaderIngestError as exc:
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code)
+
+
+@router.post("/api/reader/documents/{doc_id}/append")
+async def reader_append(doc_id: int, request: Request):
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "Expected a JSON object"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected a JSON object"}, status_code=400)
+    try:
+        result = await append_reader_document(request.app.state.db_path, doc_id, body)
+        return JSONResponse(result)
+    except ReaderIngestError as exc:
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code)
+
+
+@router.patch("/api/reader/documents/{doc_id}")
+async def reader_rename(doc_id: int, request: Request):
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "Expected a JSON object"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected a JSON object"}, status_code=400)
+    try:
+        result = await rename_reader_document(request.app.state.db_path, doc_id, body)
         return JSONResponse(result)
     except ReaderIngestError as exc:
         return JSONResponse({"error": exc.message}, status_code=exc.status_code)
