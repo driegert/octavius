@@ -456,6 +456,7 @@ Core runtime:
 - `settings.py` - env-backed runtime settings and defaults; also loads `models.json` model routing (`_role_chain` / `_role_single`, precedence: defaults < file < env; the reader's second entry is its fallback, read via `_role_single(..., index=1)`)
 - `scripts/octavius-models` - show / check / apply model routing; `check` probes every endpoint's catalog and auth before `apply` will restart
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
+- `media_uploads.py` - streaming/sanitizing/cap logic for `POST /api/media/upload` (client media, e.g. Android), pure functions plus `save_upload`; FastAPI-free and unit-testable on its own
 - `stt.py` - thin STT wrapper
 - `tts.py` - thin TTS wrapper; `speechify` markdown→speech normalization applied at the `synthesize` choke point
 - `vad.py` - Silero VAD ONNX wrapper for server-side voice activity detection
@@ -464,6 +465,7 @@ Route modules:
 
 - `routes/inbox.py` - inbox page and inbox REST API routes
 - `routes/conversations.py` - conversation history API routes
+- `routes/media.py` - `POST /api/media/upload` for non-sidecar clients (Android); thin adapter over `media_uploads.py`
 - `routes/reader_api.py` - reader page and reader REST API routes
 - `routes/vault.py` - vault REST API (`/api/vault/{recent,note,search}`); search proxies the `search_vault` MCP, everything else is local file I/O via `vault_files.py`
 
@@ -539,6 +541,7 @@ Tests:
 - `tests/test_local_tool_vault.py`
 - `tests/test_routes_vault.py`
 - `tests/test_vault_files.py`
+- `tests/test_media_upload.py` - `media_uploads.save_upload` (sanitization, mime resolution, streaming caps) and the `/api/media/upload` route
 - `tests/test_subagent.py`
 - `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
@@ -689,12 +692,33 @@ best-effort — a failure costs retryability, never the document. Both entry
 points (the `/reader` paste box and the agent's `read_document(text=...)`) go
 through `start_text_ingest`, so both get title derivation and persistence.
 
-### Matrix media (image / PDF turns)
+### Media turns (image / PDF) — Matrix and the Android client
 
 The Matrix sidecar (`../matrix-agent-sidecar`) spools attachments to
 `/media/extra_stuff/octavius/matrix_media/` and sends `image_input` /
 `file_input` WS frames — see `docs/ws-media-contract.md` for the frozen
 wire contract both repos implement against.
+
+**Client uploads (2026-09-13)**: a client that isn't the sidecar — today, the
+Android app — has no spool of its own, so it POSTs the file to Octavius first:
+`POST /api/media/upload` (`routes/media.py` / `media_uploads.py`), multipart
+with one `file` part, streamed in chunks (never buffered whole) into
+`settings.media_upload_dir` (`OCTAVIUS_MEDIA_UPLOAD_DIR`, default
+`/media/extra_stuff/octavius/client_media/`) under a sanitized
+`<12-hex>-<name>` filename. The 20 MB/50 MB caps are logical, not an ingress
+limit — Starlette's parser has already received the whole body into its own
+spooled temp file before `save_upload` sees it — so a `Content-Length`-based
+413 before parsing is the only pre-receipt bound (a real guard needs a Caddy
+body-size limit on `octavius.riegert.xyz`, sudo, not done). The response
+(`path`/`mime`/`filename`/`size_bytes`) is what the client then sends
+verbatim in the existing `image_input`/`file_input` WS frame below, but
+those handlers no longer trust it outright: `path` is resolved against the
+`OCTAVIUS_MEDIA_SPOOL_DIRS` allowlist (`media_uploads.resolve_spooled_media`,
+symlinks resolved before the containment check) and `handle_image_input`
+re-stats the file against `IMAGE_MAX_BYTES` rather than trusting
+`size_bytes`; every rejection sends `status: audio_done` too, so a rejected
+frame can't leave a client's turn hanging. Like the Matrix spool, this
+directory is **not garbage-collected yet** — a follow-up.
 
 - **Images** (`image_input`): `websocket_session.handle_image_input`
   base64-reads the spool file and builds an OpenAI-style multimodal content

@@ -644,6 +644,40 @@ ready-with-error handling, bounded poll retries on both clients, list-view offli
 reconciliation and a dialog that stays open on failure on Android. Tests:
 `tests/test_reader_edit.py` (20). Android is compile-validated only.
 
+### Client media upload (2026-09-13)
+
+New `POST /api/media/upload` (`routes/media.py` / `media_uploads.py`) is the
+server half of the frozen `docs/ws-media-contract.md` for clients without a
+spool of their own — the Android app, not the Matrix sidecar. Multipart, one
+`file` part, streamed in chunks into `settings.media_upload_dir`
+(`OCTAVIUS_MEDIA_UPLOAD_DIR`, default `/media/extra_stuff/octavius/client_media/`)
+under a sanitized `<12-hex>-<name>` name; caps enforced while streaming (20 MB
+image / 50 MB other, 413 with the partial file removed); 400 on an empty or
+missing part. The client then sends the response's four fields verbatim in
+the existing `image_input`/`file_input` WS frame — no handler changes needed.
+Like the Matrix spool, this directory is not garbage-collected yet — a
+follow-up. Tests: `tests/test_media_upload.py` (19).
+
+**Review follow-up, same day.** A path allowlist landed for the WS frame side:
+`image_input`/`file_input` now resolve `path` (`media_uploads.resolve_spooled_media`)
+against `settings.media_spool_dirs` (`OCTAVIUS_MEDIA_SPOOL_DIRS`, default the Matrix
+spool plus `media_upload_dir`) instead of trusting a bare existence check — symlinks
+are resolved before the containment check so one can't escape an allowed root, and
+`handle_image_input` re-stats the file on disk against `IMAGE_MAX_BYTES` rather than
+trusting the frame's `size_bytes`. Every rejection branch in both handlers now also
+sends `status: audio_done`, matching `_run_turn_guarded`'s "every path must end the
+turn" rule — without it, a rejected frame left the Android app's Send button and the
+Matrix sidecar's turn state stuck. `routes/media.py` gained a `Content-Length`
+fast-413 before parsing starts and now runs `save_upload` inside `request.form()`'s
+`async with` block (closing its `SpooledTemporaryFile` and fixing a `ResourceWarning`)
+with `max_files=2, max_fields=4`, translating Starlette's `MultiPartException`/
+`HTTPException` to a 400 JSON body instead of a 500. Docs now say plainly that the
+size caps are logical, not an ingress limit: Starlette's parser has already received
+the whole body into its own temp file before `save_upload` ever runs; a real ingress
+guard would be a body-size limit on Caddy's `octavius.riegert.xyz` site block (needs
+sudo; not done). Tests: `tests/test_media_upload.py` (34), plus new/updated cases in
+`tests/test_websocket_session.py`.
+
 ## Reader: pasted text (2026-08-10)
 
 The reader now accepts raw text alongside files, URLs, and inbox items.

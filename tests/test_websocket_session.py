@@ -1,12 +1,27 @@
 import unittest
 import asyncio
+import dataclasses
 import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import media_uploads
 from websocket_session import build_item_chat_context, create_item_conversation
 from websocket_session import WebSocketSessionHandler, WebSocketDisconnect
 from settings import settings
+
+
+def _settings_with_spool_dirs(*dirs):
+    """A `settings` replacement carrying only `media_spool_dirs` overridden.
+
+    Media frame handlers read `settings.media_spool_dirs` at call time, and
+    `Settings` is a frozen dataclass, so tests that spool into a tempdir
+    outside the real allowlist patch `websocket_session.settings` with this
+    rather than mutating the real settings object (which frozen forbids).
+    """
+    return dataclasses.replace(settings, media_spool_dirs=list(dirs))
 
 
 class _FakeHistorySession:
@@ -837,15 +852,83 @@ class ImageInputTests(unittest.TestCase):
             handler._spawn_turn.assert_not_called()
             statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
             self.assertTrue(any("couldn't find" in s for s in statuses))
+            self.assertEqual(statuses[-1], "audio_done")
+
+        asyncio.run(run())
+
+    def test_path_outside_allowlisted_roots_is_rejected(self):
+        """A real, readable file whose path just isn't under any configured
+        spool root must be rejected exactly like a missing one — the
+        allowlist, not existence, is the gate."""
+        async def run():
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as allowed:
+                f = Path(outside) / "cat.png"
+                f.write_bytes(b"\x89PNG\r\n\x1a\nfakepngbytes")
+                with patch("websocket_session.settings", _settings_with_spool_dirs(allowed)):
+                    await handler.handle_image_input(
+                        {"text": "", "path": str(f), "mime": "image/png", "filename": "cat.png"}
+                    )
+            handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("couldn't find" in s for s in statuses))
+            self.assertEqual(statuses[-1], "audio_done")
+
+        asyncio.run(run())
+
+    def test_symlink_escaping_allowlisted_root_is_rejected(self):
+        """A symlink that lives inside the allowed root but points outside it
+        must not be followed into an unauthorized read."""
+        async def run():
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as allowed:
+                secret = Path(outside) / "secret.png"
+                secret.write_bytes(b"\x89PNG\r\n\x1a\nfakepngbytes")
+                link = Path(allowed) / "link.png"
+                link.symlink_to(secret)
+                with patch("websocket_session.settings", _settings_with_spool_dirs(allowed)):
+                    await handler.handle_image_input(
+                        {"text": "", "path": str(link), "mime": "image/png", "filename": "link.png"}
+                    )
+            handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("couldn't find" in s for s in statuses))
+            self.assertEqual(statuses[-1], "audio_done")
+
+        asyncio.run(run())
+
+    def test_oversize_image_rejected_on_actual_disk_size(self):
+        """The frame's size_bytes is never trusted — the file's real size on
+        disk is what gets checked against IMAGE_MAX_BYTES."""
+        async def run():
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            with tempfile.TemporaryDirectory() as allowed, patch.object(
+                media_uploads, "IMAGE_MAX_BYTES", 10
+            ), patch("websocket_session.settings", _settings_with_spool_dirs(allowed)):
+                f = Path(allowed) / "big.png"
+                f.write_bytes(b"x" * 100)
+                await handler.handle_image_input(
+                    # Frame lies and says it's tiny; the handler must check the
+                    # real file, not this.
+                    {"text": "", "path": str(f), "mime": "image/png", "filename": "big.png", "size_bytes": 1}
+                )
+            handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("too large" in s for s in statuses))
+            self.assertEqual(statuses[-1], "audio_done")
 
         asyncio.run(run())
 
     def test_non_image_mime_sends_status_and_does_not_spawn_turn(self):
         async def run():
-            import tempfile
             handler, ws = self._make_handler()
             handler._spawn_turn = unittest.mock.Mock()
-            with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+            with tempfile.NamedTemporaryFile(suffix=".bin") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"not an image")
                 f.flush()
                 await handler.handle_image_input(
@@ -854,13 +937,15 @@ class ImageInputTests(unittest.TestCase):
             handler._spawn_turn.assert_not_called()
             statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
             self.assertTrue(any("isn't an image" in s for s in statuses))
+            # Every early-return branch must end the turn so clients gated on
+            # audio_done (Android's Send button, the Matrix sidecar) don't hang.
+            self.assertEqual(statuses[-1], "audio_done")
 
         asyncio.run(run())
 
     def test_valid_image_spawns_turn_with_vision_content_array(self):
         async def run():
             import base64
-            import tempfile
             handler, ws = self._make_handler()
             captured = {}
 
@@ -871,7 +956,9 @@ class ImageInputTests(unittest.TestCase):
                 captured["attachment"] = attachment
 
             handler._spawn_turn = fake_spawn
-            with tempfile.NamedTemporaryFile(suffix=".png") as f:
+            with tempfile.NamedTemporaryFile(suffix=".png") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"\x89PNG\r\n\x1a\nfakepngbytes")
                 f.flush()
                 await handler.handle_image_input(
@@ -896,13 +983,14 @@ class ImageInputTests(unittest.TestCase):
 
     def test_no_caption_uses_default_vision_text(self):
         async def run():
-            import tempfile
             handler, ws = self._make_handler()
             captured = {}
             handler._spawn_turn = lambda user_text, source, user_content=None, attachment=None: captured.update(
                 user_text=user_text, user_content=user_content
             )
-            with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
+            with tempfile.NamedTemporaryFile(suffix=".jpg") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"fakejpgbytes")
                 f.flush()
                 await handler.handle_image_input(
@@ -930,18 +1018,40 @@ class FileInputTests(unittest.TestCase):
             handler._spawn_turn = unittest.mock.Mock()
             await handler.handle_file_input({"text": "", "path": "", "mime": "application/pdf", "filename": "a.pdf"})
             handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("couldn't find" in s for s in statuses))
+            self.assertEqual(statuses[-1], "audio_done")
+
+        asyncio.run(run())
+
+    def test_path_outside_allowlisted_roots_is_rejected(self):
+        async def run():
+            handler, ws = self._make_handler()
+            handler._spawn_turn = unittest.mock.Mock()
+            with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as allowed:
+                f = Path(outside) / "notes.pdf"
+                f.write_bytes(b"%PDF-1.4 fake")
+                with patch("websocket_session.settings", _settings_with_spool_dirs(allowed)):
+                    await handler.handle_file_input(
+                        {"text": "", "path": str(f), "mime": "application/pdf", "filename": "notes.pdf"}
+                    )
+            handler._spawn_turn.assert_not_called()
+            statuses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "status"]
+            self.assertTrue(any("couldn't find" in s for s in statuses))
+            self.assertEqual(statuses[-1], "audio_done")
 
         asyncio.run(run())
 
     def test_non_pdf_acknowledges_without_docproc_call(self):
         async def run():
-            import tempfile
             handler, ws = self._make_handler()
             captured = {}
             handler._spawn_turn = lambda instruction, source, user_content=None, attachment=None: captured.update(
                 instruction=instruction, source=source, attachment=attachment
             )
-            with tempfile.NamedTemporaryFile(suffix=".docx") as f:
+            with tempfile.NamedTemporaryFile(suffix=".docx") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"not a pdf")
                 f.flush()
                 with patch("websocket_session.docproc_client.submit_job") as submit:
@@ -958,14 +1068,15 @@ class FileInputTests(unittest.TestCase):
 
     def test_pdf_without_caption_submits_and_acks_immediately(self):
         async def run():
-            import tempfile
             from unittest.mock import AsyncMock
             handler, ws = self._make_handler()
             captured = {}
             handler._spawn_turn = lambda instruction, source, user_content=None, attachment=None: captured.update(
                 instruction=instruction, source=source, attachment=attachment
             )
-            with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"%PDF-1.4 fake")
                 f.flush()
                 with patch(
@@ -985,7 +1096,6 @@ class FileInputTests(unittest.TestCase):
 
     def test_pdf_with_caption_schedules_background_poll_not_spawn_turn(self):
         async def run():
-            import tempfile
             from unittest.mock import AsyncMock
             handler, ws = self._make_handler()
             handler._spawn_turn = unittest.mock.Mock()
@@ -996,7 +1106,9 @@ class FileInputTests(unittest.TestCase):
                 coro.close()
                 return None
 
-            with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"%PDF-1.4 fake")
                 f.flush()
                 with (
@@ -1017,13 +1129,14 @@ class FileInputTests(unittest.TestCase):
 
     def test_docproc_submit_failure_acknowledges_error(self):
         async def run():
-            import tempfile
             handler, ws = self._make_handler()
             captured = {}
             handler._spawn_turn = lambda instruction, source, user_content=None, attachment=None: captured.update(
                 instruction=instruction
             )
-            with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as f, patch(
+                "websocket_session.settings", _settings_with_spool_dirs(tempfile.gettempdir())
+            ):
                 f.write(b"%PDF-1.4 fake")
                 f.flush()
                 with patch(

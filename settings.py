@@ -35,6 +35,14 @@ def _env_json(name: str, default):
     return json.loads(raw) if raw else default
 
 
+def _env_str_list(name: str, default: list[str]) -> list[str]:
+    """Colon-separated list env var (PATH-style), e.g. `OCTAVIUS_MEDIA_SPOOL_DIRS`."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return [p for p in raw.split(":") if p]
+
+
 # Optional single-file model routing. Everything else in this module reads
 # os.environ directly and that stays true — this is the ONE file the app loads,
 # and it holds no secrets, only which endpoint serves which alias with which
@@ -147,6 +155,17 @@ class Settings:
     reader: ReaderSettings
     agent_port: int
     downloads_dir: str
+    # Where POST /api/media/upload lands client-uploaded files (Android app
+    # today) before the client sends the existing image_input/file_input WS
+    # frame. See docs/ws-media-contract.md's "Client uploads" section.
+    media_upload_dir: str
+    # Allowlist of directories a WS media frame's `path` may resolve under.
+    # media_uploads.resolve_spooled_media checks this before the image_input/
+    # file_input handlers touch a file named in a frame. Always includes
+    # media_upload_dir (built into the default even when
+    # OCTAVIUS_MEDIA_UPLOAD_DIR overrides it) so a relocated upload dir can't
+    # silently fall outside its own allowlist.
+    media_spool_dirs: list[str]
     max_tool_rounds: int
     max_conversation_messages: int
     tool_labels: dict[str, str]
@@ -740,6 +759,9 @@ def load_settings() -> Settings:
         raise ValueError(
             f"{MODELS_FILE}: roles.reader's fallback entry needs both 'url' and 'model' (or neither)"
         )
+    media_upload_dir = _env_str(
+        "OCTAVIUS_MEDIA_UPLOAD_DIR", "/media/extra_stuff/octavius/client_media/"
+    )
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
         llm_chain=llm_chain,
@@ -749,6 +771,11 @@ def load_settings() -> Settings:
         reader=reader,
         agent_port=_env_int("OCTAVIUS_AGENT_PORT", 8030),
         downloads_dir=_env_str("OCTAVIUS_DOWNLOADS_DIR", "/home/dave/octavius-downloads"),
+        media_upload_dir=media_upload_dir,
+        media_spool_dirs=_env_str_list(
+            "OCTAVIUS_MEDIA_SPOOL_DIRS",
+            ["/media/extra_stuff/octavius/matrix_media", media_upload_dir],
+        ),
         max_tool_rounds=_env_int("OCTAVIUS_MAX_TOOL_ROUNDS", 7),
         max_conversation_messages=_env_int("OCTAVIUS_MAX_CONVERSATION_MESSAGES", 40),
         tool_labels=_env_json("OCTAVIUS_TOOL_LABELS", DEFAULT_TOOL_LABELS),

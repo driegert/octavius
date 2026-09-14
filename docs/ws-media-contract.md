@@ -61,3 +61,26 @@ recorded here for context)
   status / fetch the markdown path for a job id later in the conversation.
 - `file_input` with any other `mime` gets a brief acknowledgement turn (no
   docproc call): Octavius can only process PDFs so far.
+
+## Client uploads (2026-09-13)
+
+Not part of the frozen frame contract above — this is how a client that isn't
+the Matrix sidecar (today, the Android app) gets a file onto the server
+*before* sending the frames described above. The sidecar spools attachments
+itself and never calls this.
+
+`POST /api/media/upload`, multipart with one `file` part, streamed into
+`settings.media_upload_dir` under a sanitized `<12-hex>-<name>` filename (20 MB
+cap for images, 50 MB otherwise; 413 over cap, 400 on an empty/missing part).
+These caps are logical, not an ingress limit — Starlette's multipart parser
+has already received the whole body into its own spooled temp file before the
+handler enforces them — so `routes/media.py` also rejects on `Content-Length`
+before parsing starts, as the only pre-receipt bound. See `routes/media.py` /
+`media_uploads.py`. The response's `path`, `mime`, `filename`, and
+`size_bytes` are exactly the four fields the client then puts into an
+`image_input`/`file_input` frame above. Those handlers don't take the frame's
+`path`/`size_bytes` on faith, though: `path` must resolve under the
+`OCTAVIUS_MEDIA_SPOOL_DIRS` allowlist (`media_uploads.resolve_spooled_media`),
+and `handle_image_input` re-checks the actual file size against
+`IMAGE_MAX_BYTES` — see AGENTS.md's "Media turns" section for the details and
+the accompanying `audio_done`-on-rejection rule.
