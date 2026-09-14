@@ -10,6 +10,22 @@ This document holds change-oriented project status that is useful in the short t
 Keep durable architecture and contributor workflow in `AGENTS.md` (`CLAUDE.md` is a
 symlink to it, so Claude Code and Codex read the same file).
 
+## Image turns crashed the gemma4 hop until its ubatch was raised (2026-09-14)
+
+The first real Android image turn came back "I'm not sure how to respond to that." with
+nothing in Octavius's log but a 200 from `triplestuffed:8010`. The router journal had the
+story: gemma4 hit `GGML_ASSERT(... n_ubatch >= n_tokens_all) "non-causal attention requires
+n_ubatch >= n_tokens"` inside `mtmd_helper_decode_image_chunk`, the instance exited, and
+the router reloaded it — every image request, deterministically, and it took the consult
+subagent primary down with it each time. A gemma4v image is 70-1120 tokens by resolution
+and is decoded as one ubatch; the preset never set `-ub`, so it ran at the default 512.
+Fixed with `ubatch-size = 1152` in `~/.config/llama-router/preset.ini` (router restart,
+Dave). Verified with the same image: 1126 prompt tokens, a real description. Cost:
+3090 headroom 2505 → ~820 MiB. The rule is now in AGENTS.md next to the modality check.
+Octavius itself was unchanged; the 2026-09-13 upload endpoint and the Android client
+worked as designed once the client's own bounds-decode bug was fixed (see the Android
+repo's HANDOFF.md).
+
 ## Routing: gemma4 on triplestuffed takes consults and image turns; reader gains a fallback (2026-09-10)
 
 Newest entry. The "START HERE" section below it is the 2026-08-13 picture and still
