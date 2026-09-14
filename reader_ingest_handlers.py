@@ -20,8 +20,8 @@ from document_sources import (
     is_pdf_response,
     read_text_file,
 )
-from reader_store import create_document, update_document
-from reader_text import ingest_document
+from reader_store import claim_document_for_processing, create_document, get_document, is_replaced, update_document
+from reader_text import append_to_document, ingest_document
 from settings import settings
 
 if TYPE_CHECKING:
@@ -278,6 +278,14 @@ def start_retry_task(
     source_path = doc.get("source_path")
     saved_item_id = doc.get("saved_item_id")
 
+    if is_replaced(doc_id):
+        # The original source was discarded by a `replace` append. Replaying it
+        # would resurrect the sign-in page — or, for a URL, fail on it again
+        # before ingest_document ever got to fold the real text in. The
+        # appendices are the whole document now; with_appendices supplies them.
+        asyncio.create_task(ingest_document_task(db_path, doc_id, "", title))
+        return
+
     if source_type == "pdf":
         if not source_path:
             raise reader_ingest_error_type("Cannot retry PDF document without source_path", status_code=400)
@@ -430,3 +438,74 @@ async def start_inbox_ingest(
         doc_id = create_document(conn, title, "inbox_item", saved_item_id=saved_item_id)
     asyncio.create_task(ingest_document_task(db_path, doc_id, markdown, title))
     return {"id": doc_id, "status": "processing"}
+
+
+def resolve_append_text(
+    text: str | None,
+    path: str | None,
+    reader_ingest_error_type: type["ReaderIngestError"],
+) -> str:
+    """Turn an append request's `text` or `path` into markdown. A path is read
+    the way `start_file_ingest` reads one (HTML goes through trafilatura), so a
+    saved page from the browser appends the same article text a URL would have."""
+    if text is not None and not isinstance(text, str):
+        raise reader_ingest_error_type("text must be a string")
+    if path is not None and not isinstance(path, str):
+        raise reader_ingest_error_type("path must be a string")
+    if text and text.strip():
+        if path:
+            log.warning("Reader: append got both text and path; using text and ignoring %s", path)
+        return text
+    if not path:
+        raise reader_ingest_error_type("Provide text or a file path to append")
+    file_path = Path(path)
+    if not file_path.exists():
+        raise reader_ingest_error_type(f"File not found: {path}", status_code=404)
+    if not file_path.is_file():
+        raise reader_ingest_error_type(f"Not a regular file: {path}")
+    if file_path.suffix.lower() == ".pdf" or is_pdf_file(file_path):
+        raise reader_ingest_error_type("Appending a PDF is not supported; read it as its own document")
+    raw = read_text_file(file_path)
+    if is_likely_html(raw):
+        extracted = extract_article_text(raw, reader_ingest_error_type)
+        if not extracted:
+            raise reader_ingest_error_type("Could not extract article content")
+        return extracted
+    if not raw.strip():
+        raise reader_ingest_error_type("File is empty")
+    return raw
+
+
+async def append_document_task(db_path: str | Path, doc_id: int, text: str, replace: bool, prior_status: str):
+    with connect_db(Path(db_path)) as conn:
+        await append_to_document(conn, doc_id, text, replace=replace, prior_status=prior_status)
+
+
+async def start_append_ingest(
+    db_path: Path,
+    doc_id: int,
+    text: str,
+    reader_ingest_error_type: type["ReaderIngestError"],
+    replace: bool = False,
+) -> dict:
+    """Append `text` to an existing reader document (or replace its content).
+
+    The document must not be mid-ingest. `failed` is allowed on purpose: a URL
+    whose pull hit a sign-in wall fails with "Could not extract article
+    content", and supplying the text by hand is exactly the fix. The status
+    flip is a conditional UPDATE, so two concurrent appends (or an append
+    racing a retry) cannot both launch a job. Persisting the appendix is the
+    background task's job — it happens only once conversion has succeeded, so
+    a failed append leaves nothing behind.
+    """
+    if not (text and text.strip()):
+        raise reader_ingest_error_type("Text is empty")
+    with connect_db(db_path) as conn:
+        doc = get_document(conn, doc_id)
+        if not doc:
+            raise reader_ingest_error_type("Document not found", status_code=404)
+        if not claim_document_for_processing(conn, doc_id):
+            raise reader_ingest_error_type("Document is still processing", status_code=409)
+
+    asyncio.create_task(append_document_task(db_path, doc_id, text, replace, doc["status"]))
+    return {"id": doc_id, "status": "processing", "title": doc["title"], "replace": replace}

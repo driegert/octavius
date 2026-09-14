@@ -35,6 +35,14 @@ def _env_json(name: str, default):
     return json.loads(raw) if raw else default
 
 
+def _env_str_list(name: str, default: list[str]) -> list[str]:
+    """Colon-separated list env var (PATH-style), e.g. `OCTAVIUS_MEDIA_SPOOL_DIRS`."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return [p for p in raw.split(":") if p]
+
+
 # Optional single-file model routing. Everything else in this module reads
 # os.environ directly and that stays true — this is the ONE file the app loads,
 # and it holds no secrets, only which endpoint serves which alias with which
@@ -90,14 +98,19 @@ def _role_chain(role: str, env_var: str, default):
     return entries
 
 
-def _role_single(role: str, key: str, env_var: str, default):
-    """One field of a single-endpoint role (reader, summary), same precedence."""
+def _role_single(role: str, key: str, env_var: str, default, index: int = 0):
+    """One field of a single-endpoint role (reader, summary), same precedence.
+
+    index=1 addresses the optional second entry of a role — the reader's
+    failover target. A missing entry yields `default` (None), so a one-entry
+    role keeps its single-endpoint behaviour.
+    """
     raw = os.getenv(env_var)
     if raw:
         return raw
     entries = _MODEL_ROLES.get(role)
-    if isinstance(entries, list) and entries and isinstance(entries[0], dict):
-        value = entries[0].get(key)
+    if isinstance(entries, list) and len(entries) > index and isinstance(entries[index], dict):
+        value = entries[index].get(key)
         if value:
             return value
     return default
@@ -128,6 +141,8 @@ class ReaderSettings:
     directory: str
     llm_url: str
     llm_model: str
+    llm_fallback_url: str | None = None
+    llm_fallback_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +155,17 @@ class Settings:
     reader: ReaderSettings
     agent_port: int
     downloads_dir: str
+    # Where POST /api/media/upload lands client-uploaded files (Android app
+    # today) before the client sends the existing image_input/file_input WS
+    # frame. See docs/ws-media-contract.md's "Client uploads" section.
+    media_upload_dir: str
+    # Allowlist of directories a WS media frame's `path` may resolve under.
+    # media_uploads.resolve_spooled_media checks this before the image_input/
+    # file_input handlers touch a file named in a frame. Always includes
+    # media_upload_dir (built into the default even when
+    # OCTAVIUS_MEDIA_UPLOAD_DIR overrides it) so a relocated upload dir can't
+    # silently fall outside its own allowlist.
+    media_spool_dirs: list[str]
     max_tool_rounds: int
     max_conversation_messages: int
     tool_labels: dict[str, str]
@@ -273,6 +299,7 @@ DEFAULT_TOOL_LABELS = {
     "get_paper": "Reading Paper",
     "read_document": "Preparing Document",
     "list_reader_documents": "Listing Reader Docs",
+    "append_to_reader_document": "Extending Document",
     "process_pdf": "Processing PDF",
     "consult_specialist": "Consulting Specialist",
     "hybrid_search": "Email Search",
@@ -473,6 +500,11 @@ You have access to tools:
 - list_reader_documents to check what's in the reader and whether in-flight
   PDF conversions have finished. Use when Dave asks "what's in the reader",
   "is that PDF ready yet", or "did the conversion finish".
+- append_to_reader_document to add content to a document already in the reader
+  when the original pull was partial (sign-in pop-up, paywall teaser, truncated
+  page) and Dave supplies the rest, pasted or as a saved file. Pass it verbatim.
+  Use replace=true if what the reader has is junk and should be rebuilt from
+  the new content instead.
 
 Important guidelines for your responses:
 - Response length and formatting depend on the channel Dave is using; a per-turn
@@ -714,6 +746,21 @@ def load_settings() -> Settings:
         # document and running a consult otherwise thrash the router between two
         # resident models.
         llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-general"),
+        # The reader is single-endpoint per call, but the role's second entry is
+        # its failover target (reader_text.py tries it before giving up to
+        # strip_latex). Generation params are NOT read from here: LLMChainClient.
+        # complete() merges per-url params from the MAIN chain, and this url is
+        # also main chain hop 3 — so a fallback attempt inherits whatever params
+        # that entry carries (none today).
+        llm_fallback_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_FALLBACK_URL", None, index=1),
+        llm_fallback_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_FALLBACK_MODEL", None, index=1),
+    )
+    if (reader.llm_fallback_url is None) != (reader.llm_fallback_model is None):
+        raise ValueError(
+            f"{MODELS_FILE}: roles.reader's fallback entry needs both 'url' and 'model' (or neither)"
+        )
+    media_upload_dir = _env_str(
+        "OCTAVIUS_MEDIA_UPLOAD_DIR", "/media/extra_stuff/octavius/client_media/"
     )
     return Settings(
         stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
@@ -724,6 +771,11 @@ def load_settings() -> Settings:
         reader=reader,
         agent_port=_env_int("OCTAVIUS_AGENT_PORT", 8030),
         downloads_dir=_env_str("OCTAVIUS_DOWNLOADS_DIR", "/home/dave/octavius-downloads"),
+        media_upload_dir=media_upload_dir,
+        media_spool_dirs=_env_str_list(
+            "OCTAVIUS_MEDIA_SPOOL_DIRS",
+            ["/media/extra_stuff/octavius/matrix_media", media_upload_dir],
+        ),
         max_tool_rounds=_env_int("OCTAVIUS_MAX_TOOL_ROUNDS", 7),
         max_conversation_messages=_env_int("OCTAVIUS_MAX_CONVERSATION_MESSAGES", 40),
         tool_labels=_env_json("OCTAVIUS_TOOL_LABELS", DEFAULT_TOOL_LABELS),

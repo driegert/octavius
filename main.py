@@ -14,6 +14,7 @@ from mcp_manager import MCPManager
 from settings import settings
 from routes.conversations import router as conversations_router
 from routes.inbox import router as inbox_router
+from routes.media import router as media_router
 from routes.reader_api import router as reader_router
 from routes.vault import router as vault_router
 from reader_store import fail_stale_processing_documents
@@ -81,6 +82,7 @@ def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAU
     app.mount("/static", StaticFiles(directory="static"), name="static")
     app.include_router(inbox_router)
     app.include_router(conversations_router)
+    app.include_router(media_router)
     app.include_router(reader_router)
     app.include_router(vault_router)
     app.state.mcp_manager_factory = mcp_manager_factory

@@ -23,6 +23,18 @@
   const speedVal = document.getElementById('reader-speed-val');
   const voiceSelect = document.getElementById('reader-voice');
   const readAlong = document.getElementById('read-along');
+  const playerEdit = document.getElementById('player-edit');
+  const editBar = document.getElementById('edit-bar');
+  const editBarCaption = document.getElementById('edit-bar-caption');
+  const editTitleInput = document.getElementById('edit-title');
+  const editAppendInput = document.getElementById('edit-append');
+  const editReplaceCheckbox = document.getElementById('edit-replace');
+  const editError = document.getElementById('edit-error');
+  const editHint = document.getElementById('edit-hint');
+  const editCancelBtn = document.getElementById('edit-cancel');
+  const editSaveBtn = document.getElementById('edit-save');
+  const editMountList = document.getElementById('edit-bar-mount-list');
+  const editMountPlayer = document.getElementById('edit-bar-mount-player');
 
   let ws = null;
   let currentDocId = null;
@@ -38,6 +50,10 @@
   let playSeqId = 0;
   let audioEpochArmed = false;
   let seekDebounce = null;
+  let editDocId = null;
+  let editOrigTitle = '';
+  let editContext = null; // 'list' | 'player'
+  let editPollTimer = null;
 
   function enqueuePosition(pos) {
     positionQueue.push(pos);
@@ -151,6 +167,191 @@
     if (currentAudio) currentAudio.playbackRate = parseFloat(speedSlider.value);
   });
 
+  function showEditError(msg) {
+    editError.textContent = msg || '';
+  }
+
+  function openEditBar(docId, title, context, mountEl) {
+    editDocId = docId;
+    editOrigTitle = title || '';
+    editContext = context;
+    editTitleInput.value = title || '';
+    editAppendInput.value = '';
+    editReplaceCheckbox.checked = false;
+    syncEditHint();
+    showEditError('');
+    editBarCaption.textContent = title ? `Editing: ${title}` : '';
+    mountEl.appendChild(editBar);
+    editBar.classList.add('active');
+    editTitleInput.focus();
+  }
+
+  function closeEditBar() {
+    editBar.classList.remove('active');
+    editDocId = null;
+    editContext = null;
+    editTitleInput.value = '';
+    editAppendInput.value = '';
+    editReplaceCheckbox.checked = false;
+    showEditError('');
+  }
+
+  editCancelBtn.addEventListener('click', closeEditBar);
+
+  const HINT_APPEND = 'The text is cleaned and math is converted to speech, then added to the end. Playback position is kept.';
+  const HINT_REPLACE = 'The current content is discarded and the document is rebuilt from this text alone. Playback position resets.';
+  function syncEditHint() {
+    editHint.textContent = editReplaceCheckbox.checked ? HINT_REPLACE : HINT_APPEND;
+  }
+  editReplaceCheckbox.addEventListener('change', syncEditHint);
+
+  // Ctrl/Cmd+Enter submits, matching the paste panel's textarea behavior.
+  editAppendInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) editSaveBtn.click();
+  });
+  editTitleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) editSaveBtn.click();
+  });
+
+  function stopAppendPoll() {
+    clearTimeout(editPollTimer);
+    editPollTimer = null;
+  }
+
+  function startAppendPoll(docId, replace) {
+    stopAppendPoll();
+    readAlong.innerHTML = '<span style="color:#666">Processing appended text\u2026</span>';
+    let failures = 0;
+
+    function showPollError(msg) {
+      readAlong.innerHTML = '<span style="color:#bf6a6a">' + OctaviusApp.escapeHtml(msg) + '</span>';
+    }
+
+    // Transient failures (network blip, a non-JSON error page) retry on the normal
+    // cadence; a run of them stops the poll with a visible message rather than
+    // leaving "Processing…" up forever.
+    function retry() {
+      if (currentDocId !== docId) return;
+      failures++;
+      if (failures >= 5) {
+        editPollTimer = null;
+        showPollError('Lost track of the update \u2014 reopen the document to check.');
+        return;
+      }
+      editPollTimer = setTimeout(poll, 3000);
+    }
+
+    function poll() {
+      if (currentDocId !== docId) return; // stale poll for a doc we've navigated away from
+      fetch(`/api/reader/documents/${docId}`)
+        .then(resp => (resp.ok ? resp.json() : Promise.reject(new Error('HTTP ' + resp.status))))
+        .then(data => {
+          if (currentDocId !== docId) return; // guard again after the await
+          const doc = data.document;
+          if (!doc) { retry(); return; }
+          failures = 0;
+          if (doc.status === 'processing') {
+            editPollTimer = setTimeout(poll, 3000);
+            return;
+          }
+          editPollTimer = null;
+          if (doc.status === 'failed' || doc.error) {
+            // A failed append on a previously-ready document comes back `ready` with
+            // `error` set and its content untouched, so there is nothing to re-render.
+            currentDoc = doc;
+            showPollError(doc.error || 'Append failed.');
+            return;
+          }
+          renderDocument(doc, { preservePosition: !replace });
+        })
+        .catch(retry);
+    }
+    poll();
+  }
+
+  async function saveEdit() {
+    const docId = editDocId;
+    const ctx = editContext;
+    if (docId == null) return;
+
+    const rawTitle = editTitleInput.value.trim();
+    const titleChanged = !!rawTitle && rawTitle !== editOrigTitle;
+    const text = editAppendInput.value.trim();
+    const replace = editReplaceCheckbox.checked;
+
+    if (!titleChanged && !text) {
+      closeEditBar();
+      return;
+    }
+
+    if (text && replace) {
+      if (!confirm('Replace the whole document? Playback position resets.')) return;
+    }
+
+    editSaveBtn.disabled = true;
+    showEditError('');
+    try {
+      if (titleChanged) {
+        const resp = await fetch(`/api/reader/documents/${docId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: rawTitle }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showEditError(resp.status === 409
+            ? 'Still processing \u2014 try again in a moment.'
+            : (data.error || 'Rename failed.'));
+          return;
+        }
+        editOrigTitle = data.title;
+        if (ctx === 'player' && currentDocId === docId) {
+          playerTitle.textContent = data.title;
+          if (currentDoc) currentDoc.title = data.title;
+        }
+      }
+
+      if (text) {
+        if (ctx === 'player' && isPlaying) sendPause();
+        const resp = await fetch(`/api/reader/documents/${docId}/append`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, replace }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          const why = resp.status === 409
+            ? 'Still processing \u2014 try again in a moment.'
+            : (data.error || 'Append failed.');
+          // The rename above already landed; say so rather than implying nothing changed.
+          showEditError(titleChanged ? 'Title saved. ' + why : why);
+          return;
+        }
+        closeEditBar();
+        if (ctx === 'player' && currentDocId === docId) {
+          startAppendPoll(docId, replace);
+        } else {
+          loadDocList();
+        }
+        return;
+      }
+
+      closeEditBar();
+      if (ctx === 'list') loadDocList();
+    } catch (e) {
+      showEditError('Save failed.');
+    } finally {
+      editSaveBtn.disabled = false;
+    }
+  }
+
+  editSaveBtn.addEventListener('click', saveEdit);
+
+  playerEdit.addEventListener('click', () => {
+    if (!currentDocId || !currentDoc) return;
+    openEditBar(currentDocId, currentDoc.title, 'player', editMountPlayer);
+  });
+
   async function loadDocList() {
     let docs = [];
     try {
@@ -168,10 +369,14 @@
         const retryButton = doc.status === 'failed'
           ? '<button class="dc-retry" title="Retry">retry</button>'
           : '';
+        const editButton = (doc.status === 'ready' || doc.status === 'failed')
+          ? '<button class="dc-edit" title="Edit">edit</button>'
+          : '';
         card.innerHTML = `
           <span class="dc-title">${OctaviusApp.escapeHtml(doc.title)}</span>
           <span class="dc-status ${doc.status}">${doc.status}</span>
           ${retryButton}
+          ${editButton}
           <button class="dc-delete" title="Delete">&times;</button>
         `;
         card.addEventListener('click', () => {
@@ -184,6 +389,13 @@
             e.stopPropagation();
             await fetch(`/api/reader/documents/${doc.id}/retry`, { method: 'POST' });
             loadDocList();
+          });
+        }
+        const editEl = card.querySelector('.dc-edit');
+        if (editEl) {
+          editEl.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openEditBar(doc.id, doc.title, 'list', editMountList);
           });
         }
         card.querySelector('.dc-delete').addEventListener('click', async (e) => {
@@ -284,62 +496,80 @@
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pasteSubmit.click();
   });
 
+  // Builds the section list + progress/position state for a document and shows it in the
+  // player. Shared by the initial open and by the append-poll completion, so a document that
+  // grows or is replaced while the player is showing it re-renders the same way it would on
+  // a fresh open. `preservePosition: false` (used after a `replace`) resets to the start.
+  function renderDocument(doc, opts) {
+    const preservePosition = !opts || opts.preservePosition !== false;
+    currentDoc = doc;
+    totalSentences = doc.total_sentences || 0;
+    playerTitle.textContent = doc.title;
+
+    sectionsEl.innerHTML = '';
+    const sections = doc.sections || [];
+    let sentenceOffset = 0;
+    for (const sec of sections) {
+      if (!sec.heading) {
+        sentenceOffset += sec.sentence_count;
+        continue;
+      }
+      const item = document.createElement('div');
+      item.className = 'section-item';
+      item.dataset.chunk = sec.index;
+      item.dataset.sentenceOffset = sentenceOffset;
+      item.textContent = sec.heading;
+      item.addEventListener('click', () => seekTo(sec.index, 0));
+      sectionsEl.appendChild(item);
+      sentenceOffset += sec.sentence_count;
+    }
+
+    progressBar.max = totalSentences;
+    if (preservePosition) {
+      currentChunk = doc.last_chunk || 0;
+      currentSentence = doc.last_sentence || 0;
+    } else {
+      currentChunk = 0;
+      currentSentence = 0;
+    }
+
+    let savedGlobal = 0;
+    for (const sec of sections) {
+      if (sec.index < currentChunk) savedGlobal += sec.sentence_count;
+      else if (sec.index === currentChunk) {
+        savedGlobal += currentSentence;
+        break;
+      }
+    }
+
+    progressBar.value = savedGlobal;
+    progressCur.textContent = savedGlobal;
+    progressTot.textContent = totalSentences;
+    readAlong.innerHTML = currentChunk > 0 || currentSentence > 0
+      ? '<span style="color:#666">Resuming from saved position...</span>'
+      : '';
+    isPlaying = false;
+    playPauseBtn.innerHTML = '&#9654;';
+
+    document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
+    if (currentChunk > 0) {
+      const secEl = document.querySelector(`.section-item[data-chunk="${currentChunk}"]`);
+      if (secEl) secEl.classList.add('active');
+    }
+  }
+
   async function openDocument(docId) {
     try {
       const resp = await fetch(`/api/reader/documents/${docId}`);
       const data = await resp.json();
-      currentDoc = data.document;
       currentDocId = docId;
-      totalSentences = currentDoc.total_sentences || 0;
+      stopAppendPoll();
+      closeEditBar();
 
       listView.style.display = 'none';
       playerDiv.classList.add('active');
-      playerTitle.textContent = currentDoc.title;
 
-      sectionsEl.innerHTML = '';
-      const sections = currentDoc.sections || [];
-      let sentenceOffset = 0;
-      for (const sec of sections) {
-        if (!sec.heading) {
-          sentenceOffset += sec.sentence_count;
-          continue;
-        }
-        const item = document.createElement('div');
-        item.className = 'section-item';
-        item.dataset.chunk = sec.index;
-        item.dataset.sentenceOffset = sentenceOffset;
-        item.textContent = sec.heading;
-        item.addEventListener('click', () => seekTo(sec.index, 0));
-        sectionsEl.appendChild(item);
-        sentenceOffset += sec.sentence_count;
-      }
-
-      progressBar.max = totalSentences;
-      currentChunk = currentDoc.last_chunk || 0;
-      currentSentence = currentDoc.last_sentence || 0;
-
-      let savedGlobal = 0;
-      for (const sec of sections) {
-        if (sec.index < currentChunk) savedGlobal += sec.sentence_count;
-        else if (sec.index === currentChunk) {
-          savedGlobal += currentSentence;
-          break;
-        }
-      }
-
-      progressBar.value = savedGlobal;
-      progressCur.textContent = savedGlobal;
-      progressTot.textContent = totalSentences;
-      readAlong.innerHTML = currentChunk > 0 || currentSentence > 0
-        ? '<span style="color:#666">Resuming from saved position...</span>'
-        : '';
-      isPlaying = false;
-      playPauseBtn.innerHTML = '&#9654;';
-
-      if (currentChunk > 0) {
-        const secEl = document.querySelector(`.section-item[data-chunk="${currentChunk}"]`);
-        if (secEl) secEl.classList.add('active');
-      }
+      renderDocument(data.document, { preservePosition: true });
     } catch (e) {
       console.error('Failed to open document:', e);
     }
@@ -348,6 +578,8 @@
   playerBack.addEventListener('click', () => {
     if (isPlaying) sendPause();
     clearAudioQueue();
+    stopAppendPoll();
+    closeEditBar();
     playerDiv.classList.remove('active');
     listView.style.display = '';
     currentDocId = null;

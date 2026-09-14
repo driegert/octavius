@@ -19,6 +19,7 @@ except ModuleNotFoundError:
     class WebSocketDisconnect(RuntimeError):
         pass
 import docproc_client
+import media_uploads
 from conversation import Conversation
 from reader_playback import stream_reader_audio
 from settings import settings
@@ -386,10 +387,15 @@ class WebSocketSessionHandler:
         """Handle the frozen WS media contract's `image_input` frame.
 
         See docs/ws-media-contract.md. The sidecar has already spooled the
-        file to disk and enforced the size cap — we only validate the path
-        exists and the mime looks like an image, then build an OpenAI-style
-        multimodal content array and route the turn through the vision
-        chain (agent.py's `use_vision` handling in `stream_agent_turn`).
+        file to disk, but the frame's `path` and `size_bytes` are still
+        frame-supplied input: we resolve `path` against
+        `settings.media_spool_dirs` (`media_uploads.resolve_spooled_media`)
+        rather than trusting a bare existence check, check the mime looks
+        like an image, and revalidate the actual file size on disk against
+        `IMAGE_MAX_BYTES` rather than trusting `size_bytes`. Once validated,
+        we build an OpenAI-style multimodal content array and route the turn
+        through the vision chain (agent.py's `use_vision` handling in
+        `stream_agent_turn`).
         Vision routing is sticky: once a thread has carried an image
         (`Conversation.has_images`), its follow-up turns stay on the vision
         chain and the content array stays in the in-memory conversation.
@@ -401,22 +407,43 @@ class WebSocketSessionHandler:
         filename = data.get("filename") or (Path(path).name if path else "image")
         caption = (data.get("text") or "").strip()
 
-        if not path or not Path(path).exists():
-            log.warning("image_input with missing/nonexistent path: %r", path)
+        resolved = media_uploads.resolve_spooled_media(path, settings.media_spool_dirs)
+        if resolved is None:
+            log.warning("image_input with missing/unauthorized path: %r", path)
             await self.send_json("status", "I got notified about an image but couldn't find the file.")
+            await self.send_json("status", "audio_done")
             return
+        path = str(resolved)
         if not mime.startswith("image/"):
             log.warning("image_input with non-image mime %r for %s", mime, path)
             await self.send_json(
                 "status", f"Received '{filename}' but its type ({mime or 'unknown'}) isn't an image I can view."
             )
+            await self.send_json("status", "audio_done")
+            return
+
+        # Revalidate actual size on disk rather than trusting the frame's
+        # size_bytes, which describes what the sidecar/uploader claims to
+        # have spooled, not what's actually sitting at `path`.
+        try:
+            actual_size = resolved.stat().st_size
+        except OSError:
+            log.exception("Failed to stat spooled image at %s", resolved)
+            await self.send_json("status", "Received an image but couldn't read the file.")
+            await self.send_json("status", "audio_done")
+            return
+        if actual_size > media_uploads.IMAGE_MAX_BYTES:
+            log.warning("image_input at %s is %d bytes, over the %d cap", resolved, actual_size, media_uploads.IMAGE_MAX_BYTES)
+            await self.send_json("status", "That image is too large for me to view (max 20 MB).")
+            await self.send_json("status", "audio_done")
             return
 
         try:
-            image_bytes = Path(path).read_bytes()
+            image_bytes = resolved.read_bytes()
         except OSError:
-            log.exception("Failed to read spooled image at %s", path)
+            log.exception("Failed to read spooled image at %s", resolved)
             await self.send_json("status", "Received an image but couldn't read the file.")
+            await self.send_json("status", "audio_done")
             return
 
         b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -443,8 +470,10 @@ class WebSocketSessionHandler:
     async def handle_file_input(self, data: dict):
         """Handle the frozen WS media contract's `file_input` frame.
 
-        See docs/ws-media-contract.md. PDFs are submitted to the docproc
-        queue DETERMINISTICALLY (plain code — not an LLM tool-call decision);
+        See docs/ws-media-contract.md. The frame's `path` is resolved against
+        `settings.media_spool_dirs` (`media_uploads.resolve_spooled_media`)
+        rather than trusted outright. PDFs are submitted to the docproc queue
+        DETERMINISTICALLY (plain code — not an LLM tool-call decision);
         non-PDF files just get a brief acknowledgement since Octavius can't
         process them yet. Unknown/extra frame fields are ignored by
         construction.
@@ -454,10 +483,13 @@ class WebSocketSessionHandler:
         filename = data.get("filename") or (Path(path).name if path else "file")
         caption = (data.get("text") or "").strip()
 
-        if not path or not Path(path).exists():
-            log.warning("file_input with missing/nonexistent path: %r", path)
+        resolved = media_uploads.resolve_spooled_media(path, settings.media_spool_dirs)
+        if resolved is None:
+            log.warning("file_input with missing/unauthorized path: %r", path)
             await self.send_json("status", "I got notified about a file but couldn't find it on disk.")
+            await self.send_json("status", "audio_done")
             return
+        path = str(resolved)
 
         if mime != "application/pdf":
             await self.send_json("transcript", f"[file: {filename}]")

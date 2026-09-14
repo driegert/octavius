@@ -237,6 +237,55 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "append_to_reader_document",
+            "description": (
+                "Add more content to a document that is ALREADY in the reader, "
+                "instead of creating a new one. Use when the original pull came "
+                "back partial or wrong (a sign-in pop-up, a paywall teaser, a "
+                "truncated article) and Dave supplies the rest — by pasting it, "
+                "or by pointing at a saved HTML/markdown file. The new text is "
+                "appended after the existing content and Dave's playback "
+                "position is kept. Set replace=true when the existing content "
+                "is junk (e.g. it captured the sign-in page) and the document "
+                "should be rebuilt from the new text alone. Get the document id "
+                "from list_reader_documents or from the read_document result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {
+                        "type": "integer",
+                        "description": "Id of the reader document to add to.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "The content to add, verbatim (never a summary). "
+                            "Use instead of path when Dave pastes or dictates it."
+                        ),
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path to a saved HTML, markdown, or text file whose "
+                            "content should be added. Use instead of text."
+                        ),
+                    },
+                    "replace": {
+                        "type": "boolean",
+                        "description": (
+                            "Discard the document's existing content and rebuild "
+                            "it from the new content only. Default false (append)."
+                        ),
+                    },
+                },
+                "required": ["document_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_conversation_history",
             "description": (
                 "Search Dave's prior Octavius conversations by semantic meaning, "

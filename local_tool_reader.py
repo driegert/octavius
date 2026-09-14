@@ -12,6 +12,7 @@ from local_tool_inbox import _format_age
 from reader_store import create_document, list_documents
 from reader_text import ingest_document
 from reader_ingest_handlers import ingest_pdf_document, start_text_ingest
+from reader_ingest_service import ReaderIngestError, append_reader_document
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,37 @@ async def read_document(args: dict, session=None, mcp_manager=None) -> str:
     return (
         f"Document '{title}' is being prepared for reading (document #{doc_id}). "
         f"It will be available at /reader in a minute or two."
+    )
+
+
+async def append_to_reader_document(args: dict, session=None, _mcp_manager=None) -> str:
+    """Append text (or a file's contents) to an existing reader document, for
+    when the original pull came back partial — a sign-in wall, a truncated
+    article — and Dave supplies the rest by hand."""
+    # The service opens its own short-lived connection from db_path; that,
+    # not session.conn, is the precondition here.
+    if session is None or not getattr(session, "db_path", None):
+        return "Error: no database connection available."
+    try:
+        doc_id = int(args.get("document_id"))
+    except (TypeError, ValueError):
+        return "Error: document_id (an integer, from list_reader_documents) is required."
+    if not args.get("text") and not args.get("path"):
+        return "Error: provide either text (the content to add) or path (a file to add)."
+
+    try:
+        result = await append_reader_document(Path(session.db_path), doc_id, args)
+    except ReaderIngestError as exc:
+        return f"Error: {exc.message}"
+
+    if result.get("replace"):
+        return (
+            f"'{result['title']}' (document #{doc_id}) is being rebuilt from the new content. "
+            f"It'll be updated at /reader shortly."
+        )
+    return (
+        f"'{result['title']}' (document #{doc_id}) is being extended with the new content. "
+        f"It'll be updated at /reader shortly; Dave's playback position is kept."
     )
 
 

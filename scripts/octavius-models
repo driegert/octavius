@@ -48,7 +48,11 @@ def roles(st) -> dict[str, list[dict]]:
         "main": list(st.llm_chain),
         "subagent": list(st.subagent_llm_chain),
         "vision": list(st.vision_llm_chain),
-        "reader": [{"url": st.reader.llm_url, "model": st.reader.llm_model}],
+        "reader": [
+            {"url": st.reader.llm_url, "model": st.reader.llm_model},
+        ]
+        + ([{"url": st.reader.llm_fallback_url, "model": st.reader.llm_fallback_model}]
+           if st.reader.llm_fallback_url else []),
         "summary": [
             {"url": st.summary_url, "model": st.summary_model},
             {"url": st.summary_fallback_url, "model": st.summary_fallback_model},

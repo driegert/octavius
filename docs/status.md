@@ -7,11 +7,84 @@ This document holds change-oriented project status that is useful in the short t
 - recent bug fixes that should not regress
 - near-term design or implementation pressure
 
-Keep durable architecture and contributor workflow in `CLAUDE.md`.
+Keep durable architecture and contributor workflow in `AGENTS.md` (`CLAUDE.md` is a
+symlink to it, so Claude Code and Codex read the same file).
+
+## Image turns crashed the gemma4 hop until its ubatch was raised (2026-09-14)
+
+The first real Android image turn came back "I'm not sure how to respond to that." with
+nothing in Octavius's log but a 200 from `triplestuffed:8010`. The router journal had the
+story: gemma4 hit `GGML_ASSERT(... n_ubatch >= n_tokens_all) "non-causal attention requires
+n_ubatch >= n_tokens"` inside `mtmd_helper_decode_image_chunk`, the instance exited, and
+the router reloaded it — every image request, deterministically, and it took the consult
+subagent primary down with it each time. A gemma4v image is 70-1120 tokens by resolution
+and is decoded as one ubatch; the preset never set `-ub`, so it ran at the default 512.
+Fixed with `ubatch-size = 1152` in `~/.config/llama-router/preset.ini` (router restart,
+Dave). Verified with the same image: 1126 prompt tokens, a real description. Cost:
+3090 headroom 2505 → ~820 MiB. The rule is now in AGENTS.md next to the modality check.
+Octavius itself was unchanged; the 2026-09-13 upload endpoint and the Android client
+worked as designed once the client's own bounds-decode bug was fixed (see the Android
+repo's HANDOFF.md).
+
+## Routing: gemma4 on triplestuffed takes consults and image turns; reader gains a fallback (2026-09-10)
+
+Newest entry. The "START HERE" section below it is the 2026-08-13 picture and still
+describes the embedding work accurately; routing has moved on since.
+
+**Fleet changes that drove this** (all re-verified by `/v1/models` on 2026-09-10):
+`lilripper:8010` dropped to `--parallel 4`; `lilripper:8020` is now a **vLLM** server
+(`Qwen3.8-27B-AWQ-INT4`, 262k ctx, always warm, no `status.args`); `triplestuffed:8010`
+is back as a working llama.cpp router with `gemma4-26b-a4b` resident (`--parallel 4`,
+262k ctx, image input) — the 2026-08-08 "Positron zombie" is gone; `lilbuddy:8010` lost
+`qwen3-vl-30b-a3b` / `qwen3.6-35b-a3b-q6` and now holds `ling-3.0-flash` (reserved for
+the future `deep_research` domain, deliberately off the voice path).
+
+**Routing now** (`~/.config/octavius/models.json`, symlinked from `config_files`):
+
+| role | primary | fallback(s) |
+|---|---|---|
+| main | `lilripper:8010` 35B | `:8020` 27B → `triplestuffed:8010` gemma4 |
+| subagent (consults) | `triplestuffed:8010` gemma4, capacity 3 | `lilripper:8010` 35B |
+| vision | `triplestuffed:8010` gemma4 | `:8010` 35B → `:8020` 27B |
+| reader | `lilripper:8010` 35B | `triplestuffed:8010` gemma4 (**new**) |
+| summary | `lilripper:8010` 35B | `:8020` 27B |
+
+Every role runs thinking **on and uncapped**. `reasoning_effort: low` was put on the
+three gemma4 entries and removed the same day: measured warm on triplestuffed it trims a
+real question from ~4.6-5.7 s to ~3.6-3.9 s (a quarter to a third) while shortening the
+answers — not worth a knob. gemma4 is fast because it is an A4B. The "~28 s per
+question" figure that briefly justified the cap was the lilbuddy end-to-end number from
+the 08-26 auth incident, not a triplestuffed measurement.
+
+**Why gemma4 for consults:** speed and simplicity (Dave). Consults are only the three
+specialist domains — email, research, tasks. `web_search` / `read_url` are main-agent
+tools and stay on the 35B.
+
+**This closes three Stability Notes below.** Cross-host failover now exists for consults
+(gemma4 primary on triplestuffed, 35B fallback on lilripper), for image turns (same
+shape), and for the reader (first time ever). The remaining hole is the two-host case:
+lilripper *and* triplestuffed both down leaves consults, image turns, and the main
+chain's last hop with nowhere to go. Near-Term Work #4 is done as far as infrastructure
+allows.
+
+**Reader fallback is code, not just config.** `ReaderSettings` gained
+`llm_fallback_url/model`, read from the reader role's *second* `models.json` entry via
+`_role_single(..., index=1)`; a half-configured entry raises at startup.
+`reader_text._llm_convert_math` tries each endpoint in turn before degrading to local
+`strip_latex` — which is what a dead `:8010` used to do to every math chunk, silently.
+`scripts/octavius-models check` probes both entries. Tests: `tests/test_reader.py`
+(`MathConversionTests`) and `tests/test_settings_models_file.py`.
+
+**One dead-config trap found on the way:** `subagent_dispatcher` keeps only the **first**
+`role: fallback` entry (`elif ep.role == "fallback" and fallback is None`). A second
+fallback in the subagent role is silently ignored; one was added on 2026-09-10 and
+removed the same day. The main/vision chains are plain `LLMChainClient` lists and do not
+have this limit.
 
 ## START HERE (2026-08-13)
 
-Everything below this section is history. This is the live picture.
+Everything below this section is history. This was the live picture on 2026-08-13; for
+routing, see the 2026-09-10 entry above.
 
 **State.** `main` is current at `eb196b0`; nothing unmerged, tree clean, 448 tests
 passing, service healthy (`ok`, MCP 8/8). Both lilbuddy and lilripper are up.
@@ -543,6 +616,84 @@ Note the Android client depends on WS behaviour the server did NOT change this s
 (STT/VAD/`audio_done`/empty-transcription semantics are untouched — see CLAUDE.md "Native
 Android client"), so a protocol regression from this session's work is unlikely.
 
+## Reader: append to an existing document (2026-09-13)
+
+A URL pull that hits a sign-in pop-up or paywall teaser used to leave Dave with a
+stub (or a `failed` row) and no way to add the real text short of a new document.
+
+- New agent tool `append_to_reader_document(document_id, text|path, replace?)` and
+  `POST /api/reader/documents/{id}/append`, both through
+  `reader_ingest_service.append_reader_document` → `reader_ingest_handlers.start_append_ingest`.
+- `reader_text.append_to_document` is incremental: only the new text is chunked and
+  math-converted; existing chunks and indices are untouched, so playback position
+  survives. `replace=true` rebuilds from the new text (for when the stub is the sign-in
+  page itself) and resets position.
+- `failed` documents accept appends (that *is* the fix for a failed pull); `processing`
+  ones 409, via a conditional UPDATE so concurrent appends cannot race.
+- Atomic: the appendix file and the speech file are written only after conversion
+  succeeds, so a failed append (LLM down) leaves a `ready` document `ready`, with the
+  failure in `error`, and nothing orphaned on disk. Speech JSON is written temp+rename.
+- Appended blocks persist to `<reader_dir>/appendices/<id>/`, and `ingest_document`
+  folds them onto the base text — so a retry, which replays the original source, no
+  longer drops them. A `REPLACED` marker makes retry skip the discarded source
+  entirely. No schema change.
+- No `/reader` UI affordance yet; the tool and REST route are the surface.
+- Reviewed by the tri-council (Codex / Gemini / pi) before landing; the atomic-append
+  shape, the `REPLACED` marker, the conditional claim, and the strict `replace` parse
+  all came out of that review.
+- Tests: `tests/test_reader_append.py`.
+
+### Reader edit from the UIs (2026-09-13)
+
+Added `PATCH /api/reader/documents/{id} {"title": "..."}` (`rename_reader_document` /
+`reader_text.rename_document`) so a document can be renamed in any status, updating the
+DB row and the speech JSON's stored title (missing speech file is not an error; while
+`processing` the JSON is left to the running job, and `_write_speech` re-reads the row's
+title before writing, so a mid-job rename can neither be clobbered nor clobber). The
+`/reader` page (edit panel on each ready/failed card and in the player, `static/reader-app.js`)
+and the Android client (`EditDocumentDialog`, on `feature/markdown-math` in
+`../octavius-android`) now expose append / replace / rename directly with no agent turn;
+the text still goes through the normal reader pipeline, so it reads like the rest of the
+document. Both clients poll the document until it settles and treat `ready` + `error` as a
+failed append. A tri-council review (Codex + Gemini + pi) drove: the rename race fix, the
+ready-with-error handling, bounded poll retries on both clients, list-view offline-cache
+reconciliation and a dialog that stays open on failure on Android. Tests:
+`tests/test_reader_edit.py` (20). Android is compile-validated only.
+
+### Client media upload (2026-09-13)
+
+New `POST /api/media/upload` (`routes/media.py` / `media_uploads.py`) is the
+server half of the frozen `docs/ws-media-contract.md` for clients without a
+spool of their own — the Android app, not the Matrix sidecar. Multipart, one
+`file` part, streamed in chunks into `settings.media_upload_dir`
+(`OCTAVIUS_MEDIA_UPLOAD_DIR`, default `/media/extra_stuff/octavius/client_media/`)
+under a sanitized `<12-hex>-<name>` name; caps enforced while streaming (20 MB
+image / 50 MB other, 413 with the partial file removed); 400 on an empty or
+missing part. The client then sends the response's four fields verbatim in
+the existing `image_input`/`file_input` WS frame — no handler changes needed.
+Like the Matrix spool, this directory is not garbage-collected yet — a
+follow-up. Tests: `tests/test_media_upload.py` (19).
+
+**Review follow-up, same day.** A path allowlist landed for the WS frame side:
+`image_input`/`file_input` now resolve `path` (`media_uploads.resolve_spooled_media`)
+against `settings.media_spool_dirs` (`OCTAVIUS_MEDIA_SPOOL_DIRS`, default the Matrix
+spool plus `media_upload_dir`) instead of trusting a bare existence check — symlinks
+are resolved before the containment check so one can't escape an allowed root, and
+`handle_image_input` re-stats the file on disk against `IMAGE_MAX_BYTES` rather than
+trusting the frame's `size_bytes`. Every rejection branch in both handlers now also
+sends `status: audio_done`, matching `_run_turn_guarded`'s "every path must end the
+turn" rule — without it, a rejected frame left the Android app's Send button and the
+Matrix sidecar's turn state stuck. `routes/media.py` gained a `Content-Length`
+fast-413 before parsing starts and now runs `save_upload` inside `request.form()`'s
+`async with` block (closing its `SpooledTemporaryFile` and fixing a `ResourceWarning`)
+with `max_files=2, max_fields=4`, translating Starlette's `MultiPartException`/
+`HTTPException` to a 400 JSON body instead of a 500. Docs now say plainly that the
+size caps are logical, not an ingress limit: Starlette's parser has already received
+the whole body into its own temp file before `save_upload` ever runs; a real ingress
+guard would be a body-size limit on Caddy's `octavius.riegert.xyz` site block (needs
+sudo; not done). Tests: `tests/test_media_upload.py` (34), plus new/updated cases in
+`tests/test_websocket_session.py`.
+
 ## Reader: pasted text (2026-08-10)
 
 The reader now accepts raw text alongside files, URLs, and inbox items.
@@ -710,7 +861,7 @@ Operational assumptions worth keeping in mind during debugging:
 - **Memory push was silently dead 2026-07-02 → 2026-07-13 (fixed; should not regress).** When the memory service was extracted to the `agent-memory` repo, `history.py`'s push path kept doing `import memory` for three watermark helpers, so every conversation end logged "Memory client unavailable; skipping push" and skipped the push. The helpers (`get_memory_watermark` / `set_memory_watermark` / `messages_after_watermark`) now live in `history_store.py` — they only touch Octavius's own tables (`conversations.last_extracted_message_id` + `messages`), so Octavius no longer imports anything from agent-memory except over HTTP via `memory_client.py`. Conversations that *ended* during the gap were never mined for facts (push happens at conversation end; watermarks stayed put but closed conversations don't re-push) — a backfill would need a one-off script.
 - **WS disconnects arrive as messages, not exceptions (fixed; should not regress).** Starlette's `ws.receive()` returns a `websocket.disconnect` message; calling `receive()` again raises `RuntimeError`. The run loop used to reach cleanup *through* that RuntimeError, which chained the traceback into every `exc_info` warning logged during cleanup (confusing journal noise). `websocket_session.run` now breaks on the disconnect message itself.
 - **Caddy leaks upstream WS sockets when a client stalls silently (mitigated 2026-07-13).** A downstream client that freezes without dying (phone in Doze: app stops reading, kernel keeps ACKing) blocks Caddy's copy goroutines; when uvicorn's WS ping timeout then closes the upstream leg, Caddy never reaps its side — one CLOSE_WAIT socket to `127.0.0.1:8030` per stalled client (~3/day observed; clean closes and RSTs do NOT leak — verified by live probe). Mitigation: `stream_timeout 24h` in the octavius `reverse_proxy` block in the Caddyfile (safe because the app and PWA both auto-reconnect). A Caddy restart clears any backlog.
-- **Subagent chain has no cross-host failover — and as of 2026-08-08 neither does the vision chain.** `consult_specialist` routes primary `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general` since the 2026-08-13 rebuild, `--parallel 3`, `capacity: 3`) → fallback `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`). The tiers swapped on 2026-07-30 to get consults off the main agent's single-slot `:8020` (see `HANDOFF-matrix-latency.md`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`.
+- **(SUPERSEDED 2026-09-10 — both chains now have a gemma4 primary on triplestuffed with lilripper fallbacks; the reader has a fallback too. Kept for the dispatcher semantics.)** **Subagent chain has no cross-host failover — and as of 2026-08-08 neither does the vision chain.** `consult_specialist` routes primary `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general` since the 2026-08-13 rebuild, `--parallel 3`, `capacity: 3`) → fallback `lilripper:8020` (`qwen3.6-35b-a3b-mtp-general`). The tiers swapped on 2026-07-30 to get consults off the main agent's single-slot `:8020` (see `HANDOFF-matrix-latency.md`). Both tiers are on `lilripper`, so if that host is down the specialist has nowhere to go (the `lilbuddy:8010` / `triplestuffed:8010` tiers were dropped for latency). The dispatcher only tries `[assigned_url, fallback_url]` per call, and `secondary` is concurrency-overflow only — so re-adding resilience means putting a remote host in the **`fallback`** slot, not `secondary`.
 
   The **vision chain** now has the same shape: `lilripper:8020` → `lilripper:8010`. It gained a second entry on 2026-08-08 (it was previously a single `:8010` entry with no failover at all, so this is an improvement, not a regression) — but both are on lilripper. Restoring cross-host vision failover is harder than for subagents: the remote host must accept **image input**, and neither `lilbuddy:8010` nor `triplestuffed:8010` currently does. Until one of them serves a multimodal alias, the third entry doesn't exist to add. The reader (`:8010`) has no failover either and never has.
 
@@ -721,7 +872,7 @@ Operational assumptions worth keeping in mind during debugging:
   - **`:8020` bge-m3 — the embedding primary.** Degraded cleanly: the `workhorse:11434` Ollama fallback stayed up returning 1024-dim vectors, so semantic history/inbox search kept working. It was promoted to primary for the outage and demoted back on 2026-08-12 (see below).
   - **`:8010` — main-chain fallback.** Now the third hop; costs only a fast connect failure while down.
 
-- **triplestuffed:8010 is a zombie (2026-08-08).** `/v1/models` answers `200` in ~1 ms, but `/v1/chat/completions` never returns (>30 s by hand, 120 s `ReadTimeout` in the app) — its GPUs are serving Positron IDE autocomplete/NES models. Reachability checks pass while generation is dead, the same failure shape as the reader's stale `qwen3.5-9b`: **do not treat a `/v1/models` probe as proof an endpoint works.** Removed from the main chain and from the summary chain as a result.
+- **(RESOLVED 2026-09-10 — triplestuffed:8010 is a working llama.cpp router again, serving gemma4-26b-a4b; it is now the subagent/vision primary and main hop 3.)** **triplestuffed:8010 is a zombie (2026-08-08).** `/v1/models` answers `200` in ~1 ms, but `/v1/chat/completions` never returns (>30 s by hand, 120 s `ReadTimeout` in the app) — its GPUs are serving Positron IDE autocomplete/NES models. Reachability checks pass while generation is dead, the same failure shape as the reader's stale `qwen3.5-9b`: **do not treat a `/v1/models` probe as proof an endpoint works.** Removed from the main chain and from the summary chain as a result.
 
   Consequence for the cross-host work: the two hosts that were candidates for the subagent/vision `fallback` slot are exactly these two. Fix the hosts before wiring anything to them, and verify with a real completion, not a model list.
 
@@ -736,7 +887,7 @@ Likely refactor targets, in rough priority order:
 1. Further narrow `main.py` so it remains a routing layer rather than a coordination module.
 2. Reduce the size of the remaining static HTML shells by extracting reusable frontend structure or templates.
 3. Continue replacing coarse integration paths with narrower behavior-level tests where the boundary is now stable.
-4. Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input. **(b) was unblocked on 2026-08-13**: `lilbuddy:8010` now serves `qwen3-vl-30b-a3b`. Verify it actually generates on an image payload before wiring it in — `/v1/models` is not proof. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
+4. **(DONE 2026-09-10, see the entry at the top — remaining hole is the two-host case.)** Restore cross-host failover for the subagent chain (see Stability Notes; Dave flagged 2026-08-08, targeting the next couple of days): decide whether a remote host should occupy the `fallback` slot, and/or extend the dispatcher so more than one host is tried per call. Consider whether `secondary`/`fallback` role semantics should be reworked so cross-host resilience and concurrency overflow aren't mutually exclusive. Two prerequisites are infrastructure-side, not code: (a) the remote host needs a model alias that actually exists there, and (b) for the **vision** chain it must accept image input. **(b) was unblocked on 2026-08-13**: `lilbuddy:8010` now serves `qwen3-vl-30b-a3b`. Verify it actually generates on an image payload before wiring it in — `/v1/models` is not proof. Sequence it as: serve a multimodal alias on `triplestuffed:8010` or `lilbuddy:8010` → add it as the vision `fallback` → then revisit the subagent slot.
 5. **Adopt `OCTAVIUS_LR_API_KEY` (Dave to action; 2026-08-12; var renamed from `OCTAVIUS_8010_API_KEY` 2026-08-21).** The service authenticates to `lilripper:8010` through the older `OCTAVIUS_LLM_API_KEYS` JSON map. That works, so this is hygiene, not an outage — the point is that the bare var is the one that rotates, has no JSON quoting to get wrong, and has a name that survives rotations.
 
    **Resolve the drift first.** Dave's interactive shell exports an `OCTAVIUS_8010_API_KEY` whose value **differs** from the token in `~/.config/octavius/env` (fingerprints `32173c2e…` vs `94745832…`). Probed 2026-08-12: `/v1/models` returns **401 unauthenticated and 200 for *both* tokens** — lilripper:8010 accepts them both, so nothing is broken today, but two live keys for one endpoint is exactly the drift shape that turns into a silent 401 the moment one is revoked. Decide which token is canonical before copying anything. The shell export is not in any dotfile (`.bashrc`/`.profile`/`environment.d`/systemd user env are all clean), so it came from an ad-hoc `export` and will vanish with that terminal.
