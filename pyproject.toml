@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.135.2",
     "httpx>=0.28.1",
+    "hybrid-corpus",
     "mcp>=1.26.0",
     "numpy>=2.0",
     "requests>=2.32",
@@ -16,3 +17,10 @@ dependencies = [
     "websockets>=16.0",
     "onnxruntime>=1.18",
 ]
+
+[tool.uv.sources]
+# Conversation-history search moved off octavius's own legacy vec0 tables onto
+# the shared library (2026-09-15). Same editable path source as mcp-tools uses
+# for server_history.py, so both consumers of this DB run identical search,
+# chunking and embedding code rather than two drifting copies.
+hybrid-corpus = { path = "../hybrid-corpus", editable = true }

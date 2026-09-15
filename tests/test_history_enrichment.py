@@ -114,8 +114,17 @@ class GenerateSummaryTests(unittest.TestCase):
 VECTOR = np.zeros(1024, dtype=np.float32).tobytes()
 
 
-class DetachedEmbeddingTests(unittest.IsolatedAsyncioTestCase):
-    """add_message_async must not put a network round-trip on the turn path."""
+class RetiredEmbedPathTests(unittest.IsolatedAsyncioTestCase):
+    """Recording a message is pure SQLite now.
+
+    This class replaces DetachedEmbeddingTests, which covered the detached
+    embed machinery (`spawn_embedding`, the `_inflight` backlog cap, the
+    root-task lifecycle that survived turn cancellation). All of it was retired
+    on 2026-09-15: history-index.timer owns indexing, so there is no round-trip
+    on the turn path left to detach. What is worth asserting now is the
+    negative — that nothing embeds, nothing is spawned, and the retired helpers
+    fail loudly rather than quietly doing nothing.
+    """
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -124,126 +133,59 @@ class DetachedEmbeddingTests(unittest.IsolatedAsyncioTestCase):
         history.init_db(self.db_path).close()
         self.recorder = history.HistoryRecorder(self.db_path)
 
-    async def asyncTearDown(self):
-        still_pending = await enrichment.drain_inflight(timeout=5.0)
-        leaked = set(enrichment._inflight)
-        enrichment._inflight.clear()
-        # Assert rather than silently clear: a task that outlives its drain is a
-        # lifecycle bug, and clearing the set would hide it.
-        self.assertEqual(still_pending, 0, "a detached embed did not finish")
-        self.assertEqual(leaked, set(), "a detached embed did not deregister itself")
-
     def _session(self):
         session = self.recorder.start_conversation(source="voice")
         self.addCleanup(lambda: session.conn.close() if not session._closed else None)
         return session
 
-    def _vector_count(self):
+    async def test_add_message_async_records_without_embedding(self):
+        session = self._session()
+        with patch.object(enrichment, "embed_text_async") as embed:
+            msg_id = await session.add_message_async(role="user", content="hello")
+        embed.assert_not_called()
         with connect_db(self.db_path) as conn:
-            return conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone()[0]
+            row = conn.execute(
+                "SELECT content FROM messages WHERE id = ?", (msg_id,)
+            ).fetchone()
+        self.assertEqual(row[0], "hello")
 
-    async def test_add_message_async_returns_before_the_embed_lands(self):
+    def test_add_message_records_without_embedding(self):
         session = self._session()
-        gate = asyncio.Event()
-
-        async def slow_embed(text):
-            await gate.wait()
-            return VECTOR
-
-        with patch.object(enrichment, "embed_text_async", side_effect=slow_embed):
-            msg_id = await session.add_message_async(role="user", content="hello")
-            # The row is committed but the vector has not been written yet.
-            with connect_db(self.db_path) as conn:
-                row = conn.execute("SELECT content FROM messages WHERE id = ?", (msg_id,)).fetchone()
-            self.assertEqual(row[0], "hello")
-            self.assertEqual(self._vector_count(), 0)
-
-            gate.set()
-            await enrichment.drain_inflight(timeout=5.0)
-
-        self.assertEqual(self._vector_count(), 1)
-
-    async def test_embed_survives_cancellation_of_the_enclosing_turn(self):
-        """handle_reset cancels turn_task; the embed is a root task, not a child."""
-        session = self._session()
-        gate = asyncio.Event()
-
-        async def slow_embed(text):
-            await gate.wait()
-            return VECTOR
-
-        async def turn():
-            await session.add_message_async(role="assistant", content="reply")
-            await asyncio.sleep(3600)  # stands in for the rest of the turn
-
-        with patch.object(enrichment, "embed_text_async", side_effect=slow_embed):
-            turn_task = asyncio.create_task(turn())
-            await asyncio.sleep(0)  # let it reach the sleep
-            turn_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await turn_task
-
-            gate.set()
-            await enrichment.drain_inflight(timeout=5.0)
-
-        self.assertEqual(self._vector_count(), 1)
-
-    async def test_embed_survives_the_session_connection_closing(self):
-        """The detached task opens its own connection, so end_async closing
-        self.conn must not break an in-flight embed."""
-        session = self._session()
-        gate = asyncio.Event()
-
-        async def slow_embed(text):
-            await gate.wait()
-            return VECTOR
-
-        with patch.object(enrichment, "embed_text_async", side_effect=slow_embed):
-            await session.add_message_async(role="user", content="hello")
-            session.conn.close()
-            session._closed = True
-            gate.set()
-            await enrichment.drain_inflight(timeout=5.0)
-
-        self.assertEqual(self._vector_count(), 1)
-
-    async def test_failed_embed_writes_no_row(self):
-        """No row is the sweeper's pending marker."""
-        session = self._session()
-        with patch.object(enrichment, "embed_text_async", return_value=None):
-            await session.add_message_async(role="user", content="hello")
-            await enrichment.drain_inflight(timeout=5.0)
-        self.assertEqual(self._vector_count(), 0)
-
-    async def test_backlog_cap_skips_rather_than_queues(self):
-        session = self._session()
-        with patch.object(enrichment, "MAX_INFLIGHT_EMBEDS", 0), \
-             patch.object(enrichment, "embed_text_async", return_value=VECTOR) as embed:
-            msg_id = await session.add_message_async(role="user", content="hello")
+        with patch.object(enrichment, "embed_text") as embed:
+            msg_id = session.add_message(role="user", content="hello")
+        embed.assert_not_called()
         self.assertIsNotNone(msg_id)
-        embed.assert_not_called()
-        self.assertEqual(self._vector_count(), 0)
 
-    async def test_concurrent_detached_writes_all_land(self):
-        """Up to MAX_INFLIGHT_EMBEDS workers each open their own sqlite-vec
-        connection and write at once; WAL serializes them and none is lost."""
+    async def test_nothing_is_left_in_flight(self):
         session = self._session()
-        ids = []
-        with patch.object(enrichment, "embed_text_async", return_value=VECTOR):
-            for i in range(enrichment.MAX_INFLIGHT_EMBEDS):
-                ids.append(await session.add_message_async(role="user", content=f"msg {i}"))
-            await enrichment.drain_inflight(timeout=15.0)
+        await session.add_message_async(role="user", content="hello")
+        self.assertEqual(enrichment._inflight, set())
+        self.assertEqual(await enrichment.drain_inflight(timeout=1.0), 0)
 
-        self.assertEqual(len(set(ids)), enrichment.MAX_INFLIGHT_EMBEDS)
-        self.assertEqual(self._vector_count(), enrichment.MAX_INFLIGHT_EMBEDS)
+    def test_the_legacy_schema_no_longer_creates_the_vec0_tables(self):
+        """init_db must not resurrect a table the migration is about to drop."""
+        with connect_db(self.db_path) as conn:
+            names = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        for legacy in ("message_embeddings", "summary_embeddings",
+                       "saved_item_embeddings", "fact_embeddings"):
+            self.assertNotIn(legacy, names)
 
-    async def test_tool_messages_are_never_embedded(self):
-        session = self._session()
-        with patch.object(enrichment, "embed_text_async", return_value=VECTOR) as embed:
-            await session.add_message_async(role="tool", content="tool output")
-            await enrichment.drain_inflight(timeout=5.0)
-        embed.assert_not_called()
-        self.assertEqual(self._vector_count(), 0)
+    def test_retired_helpers_raise(self):
+        for call in (
+            lambda: enrichment.store_embedding(None, "t", "c", 1, "x"),
+            lambda: enrichment.store_embedding_bytes(None, "t", "c", 1, b"x"),
+            lambda: enrichment.spawn_embedding(self.db_path, "t", "c", 1, "x"),
+        ):
+            with self.assertRaises(RuntimeError):
+                call()
+
+    async def test_retired_async_helper_raises(self):
+        with self.assertRaises(RuntimeError):
+            await enrichment.store_embedding_async(None, "t", "c", 1, "x")
 
 
 if __name__ == "__main__":

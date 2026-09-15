@@ -1,56 +1,186 @@
+"""Reads over the octavius history database.
+
+Search moved off this app's own legacy vec0 tables (`message_embeddings`,
+`summary_embeddings`, `saved_item_embeddings`) and onto the shared
+`hybrid-corpus` library on 2026-09-15. The library owns sidecar tables in this
+same file (`history_summaries_*`, `history_saved_items_*`) and
+`history-index.timer` keeps them fresh every 15 minutes; this module only
+queries them. The legacy tables were L2-metric over mixed-norm vectors, with no
+lexical index at all — in-app recall was ranking by vector magnitude rather than
+by meaning.
+
+Everything else here still reads the app-owned tables directly, unchanged.
+`server_history.py` in mcp-tools is the sibling implementation of the same
+search over the same collections; the two are deliberately kept in step.
+"""
+
 import json
+import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from history_enrichment import embed_text, store_embedding
+log = logging.getLogger(__name__)
+
+# Matches list_saved_items' snippet length, so a searched row and a listed row
+# render identically in the inbox UI. (The library's own shape clips at 300.)
+SAVED_ITEM_SNIPPET = 200
+
+CORPUS = "history"
+SUMMARIES = "history_summaries"
+SAVED_ITEMS = "history_saved_items"
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def search_messages_text(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
-    pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT id, conversation_id, role, content, created_at, model
-           FROM messages
-           WHERE content LIKE ?
-           ORDER BY created_at DESC
-           LIMIT ?""",
-        (pattern, limit),
-    ).fetchall()
-    return [
-        {
-            "message_id": row[0], "conversation_id": row[1], "role": row[2],
-            "content": row[3][:300], "created_at": row[4], "model": row[5],
+# --------------------------------------------------------------------------- #
+# hybrid-corpus wiring
+# --------------------------------------------------------------------------- #
+
+_backend_cache: tuple[dict, dict] | None = None
+
+
+def _backend() -> tuple[dict, dict]:
+    """`(adapters, embedders)` for this app's two history collections.
+
+    Resolved lazily and cached: importing this module must not require a
+    readable `sites.toml` or a reachable embedding endpoint, because the test
+    suite imports it with neither. Mirrors `server_history.py`'s module-level
+    `Config.load()` / `get_corpus("history").build(...)` pair.
+    """
+    global _backend_cache
+    if _backend_cache is None:
+        from hybrid_corpus.config import Config
+        from hybrid_corpus.registry import get as get_corpus
+
+        config = Config.load()
+        adapters = {
+            a.collection: a
+            for a in get_corpus(CORPUS).build(config)
+            if a.collection in (SUMMARIES, SAVED_ITEMS)
         }
-        for row in rows
-    ]
+        embedders = {name: config.profile(name).client() for name in adapters}
+        _backend_cache = (adapters, embedders)
+    return _backend_cache
 
 
-def search_messages(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
-    query_bytes = embed_text(query)
-    if query_bytes is None:
-        return search_messages_text(conn, query, limit)
+def set_search_backend(adapters: dict | None, embedders: dict | None = None) -> None:
+    """Inject adapters/embedders; `set_search_backend(None)` restores the real
+    ones. Tests use this with `hybrid_corpus.embed.FakeEmbedder` so the suite
+    never reaches the network.
+    """
+    global _backend_cache
+    _backend_cache = None if adapters is None else (adapters, embedders or {})
 
-    rows = conn.execute(
-        """SELECT m.id, m.conversation_id, m.role, m.content, m.created_at,
-                  m.model, vec_distance_cosine(me.embedding, ?) as distance
-           FROM messages m
-           JOIN message_embeddings me ON m.id = me.message_id
-           WHERE me.embedding IS NOT NULL
-           ORDER BY distance ASC
-           LIMIT ?""",
-        (query_bytes, limit),
-    ).fetchall()
-    return [
-        {
-            "message_id": row[0], "conversation_id": row[1], "role": row[2],
-            "content": row[3][:300], "created_at": row[4], "model": row[5],
-            "distance": row[6],
-        }
-        for row in rows
-    ]
+
+@contextmanager
+def _library_conn(conn: sqlite3.Connection):
+    """Present an octavius connection the way `hybrid_corpus.db.connect` would.
+
+    The library's `hydrate()` does `dict(row)` and `row["unit_id"]`, and its
+    `atomic()` drives transactions with an explicit `BEGIN IMMEDIATE`; both need
+    the settings that `hybrid_corpus.db.connect` applies and `db.connect_db`
+    does not. Set them for the duration of the call and put them back, rather
+    than changing `db.connect` globally — every other query in this app indexes
+    its rows positionally.
+    """
+    prev_factory = conn.row_factory
+    prev_isolation = conn.isolation_level
+    conn.row_factory = sqlite3.Row
+    conn.isolation_level = None
+    try:
+        yield conn
+    finally:
+        conn.row_factory = prev_factory
+        conn.isolation_level = prev_isolation
+
+
+def assert_history_serveable(conn: sqlite3.Connection, db_path) -> None:
+    """Refuse to start if conversation search cannot actually work. Raises.
+
+    Two failure modes this closes, both of which are otherwise silent — search
+    keeps answering, just with stale or meaningless rankings:
+
+    1. **Path drift.** `sites.toml [corpora.history] database` is the file
+       `history-index.timer` keeps indexed; `OCTAVIUS_DB_PATH` is the file this
+       app opens. Two sources of truth for one path is exactly the config-drift
+       shape this migration exists to remove, so they are compared rather than
+       assumed, and a mismatch is fatal here instead of being discovered as
+       "search results stopped including anything recent".
+
+    2. **Bad sidecars.** `assert_serveable` is the library's own pre-serve gate:
+       the collection exists, its vec0 table's stored DDL declares
+       `distance_metric=cosine` (the restored-backup tripwire — reading the DDL
+       rather than a meta row is deliberate, since a hand-edited meta row can
+       lie), and `hc_index_meta`'s model/dim agree with the running config.
+
+    Called from `main.py`'s lifespan; `create_app(verify_search=...)` injects a
+    no-op for tests that run against a throwaway database.
+    """
+    from pathlib import Path
+
+    from hybrid_corpus.config import Config
+    from hybrid_corpus.db import assert_serveable
+
+    configured = Path(Config.load().site(CORPUS).database).expanduser().resolve()
+    opened = Path(db_path).expanduser().resolve()
+    if configured != opened:
+        raise RuntimeError(
+            f"history database path drift: octavius opens {opened}, but "
+            f"sites.toml [corpora.history] database is {configured}. "
+            f"history-index.timer indexes the latter, so in-app search would "
+            f"serve a file nothing is indexing. Fix OCTAVIUS_DB_PATH or sites.toml."
+        )
+
+    adapters, embedders = _backend()
+    with _library_conn(conn):
+        for collection in (SUMMARIES, SAVED_ITEMS):
+            embedder = embedders.get(collection)
+            assert_serveable(
+                conn, collection,
+                model=getattr(embedder, "model", None),
+                dim=getattr(embedder, "dim", None),
+                hard_max=getattr(adapters[collection], "hard_max", None),
+            )
+    log.info("History search ready: %s, %s over %s",
+             SUMMARIES, SAVED_ITEMS, opened)
+
+
+def _hybrid_search(conn: sqlite3.Connection, collection: str, query: str,
+                   limit: int, filter_spec) -> list[dict]:
+    """One library search, shaped by the collection's adapter.
+
+    `search()` owns the degradation contract: an embedder outage runs the
+    lexical arm alone and comes back with `degraded=True` — it neither raises
+    nor silently returns `[]` (both were live octavius behaviours before this
+    change). If the embedder cannot even be constructed, we ask for lexical-only
+    explicitly rather than letting a config/network error escape into a voice
+    turn. A `NotServeable` refusal is deliberately NOT swallowed: that means the
+    sidecars are missing or mis-built, which `assert_history_serveable` is
+    supposed to have caught at startup.
+    """
+    from hybrid_corpus.search import hydrate, search
+
+    adapters, embedders = _backend()
+    adapter = adapters[collection]
+    try:
+        embedder = embedders[collection]
+    except Exception:  # noqa: BLE001 - lexical-only beats failing the turn
+        log.warning("%s: no embedder available; searching lexical-only", collection,
+                    exc_info=True)
+        embedder = None
+
+    with _library_conn(conn):
+        result = search(conn, collection, query, embedder,
+                        limit=limit, filter_spec=filter_spec, collapse=True)
+        if result.degraded:
+            log.warning(
+                "%s: embedding chain unavailable, returning lexical-only results "
+                "for %r (%d hit(s))", collection, query[:80], len(result.hits),
+            )
+        return hydrate(conn, adapter, result.hits)
 
 
 def _conversation_tags(conn: sqlite3.Connection, conversation_id: int) -> list[str]:
@@ -63,6 +193,44 @@ def _conversation_tags(conn: sqlite3.Connection, conversation_id: int) -> list[s
     return [row[0] for row in rows]
 
 
+def _summaries_filter(service: str | None, source: str | None, since: str | None):
+    """`service` via the adapter; `source`/`since` AND-ed on as extra clauses.
+
+    The shared adapter models only `service` (the MCP shim has no source/since
+    parameters), and its `filters()` raises `TypeError` on an unknown kwarg
+    precisely so a mistyped filter cannot widen a search — so these two
+    octavius-only filters are composed here instead of being passed in. They use
+    the same `u` alias `FilterSpec` requires, and every caller-supplied value
+    goes through `params`, never into the SQL fragment.
+    """
+    from hybrid_corpus.adapter import FilterSpec
+
+    adapters, _ = _backend()
+    base = adapters[SUMMARIES].filters(service=service)
+    clauses: list[str] = []
+    params: list = []
+    if base is not None:
+        clauses.append(base.sql)
+        params.extend(base.params)
+    if source:
+        clauses.append(
+            "u.source_id IN (SELECT CAST(id AS TEXT) FROM conversations WHERE source = ?)"
+        )
+        params.append(source)
+    if since:
+        clauses.append(
+            "u.source_id IN (SELECT CAST(id AS TEXT) FROM conversations"
+            " WHERE started_at >= ?)"
+        )
+        params.append(since)
+    if not clauses:
+        return None
+    return FilterSpec(
+        sql=" AND ".join(clauses), params=tuple(params),
+        description=f"service={service} source={source} since={since}",
+    )
+
+
 def search_conversations(
     conn: sqlite3.Connection,
     query: str,
@@ -71,65 +239,21 @@ def search_conversations(
     source: str | None = None,
     since: str | None = None,
 ) -> list[dict]:
-    query_bytes = embed_text(query)
-    if query_bytes is None:
-        pattern = f"%{query}%"
-        sql = """SELECT id, session_id, started_at, ended_at, service, source,
-                        summary, model, message_count
-                 FROM conversations
-                 WHERE summary LIKE ?"""
-        params: list = [pattern]
-        if service:
-            sql += " AND service = ?"
-            params.append(service)
-        if source:
-            sql += " AND source = ?"
-            params.append(source)
-        if since:
-            sql += " AND started_at >= ?"
-            params.append(since)
-        sql += " ORDER BY started_at DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
-    else:
-        sql = """SELECT c.id, c.session_id, c.started_at, c.ended_at,
-                        c.service, c.source, c.summary, c.model, c.message_count,
-                        vec_distance_cosine(se.embedding, ?) as distance
-                 FROM conversations c
-                 JOIN summary_embeddings se ON c.id = se.conversation_id
-                 WHERE se.embedding IS NOT NULL"""
-        params = [query_bytes]
-        if service:
-            sql += " AND c.service = ?"
-            params.append(service)
-        if source:
-            sql += " AND c.source = ?"
-            params.append(source)
-        if since:
-            sql += " AND c.started_at >= ?"
-            params.append(since)
-        sql += " ORDER BY distance ASC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
+    """Hybrid search over conversation summaries (`history_summaries`).
 
-    results = []
-    for row in rows:
-        item = {
-            "conversation_id": row[0],
-            "session_id": row[1][:8],
-            "started_at": row[2],
-            "ended_at": row[3],
-            "service": row[4],
-            "source": row[5],
-            "summary": row[6],
-            "model": row[7],
-            "message_count": row[8],
-            "tags": _conversation_tags(conn, row[0]),
-        }
-        if len(row) > 9:
-            item["distance"] = row[9]
-        results.append(item)
-    return results
+    Same signature and same result keys as the legacy summary-embedding
+    version — `conversation_id`, `session_id` (8 chars), `started_at`,
+    `ended_at`, `service`, `source`, `summary`, `model`, `message_count`,
+    `tags`, and `distance` — plus the library's additive `score`/`unit_id` and
+    the conversation's token/duration totals.
+
+    One behaviour note for `agent.py`'s recall cutoff: results now also arrive
+    from a BM25 arm, and a hit found by that arm alone carries no `distance`.
+    Both callers already treat a missing `distance` as "keep", which is the
+    right answer — there was no lexical arm at all before.
+    """
+    return _hybrid_search(conn, SUMMARIES, query, limit,
+                          _summaries_filter(service, source, since))
 
 
 def list_conversations(
@@ -292,9 +416,41 @@ def save_item(
     )
     conn.commit()
     item_id = cursor.lastrowid
-    embed_text_value = f"{title}\n{content[:500]}"
-    store_embedding(conn, "saved_item_embeddings", "saved_item_id", item_id, embed_text_value)
+    index_saved_item(conn, item_id)
     return item_id
+
+
+def index_saved_item(conn: sqlite3.Connection, item_id: int) -> bool:
+    """Index a just-written `saved_items` row through the library's `Indexer`.
+
+    Same shape as `server_history.py`'s `save_to_inbox`: the app owns the row
+    and has already committed it, so an indexing failure must never turn into a
+    failed save. The row is keyword-searchable immediately — the FTS entry is
+    written in the same transaction as the unit — and only the vector is owed,
+    which the next `hybrid-corpus run history` (history-index.timer, 15 min)
+    collects. Returns whether the vector landed.
+
+    This replaces the old `saved_item_embeddings` write, which embedded only
+    `title + content[:500]`; the adapter chunks the whole item.
+    """
+    try:
+        from hybrid_corpus.index import Indexer
+
+        adapters, embedders = _backend()
+        with _library_conn(conn):
+            indexer = Indexer(conn, adapters[SAVED_ITEMS], embedders[SAVED_ITEMS])
+            indexer.ensure()  # idempotent; creates the sidecars on first use
+            written = indexer.index_source(str(item_id))
+        if written.pending:
+            log.warning(
+                "Saved item %s stored; its embedding is pending and will be "
+                "collected by history-index.timer", item_id,
+            )
+        return not written.pending
+    except Exception:  # noqa: BLE001 - the item saved; indexing is the recoverable part
+        log.warning("Saved item %s stored but could not be indexed", item_id,
+                    exc_info=True)
+        return False
 
 
 def list_saved_items(
@@ -335,45 +491,42 @@ def list_saved_items(
 
 
 def search_saved_items(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
-    query_bytes = embed_text(query)
-    if query_bytes is None:
-        pattern = f"%{query}%"
+    """Hybrid search over saved inbox items (`history_saved_items`).
+
+    `filters()` is always passed even with no arguments: for this collection it
+    never returns `None`, because "no status given" means "everything except
+    dismissed" — the same default the legacy `status != 'dismissed'` clause had.
+    Dropping it would start surfacing dismissed items.
+    """
+    adapters, _ = _backend()
+    items = _hybrid_search(conn, SAVED_ITEMS, query, limit,
+                           adapters[SAVED_ITEMS].filters())
+    _restore_octavius_item_shape(conn, items)
+    return items
+
+
+def _restore_octavius_item_shape(conn: sqlite3.Connection, items: list[dict]) -> None:
+    """Put back the two things the shared shape does not carry.
+
+    `shape_hit` is written for the MCP `search_inbox` tool, which has no
+    `conversation_id`; octavius's inbox rows always had one, so it is re-read
+    here rather than quietly dropped from the API response. `content` is also
+    re-clipped to this app's snippet length — note it is the *matching chunk*
+    now, not `content[:200]` from position 0, which is the point of the move.
+    """
+    ids = [it["id"] for it in items if it.get("id") is not None]
+    mapping: dict = {}
+    if ids:
+        placeholders = ",".join("?" * len(ids))
         rows = conn.execute(
-            """SELECT id, conversation_id, item_type, title, content, source_url,
-                      metadata, status, created_at
-               FROM saved_items
-               WHERE (title LIKE ? OR content LIKE ?) AND status != 'dismissed'
-               ORDER BY created_at DESC LIMIT ?""",
-            (pattern, pattern, limit),
+            f"SELECT id, conversation_id FROM saved_items WHERE id IN ({placeholders})",
+            ids,
         ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT s.id, s.conversation_id, s.item_type, s.title, s.content,
-                      s.source_url, s.metadata, s.status, s.created_at,
-                      vec_distance_cosine(e.embedding, ?) as distance
-               FROM saved_items s
-               JOIN saved_item_embeddings e ON s.id = e.saved_item_id
-               WHERE s.status != 'dismissed'
-               ORDER BY distance ASC LIMIT ?""",
-            (query_bytes, limit),
-        ).fetchall()
-    results = []
-    for row in rows:
-        item = {
-            "id": row[0],
-            "conversation_id": row[1],
-            "item_type": row[2],
-            "title": row[3],
-            "content": row[4][:200],
-            "source_url": row[5],
-            "metadata": json.loads(row[6]) if row[6] else None,
-            "status": row[7],
-            "created_at": row[8],
-        }
-        if len(row) > 9:
-            item["distance"] = row[9]
-        results.append(item)
-    return results
+        mapping = {row[0]: row[1] for row in rows}
+    for item in items:
+        item["conversation_id"] = mapping.get(item.get("id"))
+        if isinstance(item.get("content"), str):
+            item["content"] = item["content"][:SAVED_ITEM_SNIPPET]
 
 
 def get_saved_item(conn: sqlite3.Connection, item_id: int) -> dict | None:
@@ -465,34 +618,3 @@ def messages_after_watermark(conn: sqlite3.Connection, conversation_id: int,
     msgs = [{"id": r[0], "role": r[1], "content": r[2]} for r in rows]
     max_id = max((r[0] for r in rows), default=watermark)
     return msgs, max_id
-
-
-def get_stats(conn: sqlite3.Connection) -> dict:
-    total_convs = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-    total_msgs = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    total_tool_calls = conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
-    total_embeddings = conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone()[0]
-    by_service = conn.execute("SELECT service, COUNT(*) FROM conversations GROUP BY service").fetchall()
-    by_source = conn.execute("SELECT source, COUNT(*) FROM conversations GROUP BY source").fetchall()
-    by_role = conn.execute("SELECT role, COUNT(*) FROM messages GROUP BY role").fetchall()
-    top_tools = conn.execute(
-        """SELECT tool_name, COUNT(*) as cnt FROM tool_calls
-           GROUP BY tool_name ORDER BY cnt DESC LIMIT 10"""
-    ).fetchall()
-    top_tags = conn.execute(
-        """SELECT t.name, COUNT(*) as cnt FROM tags t
-           JOIN conversation_tags ct ON t.id = ct.tag_id
-           GROUP BY t.name ORDER BY cnt DESC LIMIT 10"""
-    ).fetchall()
-    return {
-        "total_conversations": total_convs,
-        "total_messages": total_msgs,
-        "total_tool_calls": total_tool_calls,
-        "total_embeddings": total_embeddings,
-        "embedding_coverage": f"{total_embeddings / total_msgs * 100:.1f}%" if total_msgs else "0%",
-        "conversations_by_service": {row[0]: row[1] for row in by_service},
-        "conversations_by_source": {row[0]: row[1] for row in by_source},
-        "messages_by_role": {row[0]: row[1] for row in by_role},
-        "top_tools": {row[0]: row[1] for row in top_tools},
-        "top_tags": {row[0]: row[1] for row in top_tags},
-    }

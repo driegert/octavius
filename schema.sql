@@ -95,18 +95,6 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE INDEX IF NOT EXISTS idx_attachments_message
     ON attachments(message_id);
 
--- Embeddings (sqlite-vec) — message-level semantic search
-CREATE VIRTUAL TABLE IF NOT EXISTS message_embeddings USING vec0(
-    message_id INTEGER PRIMARY KEY,
-    embedding  float[1024]
-);
-
--- Embeddings (sqlite-vec) — conversation summary search
-CREATE VIRTUAL TABLE IF NOT EXISTS summary_embeddings USING vec0(
-    conversation_id INTEGER PRIMARY KEY,
-    embedding       float[1024]
-);
-
 -- Saved items (knowledge inbox)
 CREATE TABLE IF NOT EXISTS saved_items (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,12 +112,6 @@ CREATE TABLE IF NOT EXISTS saved_items (
 
 CREATE INDEX IF NOT EXISTS idx_saved_items_status
     ON saved_items(status, created_at);
-
--- Embeddings (sqlite-vec) — saved item semantic search
-CREATE VIRTUAL TABLE IF NOT EXISTS saved_item_embeddings USING vec0(
-    saved_item_id INTEGER PRIMARY KEY,
-    embedding     float[1024]
-);
 
 -- Reader documents (document-to-speech pipeline)
 CREATE TABLE IF NOT EXISTS reader_documents (
@@ -225,12 +207,6 @@ CREATE TABLE IF NOT EXISTS memory_fact_sources (
 CREATE INDEX IF NOT EXISTS idx_memory_fact_sources_conv
     ON memory_fact_sources(conversation_id);
 
--- Embeddings (sqlite-vec) — fact-level: write-time near-dup merge + read-time retrieval.
-CREATE VIRTUAL TABLE IF NOT EXISTS fact_embeddings USING vec0(
-    fact_id   INTEGER PRIMARY KEY,
-    embedding float[1024]
-);
-
 -- Maintained profile doc (global synthesis). Single row (id=1):
 --   Block 1 (identity) is re-rendered deterministically from live facts at injection time;
 --   Block 2 (themes) is the LLM rollup, regenerated on the event counter.
@@ -243,3 +219,16 @@ CREATE TABLE IF NOT EXISTS memory_profile (
 
 INSERT OR IGNORE INTO memory_profile (id, content, generated_at, source_count)
     VALUES (1, NULL, NULL, 0);
+
+-- Legacy sqlite-vec embedding tables removed 2026-09-15.
+--
+-- message_embeddings, summary_embeddings, saved_item_embeddings and
+-- fact_embeddings lived here and were recreated by init_db() on every boot.
+-- Search moved to the hybrid-corpus library, which owns its own sidecars in
+-- this same database (history_messages_*, history_summaries_*,
+-- history_saved_items_*, plus hc_index_meta) and keeps them fresh from
+-- history-index.timer. Leaving the CREATEs in place would silently rebuild
+-- empty L2-metric tables the moment the old ones are dropped, so they are gone
+-- rather than commented in. The library creates and migrates its own tables;
+-- nothing in this file should describe them.
+

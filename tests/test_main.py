@@ -87,10 +87,6 @@ def _init_inbox_delete_db(db_path: Path):
         CREATE TABLE saved_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT
         );
-        CREATE TABLE saved_item_embeddings (
-            saved_item_id INTEGER PRIMARY KEY,
-            embedding BLOB
-        );
         CREATE TABLE reader_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
@@ -117,20 +113,28 @@ def _init_inbox_delete_db(db_path: Path):
 def _isolated_app(factory):
     """Point the module-global app at a throwaway DB for the duration.
 
-    db_path matters as much as db_init here: the lifespan hands db_path to
-    background work (the embedding sweeper), so leaving it at DEFAULT_DB_PATH
-    would run sweeps against the real octavius_history.db during unit tests.
+    db_path matters as much as db_init here: the lifespan hands db_path on to
+    other startup work, so leaving it at DEFAULT_DB_PATH would let a unit test
+    touch the real octavius_history.db.
+
+    verify_search is stubbed out for the same reason. In production it is
+    history_store.assert_history_serveable, which deliberately refuses to start
+    when the opened database is not the one sites.toml names and keeps indexed —
+    a throwaway temp DB is exactly that case, and that refusal is the point.
     """
     state = main.app.state
-    originals = (state.mcp_manager_factory, state.db_init, state.db_path)
+    originals = (state.mcp_manager_factory, state.db_init, state.db_path,
+                 state.verify_search)
     with tempfile.TemporaryDirectory() as tmpdir:
         state.mcp_manager_factory = factory
         state.db_init = lambda: _FakeConn()
         state.db_path = Path(tmpdir) / "history.db"
+        state.verify_search = lambda conn, db_path: None
         try:
             yield
         finally:
-            (state.mcp_manager_factory, state.db_init, state.db_path) = originals
+            (state.mcp_manager_factory, state.db_init, state.db_path,
+             state.verify_search) = originals
 
 
 @unittest.skipIf(TestClient is None or main is None, "fastapi dependency not installed")
@@ -199,6 +203,7 @@ class MainTests(unittest.TestCase):
                 mcp_manager_factory=_FakeMCPManager,
                 db_init=lambda: _init_inbox_delete_db(db_path),
                 db_path=db_path,
+                verify_search=lambda conn, path: None,
             )
 
             with TestClient(app) as client:

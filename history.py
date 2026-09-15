@@ -1,4 +1,14 @@
-"""Octavius conversation history — SQLite + sqlite-vec storage."""
+"""Octavius conversation history — SQLite storage.
+
+This module records turns; it no longer embeds them. Indexing for search
+moved to the `hybrid-corpus` library on 2026-09-15: `history-index.timer`
+runs `hybrid-corpus run history` every 15 minutes, fingerprints `messages`,
+`conversations` and `saved_items`, and embeds whatever changed into the
+library-owned sidecar tables in this same database. Recording a message is
+therefore pure SQLite again, with no network round-trip anywhere near the
+voice turn — which is what `add_message_async`'s detached-embed machinery
+and the background sweeper both existed to work around.
+"""
 
 import json
 import logging
@@ -15,22 +25,16 @@ from history_enrichment import (
     generate_summary,
     generate_tags_async,
     generate_tags,
-    spawn_embedding,
-    store_embedding_async,
-    store_embedding,
 )
 from history_store import (
     get_conversation_messages,
     get_item_chat_conversation_id,
     get_memory_watermark,
     get_saved_item,
-    get_stats,
     list_saved_items,
     messages_after_watermark,
     save_item,
     search_conversations,
-    search_messages,
-    search_messages_text,
     search_saved_items,
     set_item_chat_conversation,
     set_memory_watermark,
@@ -73,11 +77,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         )
         log.info("Migration: added conversations.last_extracted_message_id")
     if "indexed" not in cols:
-        # Records whether the summariser judged this conversation worth indexing.
-        # Without it a missing summary_embeddings row is ambiguous — "skipped on
-        # purpose" and "the embedder was down" look identical, so the sweeper
-        # can't tell which rows to repair. NULL means legacy/unknown and is
-        # never swept.
+        # Records whether the summariser judged this conversation worth
+        # indexing. It was introduced to disambiguate a missing legacy vector
+        # ("skipped on purpose" vs "the embedder was down") for the retired
+        # sweeper. The column is still written, and still read by
+        # conversations listings, but it no longer gates any embedding: the
+        # library indexes every conversation that has a non-empty summary.
         conn.execute("ALTER TABLE conversations ADD COLUMN indexed INTEGER")
         log.info("Migration: added conversations.indexed")
 
@@ -108,7 +113,7 @@ class HistoryRecorder:
             result_summary="Found 15 works...", result_size=4200, duration_ms=340,
         )
 
-        await session.end_async()  # generates summary, tags, and embeddings
+        await session.end_async()  # generates summary and tags
     """
 
     def __init__(self, db_path: Path = DEFAULT_DB_PATH):
@@ -210,12 +215,10 @@ class ConversationSession:
             tts_model=tts_model,
         )
 
-        # Embeds inline and therefore blocks. That is left as-is: there is no
-        # running loop to detach into from a sync caller. Anything on the voice
-        # turn path must use add_message_async, which spawns the embed instead.
-        if role in ("user", "assistant") and content:
-            store_embedding(self.conn, "message_embeddings", "message_id", msg_id, content)
-
+        # No embedding here any more. This used to embed inline (blocking the
+        # caller on a network round-trip) into the legacy `message_embeddings`
+        # table; history-index.timer now picks the row up within 15 minutes and
+        # chunks the whole message instead of its first 4,000 characters.
         return msg_id
 
     async def add_message_async(
@@ -250,16 +253,10 @@ class ConversationSession:
             tts_model=tts_model,
         )
 
-        if role in ("user", "assistant") and content:
-            # Detached on purpose. The message row is already committed, and the
-            # vector is not needed by this turn — awaiting it here put a network
-            # round-trip in front of the LLM call (user message) and in front of
-            # audio_done (assistant message). A dropped embed leaves no
-            # message_embeddings row, which is exactly what the sweeper looks
-            # for. Note there is no await between the insert and this spawn, so
-            # a cancelled turn cannot lose the embed.
-            spawn_embedding(self.db_path, "message_embeddings", "message_id", msg_id, content)
-
+        # The detached spawn_embedding() call that used to live here is gone
+        # with the rest of the legacy embed path. It existed only to keep a
+        # network round-trip off the voice turn's critical path; there is no
+        # round-trip left to keep off it.
         return msg_id
 
     def _insert_message(
@@ -365,22 +362,19 @@ class ConversationSession:
         return cursor.lastrowid
 
     def _write_summary(self, result) -> None:
-        """Persist the summary and the index decision, dropping any stale vector.
+        """Persist the summary and the index decision.
 
-        The DELETE is what keeps "no summary_embeddings row" an honest pending
-        marker. Conversations are resumed in place (every Matrix thread), so this
-        runs repeatedly on one conversation_id and rewrites `summary`. If the
-        re-embed then fails, store_embedding_bytes never reaches its own DELETE,
-        the previous vector survives, and a sweeper keyed on absence would call
-        the row done forever while it points at superseded text. Dropping it here
-        also un-indexes a conversation whose `indexed` flips 1 -> 0.
+        The companion `DELETE FROM summary_embeddings` is gone: keeping a
+        rewritten summary's vector honest is the library's problem now, and it
+        solves it properly. Conversations are resumed in place (every Matrix
+        thread), so this runs repeatedly on one conversation_id and rewrites
+        `summary`; the library fingerprints `(service, summary)` per source, so
+        a rewrite simply re-fingerprints and the next sync re-embeds it. That
+        also removes the stale-vector race this DELETE was papering over.
         """
         self.conn.execute(
             "UPDATE conversations SET summary = ?, indexed = ? WHERE id = ?",
             (result.summary, 1 if result.index else 0, self.conv_id),
-        )
-        self.conn.execute(
-            "DELETE FROM summary_embeddings WHERE conversation_id = ?", (self.conv_id,)
         )
         self.conn.commit()
 
@@ -395,9 +389,6 @@ class ConversationSession:
         if result.summary:
             self._write_summary(result)
             if result.index:
-                store_embedding(
-                    self.conn, "summary_embeddings", "conversation_id", self.conv_id, result.summary
-                )
                 log.info("Conversation %d summary: %s", self.conv_id, result.summary[:80])
             else:
                 log.info(
@@ -427,9 +418,6 @@ class ConversationSession:
         if result.summary:
             self._write_summary(result)
             if result.index:
-                await store_embedding_async(
-                    self.conn, "summary_embeddings", "conversation_id", self.conv_id, result.summary
-                )
                 log.info("Conversation %d summary: %s", self.conv_id, result.summary[:80])
             else:
                 log.info(

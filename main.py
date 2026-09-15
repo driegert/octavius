@@ -1,6 +1,5 @@
-import asyncio
 import logging
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
@@ -9,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from db import DEFAULT_DB_PATH
 from history import HistoryRecorder, init_db
 from history_enrichment import drain_inflight
-from history_sweeper import run_sweeper
+from history_store import assert_history_serveable
 from mcp_manager import MCPManager
 from settings import settings
 from routes.conversations import router as conversations_router
@@ -36,7 +35,6 @@ async def lifespan(app: FastAPI):
     db_path = app.state.db_path
     history = HistoryRecorder(db_path)
     stale_count = fail_stale_processing_documents(history_conn)
-    history_conn.close()
     app.state.mcp_manager = mcp_manager
     app.state.history = history
     app.state.db_path = db_path
@@ -47,6 +45,13 @@ async def lifespan(app: FastAPI):
     )
     if stale_count:
         log.warning("Marked %d stale reader document(s) as failed on startup", stale_count)
+    # Loud, at startup: conversation/inbox search reads sidecar tables that
+    # history-index.timer maintains in the file sites.toml names. If this app
+    # opens a different file, or the sidecars are missing or L2-metric, search
+    # would keep answering with stale or magnitude-ranked results instead of
+    # failing. Injected so tests can run against a throwaway database.
+    app.state.verify_search(history_conn, db_path)
+    history_conn.close()
     log.info("Connecting MCP servers...")
     await mcp_manager.connect_all()
     log.info("MCP ready — %d tools available", len(mcp_manager.tools))
@@ -59,25 +64,21 @@ async def lifespan(app: FastAPI):
             "Local tool name(s) collide with MCP tools (local handler wins): %s",
             sorted(overlap),
         )
-    sweeper_task = None
-    if settings.embedding_sweeper_enabled:
-        sweeper_task = asyncio.create_task(run_sweeper(db_path))
-        app.state.embedding_sweeper_task = sweeper_task
-    else:
-        log.info("Embedding sweeper disabled")
+    # The embedding sweeper started here until 2026-09-15. It backfilled the
+    # legacy vec0 tables; history-index.timer (`hybrid-corpus run history`,
+    # every 15 min) owns freshness and embed-debt healing now, for all three
+    # history collections rather than just two.
     yield
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
-    if sweeper_task is not None:
-        sweeper_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await sweeper_task
-    # Give detached embeds a moment to land; anything still pending is picked
-    # up by the sweeper on the next boot.
+    # Nothing spawns detached embeds any more (see history_enrichment), so this
+    # drains an empty set. Kept because it is the shutdown hook's only await on
+    # in-flight background work and costs nothing when there is none.
     await drain_inflight()
 
 
-def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH) -> FastAPI:
+def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH,
+               verify_search=assert_history_serveable) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     app.mount("/static", StaticFiles(directory="static"), name="static")
     app.include_router(inbox_router)
@@ -88,6 +89,7 @@ def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAU
     app.state.mcp_manager_factory = mcp_manager_factory
     app.state.db_init = db_init
     app.state.db_path = db_path
+    app.state.verify_search = verify_search
     return app
 
 

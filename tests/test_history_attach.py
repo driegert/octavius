@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import history
 
@@ -14,12 +13,11 @@ class ResumeOrStartConversationTests(unittest.TestCase):
         self.db_path = Path(self._tmp.name) / "test_history.db"
         history.init_db(self.db_path).close()
         self.history = history.HistoryRecorder(self.db_path)
-        # Embeddings reach out to a model server; stub them for the unit test.
-        self._embed = patch.object(history, "store_embedding", return_value=None)
-        self._embed.start()
+        # No embedding stub needed any more: recording a message is pure SQLite
+        # since the embed path was retired (2026-09-15) in favour of
+        # history-index.timer, so nothing here reaches a model server.
 
     def tearDown(self):
-        self._embed.stop()
         self._tmp.cleanup()
 
     def test_new_key_creates_conversation_with_key_as_session_id(self):

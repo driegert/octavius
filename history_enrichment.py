@@ -5,9 +5,6 @@ import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
-
-from db import connect_db
 from service_clients import embedding_client, summary_client
 from settings import settings
 
@@ -86,114 +83,75 @@ async def embed_text_async(text: str) -> bytes | None:
     return await embedding_client.aembed_text(_clip(text), timeout=EMBEDDING_TIMEOUT)
 
 
+# --- Retired embedding write path (2026-09-15) ------------------------------
+# These four functions wrote the legacy vec0 tables. `store_embedding` and
+# `store_embedding_async` embedded inline; `spawn_embedding` detached the
+# round-trip off the voice turn so it would not sit in front of the LLM call
+# (user message) or in front of audio_done (assistant message); and the pending
+# marker was the *absence* of a row, which `history_sweeper` swept for.
+#
+# All of it was retired in favour of history-index.timer (`hybrid-corpus run
+# history`, every 15 minutes), which fingerprints the app-owned tables and
+# embeds what changed into the library's sidecars. There is no embed left on the
+# turn path to detach, no absence-marker to maintain, and no backlog cap to
+# enforce — and saved items are covered now, which this path never managed.
+#
+# Kept as loud stubs rather than deleted, so a surviving caller fails visibly
+# instead of silently not indexing anything. Note that `embed_text` and
+# `embed_text_async` above are NOT retired: they are plain clipping wrappers
+# over `embedding_client`, with no coupling to the legacy tables.
+
+_RETIRED = (
+    "The octavius history embed path was retired on 2026-09-15. The legacy "
+    "vec0 tables (message_embeddings, summary_embeddings, "
+    "saved_item_embeddings) are gone, and hybrid-corpus owns indexing for this "
+    "database via history-index.timer. To index a row the app has just written, "
+    "call history_store.index_saved_item(); otherwise wait for the timer."
+)
+
+
 def store_embedding(conn: sqlite3.Connection, table: str, id_col: str, row_id: int, text: str):
-    emb = embed_text(text)
-    store_embedding_bytes(conn, table, id_col, row_id, emb)
+    """Retired 2026-09-15 in favour of history-index.timer. Raises RuntimeError."""
+    raise RuntimeError(_RETIRED)
 
 
-async def store_embedding_async(conn: sqlite3.Connection, table: str, id_col: str, row_id: int, text: str):
-    emb = await embed_text_async(text)
-    store_embedding_bytes(conn, table, id_col, row_id, emb)
+async def store_embedding_async(conn: sqlite3.Connection, table: str, id_col: str,
+                                row_id: int, text: str):
+    """Retired 2026-09-15 in favour of history-index.timer. Raises RuntimeError."""
+    raise RuntimeError(_RETIRED)
 
 
-def store_embedding_bytes(
-    conn: sqlite3.Connection,
-    table: str,
-    id_col: str,
-    row_id: int,
-    emb: bytes | None,
-) -> bool:
-    """Write a vector, replacing any existing one. Returns whether a row landed.
-
-    DELETE-then-INSERT makes this idempotent, so the sweeper can safely re-run it
-    over a row a live embed is also handling. A False return is the signal the
-    sweeper keys on: no row means "still pending".
-    """
-    if emb is None:
-        return False
-    try:
-        conn.execute(f"DELETE FROM {table} WHERE {id_col} = ?", (row_id,))
-        conn.execute(
-            f"INSERT INTO {table}({id_col}, embedding) VALUES (?, ?)",
-            (row_id, emb),
-        )
-        conn.commit()
-        return True
-    except Exception:
-        log.debug("Failed to store embedding in %s", table, exc_info=True)
-        return False
+def store_embedding_bytes(conn: sqlite3.Connection, table: str, id_col: str,
+                          row_id: int, emb: bytes | None) -> bool:
+    """Retired 2026-09-15 in favour of history-index.timer. Raises RuntimeError."""
+    raise RuntimeError(_RETIRED)
 
 
-# --- Detached embedding -----------------------------------------------------
-# Embedding is a network round-trip; awaiting it inline put it on the voice
-# turn's critical path (before the LLM call for the user message, before
-# audio_done for the assistant message). These helpers move it off that path.
+def spawn_embedding(db_path, table: str, id_col: str, row_id: int, text: str):
+    """Retired 2026-09-15 in favour of history-index.timer. Raises RuntimeError."""
+    raise RuntimeError(_RETIRED)
+
+
+# --- Shutdown drain ---------------------------------------------------------
+# `_inflight` stays because `main.py`'s shutdown hook still awaits
+# `drain_inflight`. Nothing adds to it since the retirement above, so it drains
+# instantly; it is kept as that hook's one await on in-flight background work.
 
 MAX_INFLIGHT_EMBEDS = 8
 _inflight: set[asyncio.Task] = set()
 
 
-def _store_sync(db_path, table: str, id_col: str, row_id: int, emb: bytes) -> bool:
-    """Open a connection, write, close — all on one thread.
-
-    Runs via asyncio.to_thread. sqlite3 connections are bound to their creating
-    thread (check_same_thread), so the connection is created *here* rather than
-    handed in. Writing off the loop also means a WAL writer-lock wait (up to
-    sqlite3's 5s default) stalls one worker instead of every session.
-    """
-    with connect_db(Path(db_path)) as conn:
-        return store_embedding_bytes(conn, table, id_col, row_id, emb)
-
-
-async def _embed_and_store_detached(db_path, table: str, id_col: str, row_id: int, text: str) -> None:
-    try:
-        emb = await embed_text_async(text)
-        if emb is None:
-            # No row written: that absence is exactly what the sweeper looks for.
-            log.warning("Embedding unavailable for %s row %d; left for the sweeper", table, row_id)
-            return
-        if not await asyncio.to_thread(_store_sync, db_path, table, id_col, row_id, emb):
-            log.warning("Could not persist embedding for %s row %d; left for the sweeper", table, row_id)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Detached embedding failed for %s row %d", table, row_id)
-    finally:
-        _inflight.discard(asyncio.current_task())
-
-
-def spawn_embedding(db_path, table: str, id_col: str, row_id: int, text: str) -> "asyncio.Task | None":
-    """Fire-and-forget an embed. Returns the task, or None if it wasn't started.
-
-    The task is a root task, not a child of the caller's: asyncio has no
-    parent/child cancellation, so cancelling the turn (handle_reset) does not
-    kill an in-flight embed. A strong reference is held in `_inflight` because
-    the loop only keeps a weak one.
-    """
-    if len(_inflight) >= MAX_INFLIGHT_EMBEDS:
-        log.warning(
-            "Embedding backlog at capacity (%d); skipping %s row %d, sweeper will retry",
-            MAX_INFLIGHT_EMBEDS, table, row_id,
-        )
-        return None
-    try:
-        task = asyncio.create_task(_embed_and_store_detached(db_path, table, id_col, row_id, text))
-    except RuntimeError:
-        # No running loop (sync context) — the caller's own path should embed.
-        log.debug("No running loop; not spawning embed for %s row %d", table, row_id)
-        return None
-    _inflight.add(task)
-    return task
-
-
 async def drain_inflight(timeout: float = 5.0) -> int:
-    """Wait for detached embeds to finish. Returns how many were still pending."""
+    """Wait for detached background tasks to finish; returns how many were still
+    pending. Nothing spawns such tasks since the retirement above, so this
+    returns 0 immediately unless something re-introduces one.
+    """
     if not _inflight:
         return 0
     pending = list(_inflight)
     done, still_pending = await asyncio.wait(pending, timeout=timeout)
     if still_pending:
-        log.warning("%d embedding task(s) unfinished at shutdown; sweeper will retry", len(still_pending))
+        log.warning("%d background task(s) unfinished at shutdown", len(still_pending))
     return len(still_pending)
 
 

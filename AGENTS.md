@@ -356,40 +356,38 @@ External services currently expected:
     `/health`'s `embedding_chain` shows per-endpoint `tripped` / `consecutive_failures` /
     `cooldown_remaining`. It deliberately does **not** feed the top-level `degraded`:
     every search path falls back to keyword matching, so Octavius still answers.
-  - **Message embeds are detached from the turn path.** `add_message_async` commits the
-    row and then *spawns* the embed (`history_enrichment.spawn_embedding`) instead of
-    awaiting it — awaiting put a network round-trip in front of the LLM call for the
-    user message and in front of `audio_done` for the assistant message, which is what
-    made a dead embedder cost ~10 s twice per turn. The spawned task is a **root** task,
-    so cancelling a turn (`handle_reset`) cannot lose it, and it does its sqlite write
-    via `asyncio.to_thread` on its own connection. Cap: 8 in flight;
-    `drain_inflight()` runs at shutdown. Consequence: message-level semantic search is
-    **eventually consistent**.
-  - **Embed input is capped at `EMBED_MAX_CHARS` (4000)** in `history_enrichment`, the
-    choke point every embed call goes through. The cap is sized for the *weakest*
-    endpoint in the chain, not the primary. Embedders reject over-long input
-    outright — Ollama's default `num_ctx` is 2048 tokens and workhorse 500s somewhere
-    between 4000 and 6000 characters. Raising `num_ctx` is not a fix: bge-m3 tops out at
-    8192 tokens (a 20k-char input still 500s), and a full-context embed took 4.5 s versus
-    0.25 s.
-  - **`history_sweeper.py`** re-embeds anything that never landed (startup + every
-    15 min, behind `OCTAVIUS_EMBEDDING_SWEEPER`). The pending marker is simply the
-    absence of a row in the vec0 table. Three non-obvious rules: the `role IN
-    ('user','assistant')` filter is load-bearing (tool results are never embedded, and
-    without it the sweeper re-selects the whole tool-call history forever); a pass gives
-    up when the breaker reports every endpoint tripped, or after
-    `MAX_CONSECUTIVE_FAILURES`, rather than burning the timeout budget row by row; but a
-    *single* failing row is **skipped, not fatal**. That last one is load-bearing too —
-    aborting on the first `None` meant one unembeddable row at the head of the
-    newest-first batch blocked every row behind it, pass after pass, forever.
-  - **`conversations.indexed`** (added 2026-08-10, additive migration) records the
-    summariser's index decision, which was previously unpersisted — so "skipped on
-    purpose" and "the embedder was down" looked identical and the summary sweeper
-    couldn't tell which rows to repair. `NULL` = legacy/unknown, never swept.
-    `_write_summary` also **deletes any existing summary vector** in the same
-    transaction: conversations are resumed in place (every Matrix thread), so a rewrite
-    whose re-embed fails would otherwise leave a vector for superseded text that looks
-    complete forever.
+  - **The app no longer embeds at all (2026-09-15).** Message, summary and
+    saved-item embedding all moved to the `hybrid-corpus` library.
+    `history-index.timer` runs `hybrid-corpus run history` every 15 minutes,
+    fingerprints `messages` / `conversations` / `saved_items`, and writes the
+    library's sidecars into the same database file. Gone with it: the inline
+    `store_embedding` write in `add_message`, the detached `spawn_embedding`
+    root task in `add_message_async` (and its 8-in-flight cap), the summary
+    embed in `end`/`end_async`, and `history_sweeper`'s repair loop. Recording
+    a turn is pure SQLite now, so there is no embedder round-trip anywhere near
+    the voice path to detach in the first place. `history_sweeper.run_sweeper`
+    / `sweep_once` and `history_enrichment`'s `store_embedding*` /
+    `spawn_embedding` are kept as stubs that **raise `RuntimeError`** — a
+    silent no-op would let a stale caller look healthy while nothing indexed.
+    `drain_inflight()` still runs at shutdown and drains an empty set.
+    Consequence: semantic search is **eventually consistent** with a 15-minute
+    worst case, except for `saved_items`, which `history_store.save_item`
+    indexes inline through the library's `Indexer` (an embed failure there is
+    logged and swallowed — the row is committed and keyword-searchable
+    immediately, and only the vector is owed).
+  - **Embed input cap.** `EMBED_MAX_CHARS` (4000) in `history_enrichment` is now
+    only relevant to `embed_text`/`embed_text_async`, which survive as plain
+    client wrappers. The library enforces its own `embed_cap` (8000 in
+    sites.toml) as a **refusal, not a trim**, and chunks long sources instead
+    of truncating them — which is the real fix for the old behaviour where a
+    20k-char message was silently indexed by its first 4000 characters.
+  - **`conversations.indexed`** (added 2026-08-10, additive migration) records
+    the summariser's index decision. It is still written and still read by
+    conversation listings, but since the cutover it **gates nothing**: the
+    library indexes every conversation with a non-empty summary, and
+    `_write_summary` no longer deletes a stale vector because the library
+    re-fingerprints `(service, summary)` on every sync and re-embeds a rewrite
+    by itself.
 - **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting (2026-09-10) to `triplestuffed:8010` (`gemma4-26b-a4b`) as **primary**, with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general`) and `lilripper:8020` (`qwen3.8-27b`) as fallbacks, all thinking on. The cross-host primary closes the old lilripper-only limitation — if lilripper is down, image turns still work — and keeps image turns off lilripper's four `:8010` slots, which the voice path owns. The chain stays separate from `llm_chain` because the main chain's third hop is chosen for *availability* rather than for modality — separate chains are what stop a future "add another fallback so voice survives a lilripper outage" edit to `llm_chain` from silently widening where an image turn can land. Check `architecture.input_modalities` before trusting any hop with images: gemma4 takes them, but `ling-3.0-flash`, `zeta-2.1`, `ministral-14b`, and `qwen3.5-9b` do not. **Modality is not enough — check the hop's micro-batch too.** A gemma4v image encodes to 70-1120 tokens by resolution and llama.cpp decodes the whole image chunk as one non-causal ubatch, so a hop launched with the default `-ub 512` *aborts* (`GGML_ASSERT ... n_ubatch >= n_tokens`) on any image bigger than a thumbnail, the router reloads it, and the turn comes back empty ("I'm not sure how to respond to that."). Found 2026-09-14 on the first real Android image turn; fixed with `ubatch-size = 1152` in triplestuffed's `~/.config/llama-router/preset.ini` (`[gemma4-26b-a4b]`), which cost ~1.7 GB of the 3090's headroom (2505 → ~820 MiB). `/v1/models` reports `--ubatch-size` in `status.args` — read it before pointing image turns at any llama.cpp hop. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
@@ -500,10 +498,10 @@ Reader pipeline:
 History and inbox:
 
 - `history.py` - DB bootstrap, conversation/session recording, and compatibility re-exports for history/inbox helpers
-- `history_enrichment.py` - embeddings, summaries, topic tags; also the detached-embed helpers (`spawn_embedding` / `drain_inflight`)
-- `history_sweeper.py` - background re-embed of rows whose inline embed never landed
-- `history_store.py` - conversation queries, inbox CRUD/search, memory-push watermarks, stats
-- `schema.sql` - SQLite+vec schema
+- `history_enrichment.py` - summaries and topic tags; the embed-write helpers are retired stubs that raise (`drain_inflight` still live)
+- `history_sweeper.py` - RETIRED 2026-09-15; both entry points raise. Kept so the retirement is visible from the import graph
+- `history_store.py` - conversation queries, inbox CRUD, hybrid search over the library's `history_summaries` / `history_saved_items` collections, `assert_history_serveable`, memory-push watermarks
+- `schema.sql` - SQLite schema for the app-owned tables only; the library owns and creates its own sidecars
 
 Frontend:
 
@@ -530,9 +528,9 @@ Tests:
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
 - `tests/test_history_attach.py`
-- `tests/test_history_enrichment.py` - also detached-embed lifecycle (survives turn cancellation and the session connection closing)
-- `tests/test_history_sweeper.py` - sweeper filters/convergence, the `indexed` migration, and summary stale-vector invalidation
-- `tests/test_history_store.py`
+- `tests/test_history_enrichment.py` - also asserts the retired embed path: recording a message embeds nothing, leaves nothing in flight, and the retired helpers raise
+- `tests/test_history_sweeper.py` - the sweeper's retirement contract, plus the `indexed` migration tests (which never concerned the sweeper)
+- `tests/test_history_store.py` - includes library-backed search tests over a throwaway DB with `FakeEmbedder`: service/source/since filters, result shape, dismissed-item exclusion, and the lexical-only degradation when the embedder is down
 - `tests/test_local_tool_handlers.py`
 - `tests/test_local_tool_history.py` - search filters/list mode and `read_conversation` paging
 - `tests/test_local_tool_reader.py`
@@ -762,20 +760,34 @@ directory is **not garbage-collected yet** — a follow-up.
   one in the repo**: the service unit sets `OCTAVIUS_DB_PATH=/media/extra_stuff/octavius/octavius_history.db`,
   and the repo-local file is a stale leftover. Query the former when inspecting real
   state — `systemctl --user show octavius -p Environment` is the authority.
+- **Indexing is not the app's job (since 2026-09-15).** Octavius writes
+  `messages`, `conversations.summary` and `saved_items` and stops there.
+  `history-index.timer` runs `hybrid-corpus run history` every 15 minutes,
+  fingerprints those three tables, and embeds what changed into the library's
+  sidecars (`history_messages_*`, `history_summaries_*`,
+  `history_saved_items_*`) in the same database file. The legacy vec0 tables,
+  the inline/detached embed writes and `history_sweeper` are all gone; the
+  sweeper and `history_enrichment`'s store/spawn helpers survive as stubs that
+  raise. `main.py`'s lifespan calls `history_store.assert_history_serveable`,
+  which refuses to start if `OCTAVIUS_DB_PATH` and sites.toml's
+  `[corpora.history] database` disagree, or if the sidecars are missing or
+  not cosine-metric.
 - Summaries and topic tags are generated when a conversation ends. The summary
   prompt asks for a one-sentence, action-oriented summary *and* an `index`
-  flag; conversations the LLM judges as purely read-only retrieval (e.g.
-  listing emails/tasks, weather lookups) get the summary stored but skip the
-  embedding write, so they don't pollute semantic search results. Tags are
-  still generated for all conversations.
+  flag. The flag is still stored on `conversations.indexed`, but it no longer
+  gates any embedding — the library indexes every conversation with a
+  non-empty summary. Tags are still generated for all conversations.
 - The main agent can search prior Octavius conversations via the
   `search_conversation_history` local tool, which wraps
-  `history_store.search_conversations()` (semantic-first against
-  `summary_embeddings`, with a text-LIKE fallback). Filtered to
-  `service="octavius"` and excludes the current conversation. Optional
-  `source` (`voice`/`matrix`/`text`) and `since` filters; with a filter and
-  no query it becomes a recency listing (`history_store.list_conversations`),
-  which also surfaces retrieval-only chats that skip embedding.
+  `history_store.search_conversations()`. That is hybrid search over the
+  `history_summaries` collection now: a vec0 KNN arm and an FTS5/BM25 arm
+  fused with RRF. An embedding outage degrades to lexical-only rather than
+  raising or returning nothing. Filtered to `service="octavius"` and excludes
+  the current conversation. Optional `source` (`voice`/`matrix`/`text`) and
+  `since` filters are composed onto the adapter's own `service` filter; with a
+  filter and no query it becomes a recency listing
+  (`history_store.list_conversations`), which also surfaces conversations with
+  no summary at all.
 - The `read_conversation` local tool returns the full transcript of a prior
   conversation by id (user/assistant turns only), channel-agnostic — this is
   what lets a Matrix thread pull in a past voice conversation and continue it
