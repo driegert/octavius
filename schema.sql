@@ -13,10 +13,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     message_count       INTEGER DEFAULT 0,
     total_input_tokens  INTEGER DEFAULT 0,
     total_output_tokens INTEGER DEFAULT 0,
-    total_duration_ms   INTEGER DEFAULT 0,
-    indexed             INTEGER                   -- 1 = summary belongs in semantic
-                                                  -- search, 0 = deliberately skipped,
-                                                  -- NULL = legacy/unknown (never swept)
+    total_duration_ms   INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_service

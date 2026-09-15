@@ -381,13 +381,15 @@ External services currently expected:
     sites.toml) as a **refusal, not a trim**, and chunks long sources instead
     of truncating them — which is the real fix for the old behaviour where a
     20k-char message was silently indexed by its first 4000 characters.
-  - **`conversations.indexed`** (added 2026-08-10, additive migration) records
-    the summariser's index decision. It is still written and still read by
-    conversation listings, but since the cutover it **gates nothing**: the
-    library indexes every conversation with a non-empty summary, and
-    `_write_summary` no longer deletes a stale vector because the library
-    re-fingerprints `(service, summary)` on every sync and re-embeds a rewrite
-    by itself.
+  - **`conversations.indexed` is gone from the schema** (added 2026-08-10 for
+    the sweeper, dropped 2026-09-15). The summariser's `index` flag is no
+    longer persisted — it only decides the push to the memory service — because
+    the library indexes every conversation with a non-empty summary and nothing
+    in the fleet read the column. The live database keeps the column
+    harmlessly. `_write_summary` also no longer deletes a stale vector: the
+    library re-fingerprints `(service, summary)` on every sync and re-embeds a
+    rewrite by itself. The `OCTAVIUS_EMBEDDING_SWEEPER` switch went the same
+    day; the retired sweeper never read it.
 - **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting (2026-09-10) to `triplestuffed:8010` (`gemma4-26b-a4b`) as **primary**, with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general`) and `lilripper:8020` (`qwen3.8-27b`) as fallbacks, all thinking on. The cross-host primary closes the old lilripper-only limitation — if lilripper is down, image turns still work — and keeps image turns off lilripper's four `:8010` slots, which the voice path owns. The chain stays separate from `llm_chain` because the main chain's third hop is chosen for *availability* rather than for modality — separate chains are what stop a future "add another fallback so voice survives a lilripper outage" edit to `llm_chain` from silently widening where an image turn can land. Check `architecture.input_modalities` before trusting any hop with images: gemma4 takes them, but `ling-3.0-flash`, `zeta-2.1`, `ministral-14b`, and `qwen3.5-9b` do not. **Modality is not enough — check the hop's micro-batch too.** A gemma4v image encodes to 70-1120 tokens by resolution and llama.cpp decodes the whole image chunk as one non-causal ubatch, so a hop launched with the default `-ub 512` *aborts* (`GGML_ASSERT ... n_ubatch >= n_tokens`) on any image bigger than a thumbnail, the router reloads it, and the turn comes back empty ("I'm not sure how to respond to that."). Found 2026-09-14 on the first real Android image turn; fixed with `ubatch-size = 1152` in triplestuffed's `~/.config/llama-router/preset.ini` (`[gemma4-26b-a4b]`), which cost ~1.7 GB of the 3090's headroom (2505 → ~820 MiB). `/v1/models` reports `--ubatch-size` in `status.args` — read it before pointing image turns at any llama.cpp hop. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
@@ -529,7 +531,7 @@ Tests:
 - `tests/test_websocket_session.py`
 - `tests/test_history_attach.py`
 - `tests/test_history_enrichment.py` - also asserts the retired embed path: recording a message embeds nothing, leaves nothing in flight, and the retired helpers raise
-- `tests/test_history_sweeper.py` - the sweeper's retirement contract, plus the `indexed` migration tests (which never concerned the sweeper)
+- `tests/test_history_sweeper.py` - the sweeper's retirement contract, plus the `last_extracted_message_id` migration tests (which never concerned the sweeper)
 - `tests/test_history_store.py` - includes library-backed search tests over a throwaway DB with `FakeEmbedder`: service/source/since filters, result shape, dismissed-item exclusion, and the lexical-only degradation when the embedder is down
 - `tests/test_local_tool_handlers.py`
 - `tests/test_local_tool_history.py` - search filters/list mode and `read_conversation` paging
@@ -774,9 +776,10 @@ directory is **not garbage-collected yet** — a follow-up.
   not cosine-metric.
 - Summaries and topic tags are generated when a conversation ends. The summary
   prompt asks for a one-sentence, action-oriented summary *and* an `index`
-  flag. The flag is still stored on `conversations.indexed`, but it no longer
-  gates any embedding — the library indexes every conversation with a
-  non-empty summary. Tags are still generated for all conversations.
+  flag. The flag decides only whether the conversation is pushed to the
+  memory service; it is not persisted, and it gates no embedding — the
+  library indexes every conversation with a non-empty summary. Tags are
+  still generated for all conversations.
 - The main agent can search prior Octavius conversations via the
   `search_conversation_history` local tool, which wraps
   `history_store.search_conversations()`. That is hybrid search over the

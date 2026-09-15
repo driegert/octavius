@@ -10,6 +10,19 @@ This document holds change-oriented project status that is useful in the short t
 Keep durable architecture and contributor workflow in `AGENTS.md` (`CLAUDE.md` is a
 symlink to it, so Claude Code and Codex read the same file).
 
+## Sweeper switch and `conversations.indexed` removed (2026-09-15)
+
+Two leftovers from the hybrid-corpus cutover earlier the same day, both flagged by that
+session as follow-ups. `OCTAVIUS_EMBEDDING_SWEEPER` was parsed into
+`settings.embedding_sweeper_enabled` and read by nothing (the sweeper is a raising stub);
+field, env parse and `.env.example` entry are gone. `conversations.indexed` was still
+written by `_write_summary` but had no reader in this repo, mcp-tools, hybrid-corpus or
+agent-memory — the library indexes every conversation with a non-empty summary — so the
+column left `schema.sql` and its migration, and the summariser's `index` flag now only
+gates the memory push. The live DB keeps the column; nothing needs to drop it. The
+`search_conversation_history` empty-result hint, which still claimed retrieval-only chats
+were "intentionally not indexed", now says the truth: the index lags by up to 15 minutes.
+
 ## Image turns crashed the gemma4 hop until its ubatch was raised (2026-09-14)
 
 The first real Android image turn came back "I'm not sure how to respond to that." with

@@ -11,9 +11,11 @@ What replaces them: one class asserting the retirement is loud (below), plus
 `hybrid-corpus`'s own suite, which owns embed-debt healing now
 (`tests/test_index.py`'s repair/pending coverage).
 
-`MigrationTests` stays as-is. It never had anything to do with the sweeper —
-it covers `history._run_migrations`' idempotent ALTER TABLEs — and it is left
-in place rather than moved so the move does not hide in this diff.
+`MigrationTests` never had anything to do with the sweeper — it covers
+`history._run_migrations`' idempotent ALTER TABLEs — and is left here rather
+than moved so the move does not hide in a diff. The `indexed` column it used
+to check was dropped from the schema on 2026-09-15 (the summariser stopped
+writing it; nothing read it), so only `last_extracted_message_id` remains.
 """
 
 import tempfile
@@ -59,22 +61,22 @@ class MigrationTests(unittest.TestCase):
 
             with connect_db(db_path) as conn:
                 cols = [row[1] for row in conn.execute("PRAGMA table_info(conversations)")]
-            self.assertEqual(cols.count("indexed"), 1)
             self.assertEqual(cols.count("last_extracted_message_id"), 1)
+            self.assertNotIn("indexed", cols)
 
     def test_migration_preserves_existing_rows_and_columns(self):
-        """Mirrors the live DB: real rows, and last_extracted_message_id already
-        present from the previous migration."""
+        """A database from before the watermark column: real rows survive, and
+        the column is backfilled as NULL."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "legacy.db"
             history.init_db(db_path).close()
             with connect_db(db_path) as conn:
-                # Drop the new column to simulate a database from before it.
-                conn.execute("ALTER TABLE conversations DROP COLUMN indexed")
+                # Drop the migrated column to simulate a database from before it.
+                conn.execute("ALTER TABLE conversations DROP COLUMN last_extracted_message_id")
                 conn.execute(
                     "INSERT INTO conversations (id, session_id, started_at, service, source, "
-                    "summary, last_extracted_message_id) "
-                    "VALUES (7, 'old', '2026-01-01T00:00:00+00:00', 'octavius', 'voice', 'kept', 42)"
+                    "summary) "
+                    "VALUES (7, 'old', '2026-01-01T00:00:00+00:00', 'octavius', 'voice', 'kept')"
                 )
                 conn.commit()
 
@@ -83,15 +85,12 @@ class MigrationTests(unittest.TestCase):
             with connect_db(db_path) as conn:
                 cols = [row[1] for row in conn.execute("PRAGMA table_info(conversations)")]
                 row = conn.execute(
-                    "SELECT summary, last_extracted_message_id, indexed "
+                    "SELECT summary, last_extracted_message_id "
                     "FROM conversations WHERE id = 7"
                 ).fetchone()
-            self.assertEqual(cols.count("indexed"), 1)
             self.assertEqual(cols.count("last_extracted_message_id"), 1)
             self.assertEqual(row[0], "kept")
-            self.assertEqual(row[1], 42)
-            # Backfilled as NULL = legacy/unknown, so the sweeper leaves it alone.
-            self.assertIsNone(row[2])
+            self.assertIsNone(row[1])
 
 
 if __name__ == "__main__":

@@ -122,8 +122,9 @@ def search_conversation_history(args: dict, session=None, _mcp_manager=None) -> 
         if query:
             return (
                 f"No prior conversations matched '{query}'{filter_desc}. "
-                "(Retrieval-only chats are intentionally not indexed; "
-                "try a source/since listing without a query.)"
+                "(Summaries are indexed on a 15-minute timer, so a conversation "
+                "that ended recently may not be searchable yet; try a "
+                "source/since listing without a query.)"
             )
         return f"No prior conversations found{filter_desc}."
 

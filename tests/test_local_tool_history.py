@@ -53,7 +53,7 @@ class SearchConversationHistoryTests(unittest.TestCase):
                 {"query": "no match"}, session=session
             )
         self.assertIn("No prior conversations matched", result)
-        self.assertIn("not indexed", result)
+        self.assertIn("15-minute timer", result)
 
     def test_current_conversation_excluded(self):
         session = SimpleNamespace(conn=object(), conv_id=42)

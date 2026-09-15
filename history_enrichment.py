@@ -43,6 +43,9 @@ SUMMARY_SYSTEM_PROMPT = (
 @dataclass
 class SummaryResult:
     summary: str | None
+    # Whether the conversation is worth remembering. Since 2026-09-15 this
+    # gates only the push to the memory service: the hybrid-corpus library
+    # indexes every conversation with a non-empty summary regardless.
     index: bool
 
 TAG_SYSTEM_PROMPT = (

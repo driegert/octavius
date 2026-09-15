@@ -178,7 +178,6 @@ class Settings:
     summary_timeout: int
     embedding_chain: list[dict]
     embedding_timeout: int
-    embedding_sweeper_enabled: bool
     result_summary_max_chars: int
     tag_generation_min_messages: int
     memory_service_url: str
@@ -826,8 +825,6 @@ def load_settings() -> Settings:
             ],
         ),
         embedding_timeout=_env_int("OCTAVIUS_EMBEDDING_TIMEOUT", 5),
-        embedding_sweeper_enabled=_env_str("OCTAVIUS_EMBEDDING_SWEEPER", "1").lower()
-        in {"1", "true", "yes", "on"},
         result_summary_max_chars=_env_int("OCTAVIUS_RESULT_SUMMARY_MAX_CHARS", 500),
         tag_generation_min_messages=_env_int("OCTAVIUS_TAG_GENERATION_MIN_MESSAGES", 4),
         # Shared memory service (v2): Octavius is a loopback HTTP client of the

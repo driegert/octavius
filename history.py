@@ -76,15 +76,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             "ALTER TABLE conversations ADD COLUMN last_extracted_message_id INTEGER"
         )
         log.info("Migration: added conversations.last_extracted_message_id")
-    if "indexed" not in cols:
-        # Records whether the summariser judged this conversation worth
-        # indexing. It was introduced to disambiguate a missing legacy vector
-        # ("skipped on purpose" vs "the embedder was down") for the retired
-        # sweeper. The column is still written, and still read by
-        # conversations listings, but it no longer gates any embedding: the
-        # library indexes every conversation that has a non-empty summary.
-        conn.execute("ALTER TABLE conversations ADD COLUMN indexed INTEGER")
-        log.info("Migration: added conversations.indexed")
+    # `conversations.indexed` (2026-08-10 → 2026-09-15) is no longer added or
+    # written. It recorded the summariser's index decision for the retired
+    # sweeper; the library indexes every conversation with a non-empty summary,
+    # so nothing reads it. The live database keeps the column harmlessly.
 
 
 # -- Core recording API --------------------------------------------------------
@@ -362,19 +357,23 @@ class ConversationSession:
         return cursor.lastrowid
 
     def _write_summary(self, result) -> None:
-        """Persist the summary and the index decision.
+        """Persist the summary.
 
-        The companion `DELETE FROM summary_embeddings` is gone: keeping a
-        rewritten summary's vector honest is the library's problem now, and it
-        solves it properly. Conversations are resumed in place (every Matrix
-        thread), so this runs repeatedly on one conversation_id and rewrites
-        `summary`; the library fingerprints `(service, summary)` per source, so
-        a rewrite simply re-fingerprints and the next sync re-embeds it. That
-        also removes the stale-vector race this DELETE was papering over.
+        The `index` decision is not persisted: it only decides whether the
+        conversation is pushed to the memory service below (the old
+        `conversations.indexed` column gated the retired sweeper and nothing
+        reads it now). The companion `DELETE FROM summary_embeddings` is gone:
+        keeping a rewritten summary's vector honest is the library's problem
+        now, and it solves it properly. Conversations are resumed in place
+        (every Matrix thread), so this runs repeatedly on one conversation_id
+        and rewrites `summary`; the library fingerprints `(service, summary)`
+        per source, so a rewrite simply re-fingerprints and the next sync
+        re-embeds it. That also removes the stale-vector race this DELETE was
+        papering over.
         """
         self.conn.execute(
-            "UPDATE conversations SET summary = ?, indexed = ? WHERE id = ?",
-            (result.summary, 1 if result.index else 0, self.conv_id),
+            "UPDATE conversations SET summary = ? WHERE id = ?",
+            (result.summary, self.conv_id),
         )
         self.conn.commit()
 
@@ -392,7 +391,7 @@ class ConversationSession:
                 log.info("Conversation %d summary: %s", self.conv_id, result.summary[:80])
             else:
                 log.info(
-                    "Conversation %d not indexed (summary kept): %s",
+                    "Conversation %d not pushed to memory (summary kept): %s",
                     self.conv_id,
                     result.summary[:80],
                 )
@@ -421,7 +420,7 @@ class ConversationSession:
                 log.info("Conversation %d summary: %s", self.conv_id, result.summary[:80])
             else:
                 log.info(
-                    "Conversation %d not indexed (summary kept): %s",
+                    "Conversation %d not pushed to memory (summary kept): %s",
                     self.conv_id,
                     result.summary[:80],
                 )
