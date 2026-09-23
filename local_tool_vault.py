@@ -1,7 +1,7 @@
 """Local tools backing the vault as the single note store.
 
 save_note / read_note / edit_note / commit_edit map the agent surface onto the
-pure file I/O in vault_files.py. Search is a separate MCP tool (search_vault).
+pure file I/O in vault_files.py. Search is a separate MCP tool (`vault_search`; upstream `search`).
 """
 from __future__ import annotations
 

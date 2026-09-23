@@ -7,7 +7,7 @@ import subagent
 
 class _FakeMCP:
     def __init__(self, tools=None, call_results=None):
-        self._tools = [{"function": {"name": "search_emails"}}] if tools is None else tools
+        self._tools = [{"function": {"name": "email_keyword_search"}}] if tools is None else tools
         self._call_results = call_results if call_results is not None else {}
 
     def get_tools_for_servers(self, server_names):
@@ -78,7 +78,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "search_emails", "arguments": '{"query": "dean"}'},
+                "function": {"name": "email_keyword_search", "arguments": '{"query": "dean"}'},
             }],
         }
         final_message = {"content": "Found an email about the budget meeting.", "tool_calls": None}
@@ -90,13 +90,13 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             call_count += 1
             return tool_message if call_count == 1 else final_message
 
-        mcp = _FakeMCP(call_results={"search_emails": "3 emails found"})
+        mcp = _FakeMCP(call_results={"email_keyword_search": "3 emails found"})
         with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             result = await subagent.run_subagent("check email from the dean", "email", mcp)
 
         self.assertIn("Found an email about the budget meeting.", result)
         self.assertIn(subagent.TOOL_DATA_HEADER, result)
-        self.assertIn("[search_emails]", result)
+        self.assertIn("[email_keyword_search]", result)
         self.assertIn("3 emails found", result)
 
     async def test_max_rounds_exhausted(self):
@@ -107,20 +107,20 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "search_emails", "arguments": "{}"},
+                "function": {"name": "email_keyword_search", "arguments": "{}"},
             }],
         }
 
         async def always_tool_call(payload, **kwargs):
             return tool_message
 
-        mcp = _FakeMCP(call_results={"search_emails": "results"})
+        mcp = _FakeMCP(call_results={"email_keyword_search": "results"})
         with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=always_tool_call):
             result = await subagent.run_subagent("check email", "email", mcp)
 
         self.assertIn("Still working...", result)
         self.assertIn(subagent.TOOL_DATA_HEADER, result)
-        self.assertIn("[search_emails]", result)
+        self.assertIn("[email_keyword_search]", result)
 
     async def test_llm_failure_returns_error(self):
         with patch.object(subagent.subagent_llm_client, "complete_with_tools", new_callable=AsyncMock, return_value=None):
@@ -141,7 +141,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "search_emails", "arguments": "{}"},
+                "function": {"name": "email_keyword_search", "arguments": "{}"},
             }],
         }
         final_message = {"content": "Done.", "tool_calls": None}
@@ -158,7 +158,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         async def status_cb(text):
             statuses.append(text)
 
-        mcp = _FakeMCP(call_results={"search_emails": "results"})
+        mcp = _FakeMCP(call_results={"email_keyword_search": "results"})
         with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             await subagent.run_subagent("check email", "email", mcp, status_callback=status_cb)
 
@@ -320,7 +320,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             "role": "assistant",
             "content": (
                 '<tool_call>\n'
-                '{"name": "search_emails", "arguments": {"query": "dean", "limit": 5}}\n'
+                '{"name": "email_keyword_search", "arguments": {"query": "dean", "limit": 5}}\n'
                 '</tool_call>'
             ),
             "tool_calls": None,
@@ -337,7 +337,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
 
         class _CaptureMCP:
             def get_tools_for_servers(self, _servers):
-                return [{"function": {"name": "search_emails"}}]
+                return [{"function": {"name": "email_keyword_search"}}]
 
             async def call_tool(self, name, arguments):
                 captured_args[name] = arguments
@@ -346,7 +346,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             result = await subagent.run_subagent("check email from dean", "email", _CaptureMCP())
 
-        self.assertEqual(captured_args.get("search_emails"), {"query": "dean", "limit": 5})
+        self.assertEqual(captured_args.get("email_keyword_search"), {"query": "dean", "limit": 5})
         self.assertIn("Found the dean's emails.", result)
 
     async def test_xml_tool_call_with_surrounding_prose_is_stripped(self):
@@ -489,7 +489,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "search_emails", "arguments": '{"query": "x"}'},
+                "function": {"name": "email_keyword_search", "arguments": '{"query": "x"}'},
             }],
         }
         final_message = {"content": "done", "tool_calls": None}
@@ -503,7 +503,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
 
         class _CaptureMCP:
             def get_tools_for_servers(self, _servers):
-                return [{"function": {"name": "search_emails"}}]
+                return [{"function": {"name": "email_keyword_search"}}]
 
             async def call_tool(self, name, arguments):
                 invoked.append(name)
@@ -512,7 +512,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(subagent.subagent_llm_client, "complete_with_tools", side_effect=mock_complete):
             await subagent.run_subagent("x", "email", _CaptureMCP())
 
-        self.assertEqual(invoked, ["search_emails"])
+        self.assertEqual(invoked, ["email_keyword_search"])
 
     async def test_xml_tool_call_malformed_falls_through_as_text(self):
         """If a <tool_call> block can't be parsed (no function, no JSON),

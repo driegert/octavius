@@ -103,7 +103,7 @@ TOOLS = [
             "name": "read_note",
             "description": (
                 "Read a note from Dave's vault by its path (as returned by "
-                "save_note or search_vault). Returns the note's title, full "
+                "save_note or vault_search). Returns the note's title, full "
                 "content, and a base_hash you pass back when editing it."
             ),
             "parameters": {

@@ -236,15 +236,19 @@ DEFAULT_KOKORO_VOICES = [
 
 DEFAULT_TOOL_LABELS = {
     "web_search": "Web Search",
-    "search_emails": "Email Search",
-    "semantic_search": "Email Search",
-    "get_email": "Reading Email",
-    "get_emails": "Reading Emails",
-    "get_conversation": "Reading Email Thread",
-    "list_conversations": "Listing Email Threads",
+    # Email tools carry the `email_` tool_prefix (see DEFAULT_MCP_SERVERS);
+    # upstream names were shortened 2026-09-23 (mcp-tools RENAMES-2026-09.md).
+    "email_keyword_search": "Email Search",
+    "email_semantic_search": "Email Search",
+    "email_hybrid_search": "Email Search",
+    "email_get": "Reading Email",
+    "email_get_many": "Reading Emails",
+    "email_get_conversation": "Reading Email Thread",
+    "email_list_conversations": "Listing Email Threads",
     "email_stats": "Email Stats",
-    "find_similar_responses": "Finding Similar Emails",
-    "extract_from_emails": "Extracting from Emails",
+    "email_find_people": "Finding People",
+    "email_find_similar_responses": "Finding Similar Emails",
+    "email_extract": "Extracting from Emails",
     "search_works": "Academic Search",
     "get_work": "Reading Paper",
     "get_related_works": "Finding Related Papers",
@@ -293,7 +297,7 @@ DEFAULT_TOOL_LABELS = {
     "read_note": "Reading Note",
     "edit_note": "Editing Note",
     "commit_edit": "Saving Edit",
-    "search_vault": "Searching Vault",
+    "vault_search": "Searching Vault",
     "search_papers": "Searching Papers",
     "get_paper": "Reading Paper",
     "read_document": "Preparing Document",
@@ -301,7 +305,6 @@ DEFAULT_TOOL_LABELS = {
     "append_to_reader_document": "Extending Document",
     "process_pdf": "Processing PDF",
     "consult_specialist": "Consulting Specialist",
-    "hybrid_search": "Email Search",
     "read_url": "Reading Web Page",
 }
 
@@ -310,6 +313,11 @@ DEFAULT_MCP_SERVERS = {
     "evangeline-email": {
         "transport": "http",
         "url": "http://triplestuffed:8251/mcp",
+        # Upstream tool names were shortened on 2026-09-23 (keyword_search,
+        # get, get_many, stats, extract, ... — mcp-tools RENAMES-2026-09.md)
+        # because clients prefix them; this prefix makes the model see
+        # email_keyword_search, email_get, email_stats, ... exactly as pi does.
+        "tool_prefix": "email",
     },
     "web-search": {
         "transport": "http",
@@ -354,9 +362,13 @@ DEFAULT_MCP_SERVERS = {
         "transport": "http",
         # Vault search (mcp-tools' server_vault.py) — sqlite-vec + FTS5 BM25
         # over the Obsidian vault, RRF-fused. Local client, co-located with the
-        # vault on triplestuffed. Exposes a single `search_vault` tool; the
-        # 03-personal/Journaling/ subtree is excluded server-side.
+        # vault on triplestuffed. Exposes a single upstream tool `search`
+        # (was `search_vault` until 2026-09-23), shown to the model as
+        # `vault_search` via tool_prefix; routes/vault.py calls it by
+        # (server key, "search"). The 03-personal/Journaling/ subtree is
+        # excluded server-side.
         "url": "http://triplestuffed:8254/mcp",
+        "tool_prefix": "vault",
         "tool_description_suffix": (
             " | Search Dave's Obsidian vault (his personal notes and captured "
             "thoughts). Use for 'what did I note about X', 'find my note on Y', "
@@ -518,7 +530,7 @@ Important guidelines for your responses:
   down", or similar, use save_note. For search results, save your summary (not
   raw results). For notes, save his words verbatim. Always give a clear,
   descriptive title.
-- search_vault to find Dave's existing notes. Use when he asks "what did I note
+- vault_search to find Dave's existing notes. Use when he asks "what did I note
   about X", "find my note on Y", or "did I write anything about Z". It returns
   note paths — read one with read_note. Do NOT use this for email (that lives
   in Evangeline) or web/academic lookups.

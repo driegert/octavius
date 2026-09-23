@@ -2,7 +2,7 @@
 
 The vault (`VAULT_PATH`, default ~/Documents/Personal) is plain `.md` files on
 triplestuffed. Agents and the Android app read/create/edit notes directly here;
-search goes through the derived index (the `search_vault` MCP), never this module.
+search goes through the derived index (the vault MCP server's `search` tool), never this module.
 
 Rules enforced (see the frozen vault API contract):
   - New notes land in `00-zettelkasten/001-Fleeting/` only; filename frozen at creation.

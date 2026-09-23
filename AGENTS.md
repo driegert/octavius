@@ -287,7 +287,7 @@ orchestrator. Re-enabling it is one tool spec + one registry line. Quick
 domains (email/tasks/research) deliberately stay inline (low voice latency,
 warm MCP sessions); only long-running deep research is backgrounded.
 
-The email subagent prompt uses evangeline's `hybrid_search` (RRF fusion of
+The email subagent prompt uses evangeline's `email_hybrid_search` (RRF fusion of
 semantic + BM25) for anything matching on body text. **Folder scope is a closed
 set of five values** — `"Inbox"` (the default), `"Read Later"`, `"Follow-Up"`,
 `"Todo"`, or All (`folder=null`) — and All requires Dave to ask for it
@@ -304,8 +304,8 @@ Two traps the prompt now names, both of which cost real turns:
   mail". The prompt used to say `folder="INBOX"`, which matches **nothing**
   (the folder is `Inbox`). A zero-result folder search should be read as a
   suspected typo first.
-- The tools disagree on their own defaults (`hybrid_search` defaults to all
-  folders; `search_emails` / `semantic_search` default to Inbox *and* a 6-month
+- The tools disagree on their own defaults (`email_hybrid_search` defaults to all
+  folders; `email_keyword_search` / `email_semantic_search` default to Inbox *and* a 6-month
   lookback), so the prompt requires `folder` to be passed explicitly on every
   call rather than relying on any tool's default.
 
@@ -395,10 +395,21 @@ External services currently expected:
 
 Configured MCP servers:
 
-- `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
+**Tool naming (2026-09-23).** `MCPManager` keys every tool by its model-facing name and routes it to
+(server, upstream name). A server with `tool_prefix` in `DEFAULT_MCP_SERVERS` exposes its tools as
+`<prefix>_<tool>` (not doubled if the upstream name already starts with it — pi-mcp-adapter's rule).
+On a name collision the **first** registered server keeps the bare name and the later one is exposed as
+`<server key>_<name>` with a warning — before 2026-09-23 the later server silently overwrote the earlier.
+Code that targets one server (e.g. `routes/vault.py`) uses `call_server_tool(server, upstream_name, ...)`
+so it never depends on display names. Upstream renames: mcp-tools `RENAMES-2026-09.md`.
+
+- `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`, `tool_prefix: "email"` → `email_hybrid_search`,
+  `email_keyword_search` (was `search_emails`), `email_get` / `email_get_many` (were `get_email` / `get_emails`),
+  `email_stats`, `email_extract` (was `extract_from_emails`), ... The calendar tools that used to live on this
+  server moved to mcp-tools' `server_calendar.py` (:8258); Octavius does not register the calendar server.
 - `web-search`: stdio subprocess (mcp-tools' `server_serper.py`, run via its own venv). Exposes a single `web_search` tool — the "search" half of the search → read → reason pipeline. **Serper.dev (Google) is primary; self-hosted SearXNG (`searxng.riegert.xyz`) is a backstop that answers only when Serper *errors*** — an empty Serper result is a valid answer to an obscure query and is not retried against a weaker index. Surfaced directly to the main agent, not behind a specialist. The order was inverted 2026-08-20: SearXNG's `bing` engine was returning topic-unrelated pages while reporting HTTP 200 success (`unresponsive_engines: []`), so roughly two results in three were junk and the old "SearXNG returned nothing" fallback trigger never fired. The backstop is now pinned to `engines=duckduckgo,wikipedia` (`SEARX_ENGINES`). When it answers, the JSON carries `fallback_reason` and `provider: "searxng"`. `server_serper.py` reads `SERPER_API_KEY` from `mcp-tools/.env` and trusts the system CA bundle for SearXNG's Caddy cert on its own (no env needed in the server config). **Without `SERPER_API_KEY` the primary arm is inert — web search runs permanently on the degraded backstop.** Mirrors `pi_harness/extensions/web-search/src/index.ts`; change one, change the other. Replaced the old varlabz `searxng-mcp` (`search` tool, SearXNG-only, no fallback).
 - `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `web-search`), not behind a specialist.
-- `vault-search`: streamable HTTP at `triplestuffed:8254/mcp` (mcp-tools' `server_vault.py` — sqlite-vec + FTS5 BM25 over the Obsidian vault, RRF-fused; co-located with the vault). Exposes a single `search_vault` tool, surfaced directly to the main agent. The `03-personal/Journaling/` subtree is excluded server-side. Search is the only vault operation that goes through MCP — note reads/writes are local file I/O (see "Vault" under Feature Notes).
+- `vault-search`: streamable HTTP at `triplestuffed:8254/mcp` (mcp-tools' `server_vault.py` — sqlite-vec + FTS5 BM25 over the Obsidian vault, RRF-fused; co-located with the vault). Exposes a single upstream tool `search` (was `search_vault` until 2026-09-23), shown as `vault_search` via `tool_prefix: "vault"`, surfaced directly to the main agent. The `03-personal/Journaling/` subtree is excluded server-side. Search is the only vault operation that goes through MCP — note reads/writes are local file I/O (see "Vault" under Feature Notes).
 - `paper-search`: streamable HTTP at `127.0.0.1:8206/mcp` (mcp-tools'
   `server_papers.py` — sqlite-vec + FTS5 BM25 over Dave's converted Paperpile
   library at `/media/extra_stuff/papers/`, RRF-fused; runs as the
@@ -467,7 +478,7 @@ Route modules:
 - `routes/conversations.py` - conversation history API routes
 - `routes/media.py` - `POST /api/media/upload` for non-sidecar clients (Android); thin adapter over `media_uploads.py`
 - `routes/reader_api.py` - reader page and reader REST API routes
-- `routes/vault.py` - vault REST API (`/api/vault/{recent,note,search}`); search proxies the `search_vault` MCP, everything else is local file I/O via `vault_files.py`
+- `routes/vault.py` - vault REST API (`/api/vault/{recent,note,search}`); search proxies the vault server's `search` tool via `call_server_tool("vault-search", "search", ...)`, everything else is local file I/O via `vault_files.py`
 
 Conversation and tool loop:
 
@@ -584,7 +595,7 @@ notes; the DB stash write path is retired. The vault (`VAULT_PATH`, default
 
 - Agent tools (local, in `local_tool_vault.py` over `vault_files.py`):
   `save_note`, `read_note`, `edit_note`, `commit_edit`. Search is the
-  `search_vault` MCP tool (vault-search server), which reads a derived
+  `vault_search` MCP tool (vault-search server, upstream `search`), which reads a derived
   sqlite-vec + FTS5 index, never the files directly.
 - Frozen vault API contract rules, enforced in `vault_files.py`: new notes
   land in `00-zettelkasten/001-Fleeting/` only (filename frozen at creation);
