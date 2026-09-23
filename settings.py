@@ -319,6 +319,14 @@ DEFAULT_MCP_SERVERS = {
         # email_keyword_search, email_get, email_stats, ... exactly as pi does.
         "tool_prefix": "email",
     },
+    "calendar": {
+        "transport": "http",
+        # mcp-tools' server_calendar.py (calendar-mcp.service), split out of the
+        # email server on 2026-09-23. Loopback like web-search; Octavius must not
+        # start before this unit is up (an unreachable server aborts connect_all).
+        "url": "http://127.0.0.1:8208/mcp",
+        "tool_prefix": "calendar",
+    },
     "web-search": {
         "transport": "http",
         # mcp-tools' server_serper.py, served as a shared streamable-HTTP
