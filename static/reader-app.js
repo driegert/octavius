@@ -48,6 +48,13 @@
   const railOpen = $('rail-open');
   const railClose = $('rail-close');
   const scrim = $('scrim');
+  const railTabs = $('rail-tabs');
+  const tabLibrary = $('tab-library');
+  const tabContents = $('tab-contents');
+  const paneLibrary = $('pane-library');
+  const paneContents = $('pane-contents');
+  const tocDoc = $('toc-doc');
+  const tocTree = $('toc-tree');
 
   let ws = null;
   let connected = false;
@@ -59,6 +66,7 @@
   let currentDoc = null;
   let isPlaying = false;
   let finished = false;
+  let stopped = false;
   let currentChunk = 0;
   let currentSentence = 0;
   let totalSentences = 0;
@@ -78,6 +86,11 @@
   let sentenceEls = new Map();
   let markedEl = null;
   let follow = true;
+
+  // Table of contents for the open document.
+  let tocLinks = new Map(); // section index -> link element
+  let tocCurrent = null;
+  let railTab = 'library';
 
   // ---------- Preferences ----------
 
@@ -184,6 +197,7 @@
     } else if (playable()) {
       state = 'idle';
       if (finished) text = 'Finished';
+      else if (stopped) text = 'Stopped';
       else if (currentChunk > 0 || currentSentence > 0) text = 'Paused';
       else text = 'Ready';
     }
@@ -225,6 +239,7 @@
   function markSentence(chunkIdx, sentIdx, scroll) {
     if (markedEl) markedEl.classList.remove('active', 'cursor');
     markedEl = sentenceEls.get(chunkIdx + ':' + sentIdx) || null;
+    updateTocCurrent(chunkIdx);
     if (!markedEl) return;
     markedEl.classList.add(isPlaying ? 'active' : 'cursor');
     if (scroll && follow) {
@@ -273,6 +288,9 @@
     progressTot.textContent = totalSentences;
     whereEl.textContent = pos.heading || sectionHeading(pos.chunk_index);
     markSentence(pos.chunk_index, pos.sentence_index, true);
+    // Keep the open document's row current; after reader_audio_done the queued
+    // tail must not pull "Finished" back down.
+    if (!finished) setDocProgress(currentDocId, pos.sentence_global, pos.total_sentences);
   }
 
   async function playNextAudio() {
@@ -362,6 +380,7 @@
         if (msg.type === 'reader_audio_done') {
           isPlaying = false;
           finished = true;
+          if (totalSentences) setDocProgress(currentDocId, totalSentences, totalSentences);
           refreshTransport();
         }
         if (msg.type === 'status' && isPlaying && /not ready|not found/i.test(String(msg.text || ''))) {
@@ -394,6 +413,7 @@
     playSeqId++;
     const mySeq = playSeqId;
     finished = false;
+    stopped = false;
     follow = true;
     followBtn.hidden = true;
     isPlaying = true;
@@ -412,9 +432,17 @@
     }, 100);
   }
 
+  // The server synthesizes ahead of what is heard, so pause and stop tell it the
+  // sentence actually playing; it saves that as the place instead of its own.
+  function heardPlace() {
+    return isPlaying && currentDocId
+      ? { doc_id: currentDocId, chunk_index: currentChunk, sentence_index: currentSentence }
+      : {};
+  }
+
   function sendPause() {
     playSeqId++;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_pause' }));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_pause', ...heardPlace() }));
     clearAudioQueue();
     isPlaying = false;
     followBtn.hidden = true;
@@ -422,18 +450,24 @@
     refreshTransport();
   }
 
+  // Leaving mid-play: without this the server keeps the further-ahead place it streamed to.
+  window.addEventListener('pagehide', () => {
+    if (isPlaying && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'reader_pause', ...heardPlace() }));
+    }
+  });
+
   function sendStop() {
-    // Stop playback and rewind to the beginning of the document.
+    // Stop playback but keep the place on the sentence being read: the next Play
+    // starts that sentence again from its beginning.
     playSeqId++;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_stop' }));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_stop', ...heardPlace() }));
     clearAudioQueue();
     isPlaying = false;
-    finished = false;
+    stopped = true;
     followBtn.hidden = true;
-    currentChunk = firstChunk();
-    currentSentence = 0;
-    showProgress(0);
-    markSentence(currentChunk, 0, 'smooth');
+    showProgress(globalIndex(currentChunk, currentSentence));
+    markSentence(currentChunk, currentSentence, false);
     refreshTransport();
   }
 
@@ -455,6 +489,7 @@
     currentChunk = chunkIdx;
     currentSentence = sentIdx;
     finished = false;
+    stopped = false;
     showProgress(globalIndex(chunkIdx, sentIdx));
     follow = true;
     followBtn.hidden = true;
@@ -567,13 +602,16 @@
     emptyEl.hidden = true;
     isPlaying = false;
     finished = false;
+    stopped = false;
     follow = true;
     followBtn.hidden = true;
+    syncDocFromDetail(doc);
     sentenceEls = new Map();
     markedEl = null;
     sectionsEl.innerHTML = '';
 
     if (doc.status !== 'ready') {
+      buildToc(null);
       renderDocState(doc);
       currentChunk = 0;
       currentSentence = 0;
@@ -628,7 +666,11 @@
       currentChunk = firstChunk();
       currentSentence = 0;
     }
+    // Read to the end last time: show it as finished, and Play starts over.
+    const prog = numOrNull(doc.progress_sentences);
+    if (totalSentences && prog !== null && prog >= totalSentences) finished = true;
     showProgress(globalIndex(currentChunk, currentSentence));
+    buildToc(doc);
 
     if (doc.error) {
       setNotice(`The last update didn’t go through: ${doc.error}`, 'error');
@@ -742,6 +784,7 @@
     emptyEl.hidden = false;
     playerTitle.textContent = 'Reader';
     playerEdit.hidden = true;
+    buildToc(null);
     showProgress(0);
     markCurrentInList();
     refreshTransport();
@@ -752,6 +795,181 @@
     } catch (_err) {
     }
   }
+
+  // ---------- Reading progress ----------
+
+  function numOrNull(v) {
+    return typeof v === 'number' && isFinite(v) ? v : null;
+  }
+
+  // Returns {pct, done} or null when there is nothing worth showing (unknown or not started).
+  function progressOf(doc) {
+    const total = numOrNull(doc.total_sentences);
+    const done = numOrNull(doc.progress_sentences);
+    if (!total || done === null || done <= 0) return null;
+    if (done >= total) return { pct: 100, done: true };
+    return { pct: Math.max(1, Math.min(99, Math.floor((100 * done) / total))), done: false };
+  }
+
+  function paintRowProgress(row, doc) {
+    const pctEl = row.querySelector('.doc-pct');
+    const bar = row.querySelector('.doc-bar');
+    if (!pctEl || !bar) return;
+    const p = progressOf(doc);
+    pctEl.hidden = !p;
+    bar.hidden = !p;
+    if (!p) return;
+    pctEl.textContent = p.done ? 'Finished' : `${p.pct}%`;
+    pctEl.classList.toggle('done', p.done);
+    bar.classList.toggle('done', p.done);
+    bar.firstElementChild.style.width = p.pct + '%';
+    bar.setAttribute('aria-label', p.done ? 'Finished' : `${p.pct}% read`);
+  }
+
+  function setDocProgress(id, done, total) {
+    if (id == null) return;
+    const doc = docs.find((d) => d.id === id);
+    if (!doc) return;
+    doc.progress_sentences = done;
+    if (numOrNull(total)) doc.total_sentences = total;
+    const row = docList.querySelector(`.doc[data-id="${id}"]`);
+    if (row) paintRowProgress(row, doc);
+  }
+
+  // The detail endpoint carries the same two fields; fold them into the list entry.
+  function syncDocFromDetail(doc) {
+    const entry = docs.find((d) => d.id === doc.id);
+    if (!entry) return;
+    entry.total_sentences = numOrNull(doc.total_sentences);
+    entry.progress_sentences = numOrNull(doc.progress_sentences);
+    entry.status = doc.status;
+    const row = docList.querySelector(`.doc[data-id="${doc.id}"]`);
+    if (row) paintRowProgress(row, entry);
+  }
+
+  // ---------- Table of contents ----------
+
+  const CHEVRON = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>';
+
+  function tocAvailable() {
+    return tocLinks.size >= 2;
+  }
+
+  function buildToc(doc) {
+    tocTree.innerHTML = '';
+    tocLinks = new Map();
+    tocCurrent = null;
+    const heads = ((doc && doc.sections) || []).filter((sec) => sec.heading);
+    if (heads.length < 2) {
+      railTabs.hidden = true;
+      selectRailTab('library', true);
+      return;
+    }
+    tocDoc.textContent = doc.title || '';
+
+    // Nest by level (1-3); documents converted before levels existed are flat.
+    const root = { level: 0, children: [], el: tocTree };
+    const stack = [root];
+    for (const sec of heads) {
+      const lv = [1, 2, 3].includes(sec.level) ? sec.level : 1;
+      while (stack.length > 1 && stack[stack.length - 1].level >= lv) stack.pop();
+      const parent = stack[stack.length - 1];
+      const node = { level: lv, sec, children: [], parent };
+      parent.children.push(node);
+      stack.push(node);
+    }
+
+    function render(nodes, ul) {
+      for (const node of nodes) {
+        const li = document.createElement('li');
+        li.className = 'toc-item';
+        li.setAttribute('role', 'treeitem');
+        const row = document.createElement('div');
+        row.className = 'toc-row';
+        if (node.children.length) {
+          li.classList.add('collapsed');
+          li.setAttribute('aria-expanded', 'false');
+          const tog = document.createElement('button');
+          tog.type = 'button';
+          tog.className = 'toc-toggle';
+          tog.setAttribute('aria-label', `Show or hide subsections of ${node.sec.heading}`);
+          tog.innerHTML = CHEVRON;
+          tog.addEventListener('click', () => setExpanded(li, li.classList.contains('collapsed')));
+          row.appendChild(tog);
+        } else {
+          const sp = document.createElement('span');
+          sp.className = 'toc-spacer';
+          row.appendChild(sp);
+        }
+        const link = document.createElement('button');
+        link.type = 'button';
+        link.className = 'toc-link';
+        link.textContent = node.sec.heading;
+        link.dataset.c = node.sec.index;
+        link.addEventListener('click', () => {
+          seekTo(node.sec.index, 0);
+          if (window.matchMedia('(max-width: 860px)').matches) closeRail();
+        });
+        row.appendChild(link);
+        li.appendChild(row);
+        tocLinks.set(node.sec.index, link);
+        if (node.children.length) {
+          const sub = document.createElement('ul');
+          sub.setAttribute('role', 'group');
+          render(node.children, sub);
+          li.appendChild(sub);
+        }
+        ul.appendChild(li);
+      }
+    }
+    render(root.children, tocTree);
+    railTabs.hidden = false;
+    selectRailTab(railTab, true);
+  }
+
+  function setExpanded(li, open) {
+    li.classList.toggle('collapsed', !open);
+    li.setAttribute('aria-expanded', String(open));
+  }
+
+  // The heading section the reader is currently inside, if any.
+  function headingFor(chunkIdx) {
+    let found = null;
+    for (const idx of tocLinks.keys()) {
+      if (idx <= chunkIdx) found = idx;
+      else break;
+    }
+    return found;
+  }
+
+  function updateTocCurrent(chunkIdx) {
+    if (!tocLinks.size) return;
+    const idx = headingFor(chunkIdx);
+    const link = idx === null ? null : tocLinks.get(idx);
+    if (link === tocCurrent) return;
+    if (tocCurrent) tocCurrent.removeAttribute('aria-current');
+    tocCurrent = link;
+    if (!link) return;
+    link.setAttribute('aria-current', 'true');
+    // Open the branch that holds the current section.
+    for (let li = link.closest('.toc-item'); li; li = li.parentElement && li.parentElement.closest('.toc-item')) {
+      if (li.querySelector(':scope > ul') && li !== link.closest('.toc-item')) setExpanded(li, true);
+    }
+    if (!paneContents.hidden) link.scrollIntoView({ block: 'nearest' });
+  }
+
+  function selectRailTab(which, quiet) {
+    if (which === 'contents' && !tocAvailable()) which = 'library';
+    if (!quiet) railTab = which;
+    const contents = which === 'contents';
+    tabLibrary.setAttribute('aria-selected', String(!contents));
+    tabContents.setAttribute('aria-selected', String(contents));
+    paneLibrary.hidden = contents;
+    paneContents.hidden = !contents;
+    if (contents && tocCurrent) tocCurrent.scrollIntoView({ block: 'nearest' });
+  }
+  tabLibrary.addEventListener('click', () => selectRailTab('library'));
+  tabContents.addEventListener('click', () => selectRailTab('contents'));
 
   // ---------- Library ----------
 
@@ -788,12 +1006,14 @@
       row.innerHTML = `
         <button type="button" class="doc-open">
           <span class="doc-title">${esc(doc.title)}</span>
-          <span class="doc-meta">${stateTag}${source ? `<span>${esc(source)}</span><span class="sep"></span>` : ''}<span>${esc(formatDate(doc.created_at))}</span></span>
+          <span class="doc-meta">${stateTag}<span class="doc-pct" hidden></span><span class="sep"></span>${source ? `<span>${esc(source)}</span><span class="sep"></span>` : ''}<span>${esc(formatDate(doc.created_at))}</span></span>
+          <span class="doc-bar" hidden><span></span></span>
         </button>
         <div class="doc-actions">
           ${doc.status === 'failed' ? `<button class="icon-btn" data-act="retry" title="Retry" aria-label="Retry ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.7-5.6L20 8.7M20 4v4.7h-4.7M20 12a8 8 0 0 1-13.7 5.6L4 15.3M4 20v-4.7h4.7"/></svg></button>` : ''}
           <button class="icon-btn danger" data-act="delete" title="Delete" aria-label="Delete ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg></button>
         </div>`;
+      paintRowProgress(row, doc);
       docList.appendChild(row);
     }
     markCurrentInList();
@@ -1175,13 +1395,23 @@
       if (!editBar.hidden && editBar.contains(document.activeElement)) { closeEditBar(); return; }
       if (shell.classList.contains('rail-open')) { closeRail(); return; }
       if (isTypingTarget(document.activeElement)) return;
-      if (isPlaying || finished || currentChunk > 0 || currentSentence > 0) sendStop();
+      if (isPlaying || audioQueue.length || currentAudio) sendStop();
       return;
     }
     if (isTypingTarget(document.activeElement)) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if ((event.key === 't' || event.key === 'T') && !event.shiftKey) {
+      if (!tocAvailable()) return;
+      event.preventDefault();
+      const narrow = window.matchMedia('(max-width: 860px)').matches;
+      if (narrow && !shell.classList.contains('rail-open')) { selectRailTab('contents'); openRail(); return; }
+      selectRailTab(railTab === 'contents' ? 'library' : 'contents');
+      if (narrow && railTab === 'library') closeRail();
+      return;
+    }
     if (event.key === '/') {
       event.preventDefault();
+      selectRailTab('library');
       if (window.matchMedia('(max-width: 860px)').matches) openRail();
       searchInput.focus();
       return;

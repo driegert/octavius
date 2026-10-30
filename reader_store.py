@@ -43,11 +43,32 @@ def update_document(conn: sqlite3.Connection, doc_id: int, **kwargs):
     conn.commit()
 
 
+def sentences_before(chunks: list[dict], chunk_index: int, sentence_index: int) -> int:
+    """How many sentences precede (chunk_index, sentence_index), clamped to the document."""
+    total = sum(len(c["sentences"]) for c in chunks)
+    before = sum(len(c["sentences"]) for c in chunks[:max(chunk_index, 0)])
+    return min(before + max(sentence_index, 0), total)
+
+
+def _backfill_progress(conn: sqlite3.Connection, doc_id: int, speech_file: str | None,
+                       last_chunk: int, last_sentence: int) -> tuple[int | None, int | None]:
+    """Fill total/progress for a ready row written before those columns existed."""
+    speech = load_speech_data({"speech_file": speech_file})
+    if not speech:
+        return None, None
+    chunks = speech.get("chunks") or []
+    total = sum(len(c["sentences"]) for c in chunks)
+    progress = sentences_before(chunks, last_chunk, last_sentence)
+    update_document(conn, doc_id, total_sentences=total, progress_sentences=progress)
+    return total, progress
+
+
 def get_document(conn: sqlite3.Connection, doc_id: int) -> dict | None:
     row = conn.execute(
         """SELECT id, title, source_type, source_path, saved_item_id,
                   speech_file, original_md_file, chunk_count, status, error,
-                  last_chunk, last_sentence, created_at, updated_at
+                  last_chunk, last_sentence, created_at, updated_at,
+                  total_sentences, progress_sentences
            FROM reader_documents WHERE id = ?""",
         (doc_id,),
     ).fetchone()
@@ -60,6 +81,7 @@ def get_document(conn: sqlite3.Connection, doc_id: int) -> dict | None:
         "chunk_count": row[7], "status": row[8], "error": row[9],
         "last_chunk": row[10], "last_sentence": row[11],
         "created_at": row[12], "updated_at": row[13],
+        "total_sentences": row[14], "progress_sentences": row[15],
     }
 
 
@@ -68,7 +90,8 @@ def list_documents(
     limit: int = 50,
     status: str | None = None,
 ) -> list[dict]:
-    sql = """SELECT id, title, source_type, chunk_count, status, error, created_at
+    sql = """SELECT id, title, source_type, chunk_count, status, error, created_at,
+                    total_sentences, progress_sentences, speech_file, last_chunk, last_sentence
              FROM reader_documents"""
     params: list = []
     if status:
@@ -77,11 +100,17 @@ def list_documents(
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = conn.execute(sql, params).fetchall()
-    return [
-        {"id": r[0], "title": r[1], "source_type": r[2],
-         "chunk_count": r[3], "status": r[4], "error": r[5], "created_at": r[6]}
-        for r in rows
-    ]
+    docs = []
+    for r in rows:
+        total, progress = r[7], r[8]
+        if total is None and r[4] == "ready":
+            total, progress = _backfill_progress(conn, r[0], r[9], r[10], r[11])
+        docs.append({
+            "id": r[0], "title": r[1], "source_type": r[2],
+            "chunk_count": r[3], "status": r[4], "error": r[5], "created_at": r[6],
+            "total_sentences": total, "progress_sentences": progress,
+        })
+    return docs
 
 
 def delete_document(conn: sqlite3.Connection, doc_id: int) -> bool:

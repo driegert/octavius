@@ -1,0 +1,74 @@
+#!/usr/bin/env -S uv run python
+"""Add heading `level`s to reader documents converted before 2026-10-30.
+
+The reader's table of contents nests sections by `level` (1-3 from #/##/###),
+which conversion used to throw away. For a ready document whose source markdown
+still exists (original_md_file, or a .md source_path), this walks the markdown's
+headings in order and gives each heading chunk the level of the next markdown
+heading with the same text. Chunks it cannot match are left alone (clients treat
+a missing level as 1). Additive only; the speech JSON is rewritten atomically.
+
+    scripts/reader-backfill-heading-levels            # dry run: report only
+    scripts/reader-backfill-heading-levels --apply
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from reader_text import HEADING_RE, _atomic_write_json  # noqa: E402
+
+
+def levels_for(chunks: list[dict], markdown: str) -> dict[int, int]:
+    heads = [(len(m.group(1)), m.group(2).strip()) for m in HEADING_RE.finditer(markdown)]
+    found, pos = {}, 0
+    for i, chunk in enumerate(chunks):
+        if not chunk.get("heading") or chunk.get("level"):
+            continue
+        for j in range(pos, len(heads)):
+            if heads[j][1] == chunk["heading"]:
+                found[i], pos = heads[j][0], j + 1
+                break
+    return found
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--db", default=os.environ.get("OCTAVIUS_DB_PATH", "/media/extra_stuff/octavius/octavius_history.db"))
+    args = ap.parse_args()
+
+    conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    rows = conn.execute(
+        "SELECT id, title, speech_file, original_md_file, source_path FROM reader_documents WHERE status = 'ready'"
+    ).fetchall()
+    conn.close()
+
+    for doc_id, title, speech_file, original_md, source_path in rows:
+        md = next((p for p in (original_md, source_path) if p and p.endswith(".md") and os.path.exists(p)), None)
+        if not md or not speech_file or not os.path.exists(speech_file):
+            continue
+        speech = json.loads(Path(speech_file).read_text(encoding="utf-8"))
+        chunks = speech.get("chunks") or []
+        missing = sum(1 for c in chunks if c.get("heading") and not c.get("level"))
+        if not missing:
+            continue
+        found = levels_for(chunks, Path(md).read_text(encoding="utf-8", errors="replace"))
+        depth = sorted({lvl for lvl in found.values()})
+        print(f"{doc_id:>4}  {len(found)}/{missing} headings matched, levels {depth}  {title[:60]}")
+        if args.apply and found:
+            for i, lvl in found.items():
+                chunks[i]["level"] = lvl
+            _atomic_write_json(Path(speech_file), speech)
+    if not args.apply:
+        print("(dry run; pass --apply to write)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

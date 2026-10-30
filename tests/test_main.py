@@ -100,6 +100,8 @@ def _init_inbox_delete_db(db_path: Path):
             error TEXT,
             last_chunk INTEGER NOT NULL DEFAULT 0,
             last_sentence INTEGER NOT NULL DEFAULT 0,
+            total_sentences INTEGER,
+            progress_sentences INTEGER,
             created_at TEXT NOT NULL DEFAULT 'now',
             updated_at TEXT
         );

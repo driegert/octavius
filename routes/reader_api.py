@@ -2,7 +2,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from db import connect_db
-from reader_store import delete_document, get_document, list_documents, load_speech_data
+from reader_store import delete_document, get_document, list_documents, load_speech_data, sentences_before
 from reader_ingest_service import (
     ReaderIngestError,
     append_reader_document,
@@ -47,10 +47,15 @@ async def reader_get(doc_id: int, request: Request):
             speech = load_speech_data(doc)
             if speech:
                 doc["total_sentences"] = speech.get("total_sentences", 0)
+                if doc.get("progress_sentences") is None:
+                    doc["progress_sentences"] = sentences_before(
+                        speech["chunks"], doc["last_chunk"], doc["last_sentence"])
                 doc["sections"] = [
                     {
                         "index": c["index"],
                         "heading": c["heading"],
+                        # 1-3 when the heading's depth is known; older documents omit it.
+                        **({"level": c["level"]} if c.get("level") and c.get("heading") else {}),
                         "sentence_count": len(c["sentences"]),
                         # Full sentence text so clients can render a tappable read-along and
                         # seek to any sentence. Additive; the PWA ignores the extra field.

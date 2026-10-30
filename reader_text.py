@@ -20,6 +20,7 @@ from reader_store import (
     load_appendices,
     load_speech_data,
     save_appendix,
+    sentences_before,
     update_document,
 )
 
@@ -58,6 +59,7 @@ def split_into_chunks(markdown: str) -> list[dict]:
     """Split markdown into chunks by headings and paragraphs."""
     chunks = []
     current_heading = None
+    current_level = None
     current_text_parts = []
 
     for line in markdown.split("\n"):
@@ -65,15 +67,16 @@ def split_into_chunks(markdown: str) -> list[dict]:
         if heading_match:
             text = "\n".join(current_text_parts).strip()
             if text:
-                chunks.append({"heading": current_heading, "text": text})
+                chunks.append({"heading": current_heading, "level": current_level, "text": text})
             current_heading = heading_match.group(2).strip()
+            current_level = len(heading_match.group(1))
             current_text_parts = []
         else:
             current_text_parts.append(line)
 
     text = "\n".join(current_text_parts).strip()
     if text:
-        chunks.append({"heading": current_heading, "text": text})
+        chunks.append({"heading": current_heading, "level": current_level, "text": text})
 
     final_chunks = []
     for chunk in chunks:
@@ -87,6 +90,7 @@ def split_into_chunks(markdown: str) -> list[dict]:
                     continue
                 final_chunks.append({
                     "heading": chunk["heading"] if i == 0 else None,
+                    "level": chunk["level"] if i == 0 else None,
                     "text": para,
                 })
 
@@ -230,12 +234,17 @@ def _build_speech_chunks(raw_chunks: list[dict], converted_texts: list[str], sta
         sentences = split_sentences(speech_text)
         if not sentences:
             sentences = [speech_text] if speech_text else [""]
-        speech_chunks.append({
+        chunk = {
             "index": i,
             "heading": raw_chunk["heading"],
             "speech_text": speech_text,
             "sentences": sentences,
-        })
+        }
+        # Heading depth (1-3, from #/##/###) for the reader's table of contents.
+        # Documents converted before 2026-10-30 have none; clients treat that as 1.
+        if raw_chunk["heading"] and raw_chunk.get("level"):
+            chunk["level"] = raw_chunk["level"]
+        speech_chunks.append(chunk)
     return speech_chunks
 
 
@@ -262,6 +271,8 @@ def _write_speech(conn: sqlite3.Connection, doc_id: int, title: str, chunks: lis
     if row and row.get("title"):
         title = row["title"]
     _atomic_write_json(speech_path, {"title": title, "total_sentences": total_sentences, "chunks": chunks})
+    last_chunk = fields.get("last_chunk", row["last_chunk"] if row else 0)
+    last_sentence = fields.get("last_sentence", row["last_sentence"] if row else 0)
     update_document(
         conn,
         doc_id,
@@ -269,6 +280,8 @@ def _write_speech(conn: sqlite3.Connection, doc_id: int, title: str, chunks: lis
         chunk_count=len(chunks),
         status="ready",
         error=None,
+        total_sentences=total_sentences,
+        progress_sentences=sentences_before(chunks, last_chunk, last_sentence),
         **fields,
     )
     log.info("Reader: document %d ready — %d chunks, %d sentences", doc_id, len(chunks), total_sentences)

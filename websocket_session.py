@@ -22,7 +22,7 @@ except ModuleNotFoundError:
 import docproc_client
 import media_uploads
 from conversation import Conversation
-from reader_playback import stream_reader_audio
+from reader_playback import save_heard_position, stream_reader_audio
 from settings import settings
 from subagent import run_subagent
 from subagent_dispatcher import SubagentTicket
@@ -641,11 +641,20 @@ class WebSocketSessionHandler:
             )
         )
 
-    async def handle_reader_pause(self, _data: dict):
+    async def handle_reader_pause(self, data: dict):
         await self.cancel_reader_task()
+        self._save_heard_position(data)
 
-    async def handle_reader_stop(self, _data: dict):
+    async def handle_reader_stop(self, data: dict):
         await self.cancel_reader_task()
+        self._save_heard_position(data)
+
+    def _save_heard_position(self, data: dict) -> None:
+        # Optional fields (2026-10-30): the sentence the client was hearing. Saved after
+        # the cancel, so it replaces the further-ahead place the stream recorded.
+        if "chunk_index" in data:
+            save_heard_position(self.state.history.db_path, data.get("doc_id"),
+                                data.get("chunk_index"), data.get("sentence_index"))
 
     async def handle_item_chat_load(self, data: dict):
         from history import (

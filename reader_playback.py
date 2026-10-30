@@ -8,9 +8,32 @@ from pathlib import Path
 from db import connect_db
 from tts import synthesize
 
-from reader_store import get_document, load_speech_data, update_document
+from reader_store import get_document, load_speech_data, sentences_before, update_document
 
 log = logging.getLogger(__name__)
+
+
+def save_heard_position(db_path: str | Path, doc_id, chunk_index, sentence_index) -> bool:
+    """Persist the sentence the client was actually hearing when it paused or stopped.
+
+    stream_reader_audio synthesizes ahead of playback (TTS is far faster than
+    speech and nothing applies backpressure), so the place it saves on cancel can
+    be many sentences past what Dave heard. The client knows; this takes its word,
+    clamped to the document. Ignores anything malformed. Returns True if saved.
+    """
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (doc_id, chunk_index, sentence_index)):
+        return False
+    with connect_db(Path(db_path)) as conn:
+        doc = get_document(conn, doc_id)
+        speech = load_speech_data(doc) if doc and doc["status"] == "ready" else None
+        if not speech or not speech.get("chunks"):
+            return False
+        chunks = speech["chunks"]
+        chunk_index = min(max(chunk_index, 0), len(chunks) - 1)
+        sentence_index = min(max(sentence_index, 0), max(len(chunks[chunk_index]["sentences"]) - 1, 0))
+        update_document(conn, doc_id, last_chunk=chunk_index, last_sentence=sentence_index,
+                        progress_sentences=sentences_before(chunks, chunk_index, sentence_index))
+    return True
 
 
 async def stream_reader_audio(
@@ -70,18 +93,21 @@ async def stream_reader_audio(
                         "sentence_text": sentence,
                     }))
 
-                    update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index)
+                    update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index,
+                                    progress_sentences=sentence_global)
 
                     wav_bytes = await synthesize(sentence, voice=voice)
                     await ws.send_bytes(wav_bytes)
 
                     sentence_global += 1
 
-            update_document(conn, doc_id, last_chunk=0, last_sentence=0)
+            # Read to the end: the next play starts over, but the list shows it finished.
+            update_document(conn, doc_id, last_chunk=0, last_sentence=0, progress_sentences=total_sentences)
             await ws.send_text(json.dumps({"type": "reader_audio_done", "seq": seq}))
 
         except asyncio.CancelledError:
-            update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index)
+            update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index,
+                            progress_sentences=sentences_before(chunks, current_chunk_index, current_sentence_index))
             log.info(
                 "Reader: playback paused at chunk %d, sentence %d",
                 current_chunk_index,

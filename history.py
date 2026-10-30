@@ -76,6 +76,13 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             "ALTER TABLE conversations ADD COLUMN last_extracted_message_id INTEGER"
         )
         log.info("Migration: added conversations.last_extracted_message_id")
+    reader_cols = {row[1] for row in conn.execute("PRAGMA table_info(reader_documents)")}
+    for col in ("total_sentences", "progress_sentences"):
+        if col not in reader_cols:
+            # Per-document reading progress for the /reader list. Existing rows
+            # start NULL and are filled lazily by reader_store.list_documents.
+            conn.execute(f"ALTER TABLE reader_documents ADD COLUMN {col} INTEGER")
+            log.info("Migration: added reader_documents.%s", col)
     # `conversations.indexed` (2026-08-10 → 2026-09-15) is no longer added or
     # written. It recorded the summariser's index decision for the retired
     # sweeper; the library indexes every conversation with a non-empty summary,

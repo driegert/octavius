@@ -510,7 +510,10 @@ WebSocket message families:
 - Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
 - Text streaming (server→client): `response_delta` — one sentence of the reply as it streams, emitted before the final `response` (which stays authoritative). The Matrix sidecar edits its thread message in place from these; the browser ignores the frame.
 - Matrix media (client→server, same session/threading semantics as `text_input`): `image_input`, `file_input` — frozen contract, see `docs/ws-media-contract.md`. Both repos (`octavius`, `matrix-agent-sidecar`) implement against that doc.
-- Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
+- Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`. Since 2026-10-30
+  `reader_pause`/`reader_stop` may carry `doc_id`/`chunk_index`/`sentence_index` — the sentence the client was
+  *hearing*. Playback synthesizes far ahead of the audio, so the server saves that (`save_heard_position`, after
+  the cancel) instead of its own run-ahead place. Older clients omit them and get the old behaviour.
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
 - Confirmation (server→client, pi brain only): `confirm_request` (`title`, `message`) — the agent is waiting for Dave's next transcript/`text_input` as a yes/no; sent with the spoken question and an `audio_done`
 - Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
@@ -598,6 +601,7 @@ Tests:
 - `tests/test_reader_ingest_handlers.py`
 - `tests/test_reader_ingest_service.py`
 - `tests/test_reader_append.py` - appending to an existing document: incremental chunk append, position preservation, `replace`, retry folding appendices, status rules, tool/route wiring
+- `tests/test_reader_progress.py` - per-document progress (playback, append/replace, lazy backfill, migration) and heading levels
 - `tests/test_reader_edit.py` - renaming a document: DB + speech JSON title update, missing speech file, validation, any-status rename, route wiring
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
@@ -702,6 +706,13 @@ Still live:
 - Playback is streamed sentence-by-sentence over WebSocket with position sync.
 - Document list auto-polls while any document is still `processing`.
 - Failed reader documents can be retried from the stored source metadata via `POST /api/reader/documents/{id}/retry`.
+- Reading progress: `reader_documents.total_sentences` / `progress_sentences` (sentences before the saved place,
+  blanks included; equal to the total once read to the end, while `last_chunk`/`last_sentence` rewind to 0 so the
+  next play starts over). Playback writes them per sentence; `_write_speech` recomputes them on ingest/append/replace;
+  rows from before 2026-10-30 are backfilled lazily by `list_documents` (and derived in `GET /documents/{id}`).
+- Sections carry `level` (1-3 from `#`/`##`/`###`) for the page's table of contents. Documents converted earlier
+  have none (clients treat that as 1); `scripts/reader-backfill-heading-levels [--apply]` restores it where the
+  source markdown still exists.
 
 Reader storage:
 
