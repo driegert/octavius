@@ -96,6 +96,12 @@
             return OctaviusApp.escapeHtml(raw);
           },
         },
+        // Replies can quote web pages: only web and mail links survive.
+        walkTokens(token) {
+          if ((token.type === 'link' || token.type === 'image') && !/^(https?:|mailto:)/i.test(token.href || '')) {
+            token.href = '#';
+          }
+        },
       });
     } catch (_err) {
     }

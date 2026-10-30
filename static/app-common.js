@@ -3,7 +3,8 @@
     if (value == null) return '';
     const div = document.createElement('div');
     div.textContent = String(value);
-    return div.innerHTML;
+    // innerHTML escapes & < > only; callers also put this inside attributes.
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function websocketUrl(path) {
