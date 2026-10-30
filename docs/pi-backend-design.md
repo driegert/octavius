@@ -240,6 +240,49 @@ content in context today; pi_harness has `image-context-trim.ts`, which may
 do the opposite), and context growth — pi auto-compacts rather than trimming
 to 40 messages, and the cold-prefill worst case grows with it.
 
+What pi 1.4.0 does, checked 2026-10-30 (`dist/`, `docs/`):
+
+| Guardrail | pi | Phase-2 action |
+|---|---|---|
+| Tool-result cap | MCP text results capped at 20 KB, middle removed (`MCP_OUTPUT_MAX_BYTES`, hard-coded); built-ins 2000 lines / 50 KB | 20 KB is ~5k tokens per result. Add a `tool_result` cap to the profile if turns bloat |
+| Round cap | None: the agent loop is `while (true)` | Octavius counts `turn_end` and sends `abort` at 7; the nudge becomes a `steer` at 5 |
+| Images | Stored in the session and re-sent every request until compacted; resized to ≤2000 px at intake | Same as today's sticky `has_images`; `image-context-trim.ts` (keep last 6) is on |
+| Compaction | Auto, when context > `contextWindow` − 16384; keeps the last 20k tokens | `lb-unified/gemma4-26b-a4b` declares 147,456, so it fires. Same behaviour in RPC mode |
+| Final vs tool message | assistant `message_end` with `stopReason` `"stop"` vs `"toolUse"` | The speaking rule above keys on this |
+
+## Step 1 result (2026-10-30)
+
+Built in pi_harness: `scripts/pi-octavius` (one argv for a terminal and for
+`--mode rpc`), `profiles/octavius/system.md`, the `octavius` profile in
+`extensions/mcp-scope.ts`, and `PI_SUBAGENT_ALLOW` / `PI_SUBAGENT_SKIP_PROVIDERS`
+in the subagent extension. Measured live:
+
+- 16 tools declared, the same on every request: 4.5k chars of system prompt and
+  28k chars of tool schemas.
+- `web_search` turns: about 6 s cold, and 1.4 s to the tool call once the
+  cache is warm.
+- A `searcher` request is refused. `scholar` runs, but it took 228 s and
+  returned the wrong venue for Thomson (1982). That is a scholar quality issue
+  to look at separately.
+- **Prefix stability needed two fixes.** pi writes the cwd into the system
+  prompt, so the launcher pins it. MCP servers connect in a race, so the
+  profile sorts the payload's tools by name. Without both, separate
+  conversations never share a cached prefix.
+- `model-profiles` was stripping `web_search` from turn 2 on (it is
+  "profile-only" for models with no per-model profile). It now stands aside
+  whenever `PI_AGENT_PROFILE` is set.
+- **Prompt-injection guard** (`extensions/octavius-guard.ts`, added after a
+  review flagged both gaps). The profile pairs mail with the open web, so an
+  instruction planted in an email could have sent mail text out in a fetched
+  URL. Once any email/calendar/vault/vikunja result is in the session,
+  `read_url` opens only URLs from a `web_search` result or a user message, and
+  `scholar` cannot be started. `web_search` stays open (the query reaches the
+  provider, not the attacker; the prompt forbids private text in it). Cost: a
+  conversation that has read mail cannot start research. Vikunja writes now
+  need `ctx.ui.confirm`, which over RPC is an `extension_ui_request` that
+  **step 2 must answer** (spoken yes/no on voice, a button or reply on text);
+  no answer in 60 s, or no UI, blocks the write.
+
 ## What Octavius's own tools become
 
 The main agent has 17 local tools today. Phase 1 ships without the ones marked
@@ -289,7 +332,8 @@ triplestuffed gemma4-12b.
    allowlist; checked from a pi terminal first.
 2. **Vertical slice** behind `OCTAVIUS_BRAIN=pi|native` (default `native`):
    RPC process manager, event → TTS bridge (speaking rule above), status line,
-   barge-in → `abort`, SQLite recording, crash → reseed. Tests for each, plus
+   barge-in → `abort`, SQLite recording, crash → reseed, and answering
+   `extension_ui_request` confirms (vikunja writes). Tests for each, plus
    measured **first-audio** latency per turn type without warming —
    end to end through thinking, sentence split and Phonon, not prefill alone.
 3. `/warm` extension in `pi_harness` (requirements above) and the Octavius
