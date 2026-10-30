@@ -340,10 +340,10 @@ External services currently expected:
 
 - **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
 **Routing below is what `models.json` loads as of 2026-10-28.** The code defaults in
-`settings.py` (and `.env.example`) still name the retired `lilripper:8010`
-`qwen3.6-35b-a3b-mtp-general` everywhere, so a missing or unreadable `models.json`
-now means routing onto aliases that no longer exist — `scripts/octavius-models show`
-says which file loaded.
+`settings.py` (and `.env.example`) match it (updated 2026-10-30), so a missing or
+unreadable `models.json` falls back to the same routing — `scripts/octavius-models show`
+says which file loaded. A models.json that lists a single `reader` entry still means
+"no reader fallback"; the default fallback applies only when the file omits `reader`.
 
 **2026-10-28 reshuffle (Dave):** `lilripper:8010` now serves **only `glm-5.3-flash`**
 (text-only), so the five roles that shared `qwen3.6-35b-a3b-mtp-general` there — main
@@ -378,8 +378,8 @@ false`, and `:8020` answers an image prompt.
 - **TTS**: **Phonon 31m** at `lilripper:8881/v1/audio/speech` (CPU, open, voice
   `Imogen`) — the live default since 2026-10-28. It is configured **env-only** in
   `~/.config/octavius/env` (`OCTAVIUS_TTS_FALLBACK_*`, `OCTAVIUS_TTS_VOICE`,
-  `OCTAVIUS_TTS_KOKORO_VOICES`); the code defaults still name Kokoro at
-  `lilbuddy:8880`. `TTSSettings.voxtral_enabled` is **False**, so every synth call
+  `OCTAVIUS_TTS_KOKORO_VOICES`); the code defaults match since 2026-10-30
+  (Phonon, voice `Imogen`, `DEFAULT_KOKORO_VOICES` = Phonon's seven voices). `TTSSettings.voxtral_enabled` is **False**, so every synth call
   goes straight to the `FALLBACK_*` endpoint, and any voice not in
   `OCTAVIUS_TTS_KOKORO_VOICES` (misnamed now: "voices passed through unchanged") is
   remapped to `OCTAVIUS_TTS_FALLBACK_VOICE`. Only list names the server has
@@ -389,8 +389,10 @@ false`, and `:8020` answers an image prompt.
   only the first sentence of a reply pays it. **Rollback:** Kokoro is still up on
   `lilripper:8880` —
   `cp ~/.config/octavius/env.bak-2026-10-28-pre-phonon ~/.config/octavius/env && systemctl --user restart octavius`
-  (that restores the code defaults, i.e. `lilbuddy:8880`; point
-  `OCTAVIUS_TTS_FALLBACK_URL` at `lilripper:8880` if lilbuddy's Kokoro is gone).
+  (the backup predates the Phonon defaults, so after restoring it also set
+  `OCTAVIUS_TTS_FALLBACK_URL=http://lilripper:8880/v1/audio/speech`,
+  `_FALLBACK_MODEL=kokoro`, `_FALLBACK_VOICE`/`OCTAVIUS_TTS_VOICE=bm_lewis` and
+  `OCTAVIUS_TTS_KOKORO_VOICES` to Kokoro names).
   Voxtral 4B (`OCTAVIUS_TTS_URL`) is wired but disabled — its inconsistent output
   levels make it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1`
   to restore the Voxtral-primary → fallback path (with circuit breaker).

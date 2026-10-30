@@ -57,7 +57,51 @@ class ModelsFileTests(unittest.TestCase):
 
     def test_absent_file_falls_back_to_code_defaults(self):
         _, st = self._load()
-        self.assertEqual(st.llm_chain[0]["url"], "http://lilripper:8010/v1/chat/completions")
+        self.assertEqual(st.llm_chain[0]["url"], "http://lilbuddy:8010/v1/chat/completions")
+        self.assertEqual(st.llm_chain[0]["model"], "gemma4-26b-a4b")
+
+    def test_code_defaults_match_live_routing(self):
+        """With no models.json the code defaults must be today's live routing."""
+        _, st = self._load()
+        lb = "http://lilbuddy:8010/v1/chat/completions"
+        lr = "http://lilripper:8020/v1/chat/completions"
+        ts = "http://triplestuffed:8010/v1/chat/completions"
+        self.assertEqual(
+            [(e["url"], e["model"]) for e in st.llm_chain],
+            [(lb, "gemma4-26b-a4b"), (lr, "qwen3.8-27b"), (ts, "gemma4-12b")],
+        )
+        self.assertEqual(
+            st.subagent_llm_chain,
+            [
+                {"url": ts, "model": "gemma4-12b", "role": "primary", "capacity": 3},
+                {"url": lr, "model": "qwen3.8-27b", "role": "fallback", "capacity": 2},
+            ],
+        )
+        self.assertEqual(
+            [(e["url"], e["model"]) for e in st.vision_llm_chain],
+            [(lb, "gemma4-26b-a4b"), (lr, "qwen3.8-27b")],
+        )
+        self.assertEqual((st.reader.llm_url, st.reader.llm_model), (ts, "gemma4-12b"))
+        self.assertEqual(
+            (st.reader.llm_fallback_url, st.reader.llm_fallback_model), (lr, "qwen3.8-27b")
+        )
+        self.assertEqual((st.summary_url, st.summary_model), (ts, "gemma4-12b"))
+        self.assertEqual(
+            (st.summary_fallback_url, st.summary_fallback_model), (lr, "qwen3.8-27b")
+        )
+
+    def test_code_default_tts_is_phonon(self):
+        for var in list(os.environ):
+            if var.startswith("OCTAVIUS_TTS_"):
+                os.environ.pop(var)
+        _, st = self._load()
+        self.assertEqual(st.tts.fallback_url, "http://lilripper:8881/v1/audio/speech")
+        self.assertEqual(st.tts.fallback_model, "phonon-31m-en")
+        self.assertEqual(st.tts.fallback_voice, "Imogen")
+        self.assertEqual(st.tts.voice, "Imogen")
+        self.assertIn(st.tts.voice, st.tts.kokoro_voices)
+        self.assertIn(st.tts.fallback_voice, st.tts.kokoro_voices)
+        self.assertFalse(st.tts.voxtral_enabled)
 
     def test_file_overrides_code_defaults(self):
         _, st = self._load({"roles": {"main": [{"url": "http://h:1/v1", "model": "m"}]}})
@@ -83,7 +127,7 @@ class ModelsFileTests(unittest.TestCase):
 
     def test_unlisted_role_keeps_its_code_default(self):
         _, st = self._load({"roles": {"main": [{"url": "http://h:1/v1", "model": "m"}]}})
-        self.assertEqual(st.vision_llm_chain[0]["url"], "http://lilripper:8010/v1/chat/completions")
+        self.assertEqual(st.vision_llm_chain[0]["url"], "http://lilbuddy:8010/v1/chat/completions")
 
     def test_single_endpoint_roles_read_url_and_model(self):
         _, st = self._load({

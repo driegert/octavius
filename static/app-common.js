@@ -124,7 +124,7 @@
   async function loadVoices(selectEl, options) {
     const {
       currentVoice,
-      fallbackVoice = 'bm_lewis',
+      fallbackVoice = 'Imogen',
       onLoaded,
     } = options || {};
 
