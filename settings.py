@@ -137,6 +137,26 @@ class TTSSettings:
 
 
 @dataclass(frozen=True)
+class PiBrainSettings:
+    """pi as the turn brain (docs/pi-backend-design.md, rollout step 2).
+
+    ``brain`` is "native" (agent.py's loop, the default) or "pi" (a long-lived
+    ``pi --mode rpc`` process per conversation, see pi_brain.py).
+    """
+    brain: str
+    launcher: str
+    pi_bin: str
+    model: str
+    idle_reap_s: float
+    turn_timeout_s: float
+    confirm_timeout_s: float
+
+    @property
+    def enabled(self) -> bool:
+        return self.brain == "pi"
+
+
+@dataclass(frozen=True)
 class ReaderSettings:
     directory: str
     llm_url: str
@@ -197,6 +217,7 @@ class Settings:
     # (scheme://host:port). Endpoints absent from the map are called without an
     # Authorization header, as before. Set via OCTAVIUS_LLM_API_KEYS.
     llm_api_keys: dict[str, str]
+    pi_brain: PiBrainSettings
 
 
 DEFAULT_VOXTRAL_VOICES = [
@@ -858,6 +879,24 @@ def load_settings() -> Settings:
         docproc_inline_char_budget=_env_int("OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET", 20000),
         docproc_excerpt_chars=_env_int("OCTAVIUS_DOCPROC_EXCERPT_CHARS", 3000),
         llm_api_keys=_llm_api_keys(),
+        pi_brain=PiBrainSettings(
+            brain=_env_str("OCTAVIUS_BRAIN", "native"),
+            launcher=_env_str(
+                "OCTAVIUS_PI_LAUNCHER",
+                os.path.expanduser("~/git_repos/pi_harness/scripts/pi-octavius"),
+            ),
+            # The user service's PATH has no ~/.local/bin, so name pi explicitly.
+            pi_bin=_env_str("OCTAVIUS_PI_BIN", os.path.expanduser("~/.local/bin/pi")),
+            # Passed to the launcher as PI_OCTAVIUS_MODEL; also what history records.
+            model=_env_str("OCTAVIUS_PI_MODEL", "lb-unified/gemma4-26b-a4b"),
+            # Hours, not minutes: a reaped process loses its warm session and the
+            # next turn reseeds from history (see "What /warm can and cannot warm").
+            idle_reap_s=_env_float("OCTAVIUS_PI_IDLE_REAP_S", 4 * 3600),
+            # scholar alone took 228 s in the step-1 run.
+            turn_timeout_s=_env_float("OCTAVIUS_PI_TURN_TIMEOUT_S", 600),
+            # Below octavius-guard's 60 s, so Octavius answers before pi gives up.
+            confirm_timeout_s=_env_float("OCTAVIUS_PI_CONFIRM_TIMEOUT_S", 55),
+        ),
     )
 
 

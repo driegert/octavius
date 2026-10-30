@@ -294,6 +294,26 @@ orchestrator. Re-enabling it is one tool spec + one registry line. Quick
 domains (email/tasks/research) deliberately stay inline (low voice latency,
 warm MCP sessions); only long-running deep research is backgrounded.
 
+**pi brain (opt-in, `OCTAVIUS_BRAIN=pi`, default `native`).** Voice and text
+turns can instead run on a long-lived `pi --mode rpc` process per conversation,
+launched through `pi_harness/scripts/pi-octavius` (the `octavius` profile:
+email/calendar/vault/vikunja/web tools direct, `scholar` as the only subagent).
+`pi_brain.stream_pi_turn` has `stream_agent_turn`'s contract, so `run_turn`
+picks one or the other per turn (`pi_brain.wants_pi`). Image turns, vision
+threads, item chat and file turns stay native. SQLite stays authoritative: a
+fresh or crashed process is seeded with a compact transcript of the in-memory
+`Conversation`. pi has no round cap, so `pi_brain` counts `turn_end`, steers
+at 5 and aborts at `max_tool_rounds`. Vikunja writes are confirmed:
+pi_harness `octavius-guard.ts` raises an RPC `confirm`, Octavius speaks the
+question, sends `confirm_request` + `audio_done`, and Dave's next transcript or
+`text_input` answers it (`_spawn_turn`; opening the mic then is not a barge-in).
+Processes are reaped after `OCTAVIUS_PI_IDLE_REAP_S` (4 h), killed on reset,
+load and shutdown, and re-keyed on `restore_session`. Knobs:
+`OCTAVIUS_PI_LAUNCHER`, `OCTAVIUS_PI_BIN` (the user service's PATH lacks
+`~/.local/bin`), `OCTAVIUS_PI_MODEL`, `OCTAVIUS_PI_TURN_TIMEOUT_S` (600),
+`OCTAVIUS_PI_CONFIRM_TIMEOUT_S` (55). `/health` → `pi_brain`. pi never gets
+`OCTAVIUS_*` env vars. Design and status: `docs/pi-backend-design.md`.
+
 The email subagent prompt uses evangeline's `email_hybrid_search` (RRF fusion of
 semantic + BM25) for anything matching on body text. **Folder scope is a closed
 set of five values** — `"Inbox"` (the default), `"Read Later"`, `"Follow-Up"`,
@@ -492,6 +512,7 @@ WebSocket message families:
 - Matrix media (client→server, same session/threading semantics as `text_input`): `image_input`, `file_input` — frozen contract, see `docs/ws-media-contract.md`. Both repos (`octavius`, `matrix-agent-sidecar`) implement against that doc.
 - Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
+- Confirmation (server→client, pi brain only): `confirm_request` (`title`, `message`) — the agent is waiting for Dave's next transcript/`text_input` as a yes/no; sent with the spoken question and an `audio_done`
 - Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
 
 ## Code Map
@@ -523,6 +544,7 @@ Conversation and tool loop:
 - `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
 - `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
 - `tools.py` - local tool schemas and dispatch entrypoint used by the agent loop
+- `pi_brain.py` - opt-in pi turn brain: RPC process per conversation, manager (reaping, re-key), `stream_pi_turn`, confirm relay
 - `subagent.py` - internal scoped subagent for specialist domains (email, research, tasks); invoked inline via `consult_specialist` (`run_inline_subagent`)
 - `local_tool_specs.py` - local tool schemas
 - `local_tool_registry.py` - compatibility wrapper for older local-tool imports
@@ -590,6 +612,7 @@ Tests:
 - `tests/test_vault_files.py`
 - `tests/test_media_upload.py` - `media_uploads.save_upload` (sanitization, mime resolution, streaming caps) and the `/api/media/upload` route
 - `tests/test_subagent.py`
+- `tests/test_pi_brain.py` - pi_brain against `tests/fake_pi_rpc.py` (a scripted `pi --mode rpc` subprocess): speaking rule, tool recording, seeding, round cap, abort on close, crash restart, confirm yes/no, reaping
 - `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
 - `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, LLM endpoint auth headers, and per-entry `params` merging

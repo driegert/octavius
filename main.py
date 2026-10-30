@@ -10,6 +10,7 @@ from history import HistoryRecorder, init_db
 from history_enrichment import drain_inflight
 from history_store import assert_history_serveable
 from mcp_manager import MCPManager
+from pi_brain import PiProcessManager
 from settings import settings
 from routes.conversations import router as conversations_router
 from routes.inbox import router as inbox_router
@@ -68,7 +69,15 @@ async def lifespan(app: FastAPI):
     # legacy vec0 tables; history-index.timer (`hybrid-corpus run history`,
     # every 15 min) owns freshness and embed-debt healing now, for all three
     # history collections rather than just two.
+    # OCTAVIUS_BRAIN=pi: voice/text turns run on pi processes (pi_brain.py).
+    app.state.pi_brain = None
+    if settings.pi_brain.enabled:
+        app.state.pi_brain = PiProcessManager(settings.pi_brain)
+        app.state.pi_brain.start_reaper()
+        log.info("Brain: pi (%s via %s)", settings.pi_brain.model, settings.pi_brain.launcher)
     yield
+    if app.state.pi_brain is not None:
+        await app.state.pi_brain.shutdown()
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
     # Nothing spawns detached embeds any more (see history_enrichment), so this
@@ -105,6 +114,7 @@ async def index():
 async def health(request: Request):
     mcp_manager = getattr(request.app.state, "mcp_manager", None)
     history = getattr(request.app.state, "history", None)
+    pi_brain = getattr(request.app.state, "pi_brain", None)
     llm_health = llm_client.get_health()
     mcp_health = (
         mcp_manager.get_health()
@@ -133,6 +143,7 @@ async def health(request: Request):
             "mcp": mcp_health,
             "llm_chain": llm_health,
             "embedding_chain": embedding_client.get_health(),
+            "pi_brain": pi_brain.health() if pi_brain else {"brain": settings.pi_brain.brain},
         }
     )
 

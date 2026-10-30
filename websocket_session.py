@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -132,6 +133,9 @@ class WebSocketSessionState:
     # record and the UI shows a non-intrusive badge instead of speaking
     # results aloud. Flip to True to restore the old interrupt-and-speak path.
     proactive_speak_enabled: bool = False
+    # Set while a pi turn waits on Dave to answer a confirmation (pi_brain); his
+    # next transcript or text input resolves it instead of starting a turn.
+    pending_confirm: asyncio.Future | None = None
 
 
 class WebSocketSessionHandler:
@@ -260,6 +264,9 @@ class WebSocketSessionHandler:
         if msgs:
             self.state.conversation.load_from_history(msgs)
             log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
+            pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+            if pi_brain is not None:
+                pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
             await self.send_payload(
                 {
                     "type": "session_id",
@@ -317,6 +324,7 @@ class WebSocketSessionHandler:
         # tearing down a live mic for New Chat) — don't leave the stream armed.
         self.state.stt_stream.reset()
         self.state.stt_stream.active = False
+        await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.reset()
         self.state.history_session = self.state.history.start_conversation(
@@ -342,6 +350,7 @@ class WebSocketSessionHandler:
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
+        await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.load_from_history(msgs)
         self.state.history_session = self.state.history.start_conversation(
@@ -828,7 +837,10 @@ class WebSocketSessionHandler:
         # turn is already finished by the time the mic reopens, so this is a
         # no-op; it only bites when the user talks over a still-streaming reply.
         turn = self.state.turn_task
-        if turn and not turn.done():
+        pending = self.state.pending_confirm
+        # A turn waiting on a confirmation is not talking: Dave is opening the mic
+        # to answer it, and his transcript resolves it in _spawn_turn.
+        if turn and not turn.done() and (pending is None or pending.done()):
             turn.cancel()
             try:
                 await turn
@@ -938,6 +950,12 @@ class WebSocketSessionHandler:
         await self.send_json("transcript", last_text)
         self._spawn_turn(last_text, source="voice")
 
+    async def _discard_pi_process(self) -> None:
+        """The conversation is ending (reset, load): stop its pi process, if any."""
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is not None and self.state.history_session is not None:
+            await pi_brain.discard(self.state.history_session.conv_id)
+
     def _spawn_turn(
         self,
         user_text: str,
@@ -963,6 +981,11 @@ class WebSocketSessionHandler:
         "title"}`` recorded against the persisted user message via the
         ``attachments`` table (image_input / file_input turns only).
         """
+        pending = self.state.pending_confirm
+        if pending is not None and not pending.done():
+            from pi_brain import is_yes
+            pending.set_result(is_yes(user_text))
+            return
         if self.state.turn_task and not self.state.turn_task.done():
             log.warning("Turn already in flight; dropping new turn request")
             return
@@ -992,16 +1015,20 @@ class WebSocketSessionHandler:
         attachment: dict | None = None,
     ):
         from agent import stream_agent_turn
+        from pi_brain import stream_pi_turn, wants_pi
         from tts import synthesize
         async with self.state.turn_lock:
             turn_start = time.monotonic()
             await self.send_json("status", "Thinking...")
 
+            # OCTAVIUS_BRAIN=pi sends voice/text turns to pi (pi_brain.py).
             # Image turns route through the vision chain; everything else
             # (including file_input's synthetic instruction turns) uses the
             # default text chain unchanged.
+            use_pi = wants_pi(source, user_content, self.state.conversation)
             turn_model = (
-                settings.vision_llm_chain[0]["model"] if user_content is not None
+                f"pi:{settings.pi_brain.model}" if use_pi
+                else settings.vision_llm_chain[0]["model"] if user_content is not None
                 else settings.llm_chain[0]["model"]
             )
 
@@ -1026,8 +1053,10 @@ class WebSocketSessionHandler:
             full_reply_parts = []
             first_sentence = True
             agent_error: Exception | None = None
-            try:
-                async for sentence in stream_agent_turn(
+            if use_pi:
+                stream = stream_pi_turn(self, user_text, source=source, status_callback=status_cb)
+            else:
+                stream = stream_agent_turn(
                     self.state.conversation,
                     self.state.mcp_manager,
                     user_text,
@@ -1036,23 +1065,32 @@ class WebSocketSessionHandler:
                     session=self,
                     user_content=user_content,
                     source=source,
-                ):
-                    full_reply_parts.append(sentence)
-                    # Text-side streaming: emit each sentence as it lands so a
-                    # client can render progressively instead of waiting for the
-                    # final `response`. The Matrix sidecar edits its reply in
-                    # place from these; the browser ignores unknown frame types.
-                    # Sent before TTS so text isn't gated on audio synthesis.
-                    await self.send_json("response_delta", sentence)
-                    if self.state.tts_enabled:
-                        if first_sentence:
-                            await self.send_json("status", "Speaking...")
-                            first_sentence = False
-                        try:
-                            wav_bytes = await synthesize(sentence, voice=self.state.voice)
-                            await self.send_bytes(wav_bytes)
-                        except Exception:
-                            log.exception("TTS failed for chunk")
+                )
+            try:
+                # aclosing: a cancelled turn (barge-in, reset) must close the
+                # generator now, so the pi path aborts pi before the next prompt.
+                async with aclosing(stream) as sentences:
+                    async for sentence in sentences:
+                        full_reply_parts.append(sentence)
+                        # Text-side streaming: emit each sentence as it lands so a
+                        # client can render progressively instead of waiting for the
+                        # final `response`. The Matrix sidecar edits its reply in
+                        # place from these; the browser ignores unknown frame types.
+                        # Sent before TTS so text isn't gated on audio synthesis.
+                        await self.send_json("response_delta", sentence)
+                        if self.state.tts_enabled:
+                            if first_sentence:
+                                await self.send_json("status", "Speaking...")
+                                first_sentence = False
+                                log.info(
+                                    "First sentence after %.2fs (%s, %s)",
+                                    time.monotonic() - turn_start, source, turn_model,
+                                )
+                            try:
+                                wav_bytes = await synthesize(sentence, voice=self.state.voice)
+                                await self.send_bytes(wav_bytes)
+                            except Exception:
+                                log.exception("TTS failed for chunk")
             except Exception as exc:
                 # Capture but do NOT early-return — the finally block must
                 # send audio_done so continuous mode re-arms. Without it,

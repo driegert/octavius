@@ -1317,5 +1317,77 @@ class RunTurnMediaTests(unittest.TestCase):
         asyncio.run(run())
 
 
+class _FakePiBrain:
+    def __init__(self):
+        self.discarded = []
+        self.rekeyed = []
+
+    async def discard(self, conv_id):
+        self.discarded.append(conv_id)
+
+    def rekey(self, old, new):
+        self.rekeyed.append((old, new))
+
+
+class PiBrainWiringTests(unittest.TestCase):
+    """websocket_session's side of pi_brain: confirmations, barge-in, process lifecycle."""
+
+    def _handler(self):
+        ws = _FakeWS()
+        ws.app.state.pi_brain = _FakePiBrain()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=5)
+        return handler, ws.app.state.pi_brain
+
+    def test_pending_confirm_takes_the_next_input_instead_of_a_turn(self):
+        async def run():
+            handler, _ = self._handler()
+            fut = asyncio.get_running_loop().create_future()
+            handler.state.pending_confirm = fut
+            with patch.object(handler, "_run_turn_guarded") as run_turn:
+                handler._spawn_turn("yes, go ahead", source="voice")
+                run_turn.assert_not_called()
+            self.assertIs(fut.result(), True)
+            handler.state.pending_confirm = asyncio.get_running_loop().create_future()
+            handler._spawn_turn("no thanks", source="text")
+            self.assertIs(handler.state.pending_confirm.result(), False)
+
+        asyncio.run(run())
+
+    def test_mic_open_does_not_cancel_a_turn_waiting_on_confirm(self):
+        async def run():
+            handler, _ = self._handler()
+            handler.state.turn_task = asyncio.create_task(asyncio.sleep(10))
+            handler.state.pending_confirm = asyncio.get_running_loop().create_future()
+            with patch("vad.SileroVAD"):
+                await handler.handle_stt_start({})
+            self.assertFalse(handler.state.turn_task.done())
+            # Without a pending confirm, opening the mic is a barge-in.
+            handler.state.pending_confirm = None
+            with patch("vad.SileroVAD"):
+                await handler.handle_stt_start({})
+            self.assertTrue(handler.state.turn_task.cancelled())
+
+        asyncio.run(run())
+
+    def test_reset_discards_the_conversations_pi_process(self):
+        async def run():
+            handler, brain = self._handler()
+            await handler.handle_reset({})
+            self.assertEqual(brain.discarded, [5])
+
+        asyncio.run(run())
+
+    def test_restore_rekeys_the_live_pi_process(self):
+        async def run():
+            handler, brain = self._handler()
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hi"}]):
+                await handler.handle_restore_session({"conversation_id": 3})
+            self.assertEqual(brain.rekeyed, [(3, 5)])
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()

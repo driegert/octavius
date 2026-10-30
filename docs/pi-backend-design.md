@@ -1,7 +1,7 @@
 # Octavius on pi: design
 
-Status: **proposal, 2026-10-30, revised after review (Codex gpt-6.1-sol, local
-GLM-5.3-Flash). Nothing here is built.** Measurements in this note
+Status: **steps 1–2 built 2026-10-30 (see their result sections); the rest is
+proposal**, revised after review (Codex gpt-6.1-sol, local GLM-5.3-Flash). Measurements in this note
 were taken 2026-10-28..30 on the live fleet. Every timing run used synthetic or
 trivial prompts, or reported numbers only, so no mail or calendar content was
 ever read.
@@ -282,6 +282,26 @@ in the subagent extension. Measured live:
   need `ctx.ui.confirm`, which over RPC is an `extension_ui_request` that
   **step 2 must answer** (spoken yes/no on voice, a button or reply on text);
   no answer in 60 s, or no UI, blocks the write.
+
+## Step 2 result (2026-10-30)
+
+Built behind `OCTAVIUS_BRAIN=pi` (default `native`): `pi_brain.py` (RPC process
+per conversation, manager, `stream_pi_turn`), wired into `run_turn`, reset,
+load, restore and shutdown; tests against a scripted fake pi. Not yet done from
+the step-2 list: `/warm` (step 3), and a measured first-*audio* number through
+Phonon, as opposed to first sentence.
+
+Live, synthetic prompts, lilbuddy 26B, no warming, memory injection off:
+
+| Turn | First sentence |
+|---|---|
+| Trivial, fresh process (includes pi start + MCP connect) | 5.15 s |
+| `web_search` turn (tool call at 1.7 s) | 4.10 s |
+| Warm follow-up | 2.33 s |
+| Vikunja create → confirm asked | 3.14 s; declined, not written, model said so |
+
+Open: Android and the PWA treat a second `audio_done` within one turn (after a
+confirm) as untested; the browser ignores `confirm_request`.
 
 ## What Octavius's own tools become
 
