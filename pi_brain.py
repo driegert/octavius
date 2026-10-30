@@ -52,10 +52,17 @@ SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 SEED_MESSAGES = 20
 SEED_CHARS_PER_MESSAGE = 800
 SEED_TOTAL_CHARS = 6000
+# A confirmation is a short, clear yes and nothing else: the whole utterance must
+# match, and any negation or hedge anywhere cancels ("yes, but wait" is a no).
 YES_RE = re.compile(
-    r"^\W*(yes|yeah|yep|yup|sure|ok|okay|confirm(ed)?|do it|go ahead|please do|affirmative)\b",
+    r"^\W*(yes|yeah|yep|yup|sure|ok|okay|confirm(ed)?|do it|go ahead|please do|affirmative)"
+    r"(\W+(please|do it|go ahead|thanks|thank you))?\W*$",
     re.IGNORECASE,
 )
+NO_WORDS = re.compile(
+    r"\b(no|not|don'?t|do not|wait|cancel|stop|never|hold on|but)\b", re.IGNORECASE,
+)
+CONFIRM_VALUE_CHARS = 80
 STDOUT_LIMIT = 64 * 1024 * 1024  # one JSONL record can carry a whole tool result or image
 ABORT_SETTLE_S = 10.0
 COMMAND_TIMEOUT_S = 30.0
@@ -66,7 +73,8 @@ class PiTurnError(RuntimeError):
 
 
 def is_yes(text: str) -> bool:
-    return bool(YES_RE.match(text or ""))
+    text = text or ""
+    return bool(YES_RE.match(text)) and not NO_WORDS.search(text)
 
 
 def tool_label(pi_tool_name: str) -> str:
@@ -523,21 +531,26 @@ async def _handle_ui_request(session, proc: PiRpcProcess, ev: dict) -> AsyncGene
 
 
 def _describe_confirm(title: str, detail: str) -> str:
-    """A speakable version of octavius-guard's confirm: the action and its title."""
+    """A speakable version of octavius-guard's confirm: the action and EVERY argument.
+
+    Ids and target fields are read out, not just model-written text, so Dave hears
+    which task changes and how. Long values are shortened but every key is named;
+    the full JSON goes to the client in ``confirm_request``.
+    """
     action = title.removeprefix("Allow ").rstrip("?").replace("_", " ")
     try:
         args = json.loads(detail)
     except (json.JSONDecodeError, TypeError):
-        args = {}
-    subject = ""
-    if isinstance(args, dict):
-        for key in ("title", "comment", "description"):
-            if isinstance(args.get(key), str) and args[key].strip():
-                subject = args[key].strip()
-                break
-    if len(subject) > 160:
-        subject = subject[:160] + "…"
-    return f"{action}, {subject!r}." if subject else f"{action}."
+        args = None
+    if not isinstance(args, dict):
+        return f"{action}, with arguments I can't read aloud; check the screen."
+    parts = []
+    for key, value in args.items():
+        text = value if isinstance(value, str) else json.dumps(value)
+        if len(text) > CONFIRM_VALUE_CHARS:
+            text = text[:CONFIRM_VALUE_CHARS] + f"… ({len(text)} characters)"
+        parts.append(f"{key.replace('_', ' ')} {text!r}" if isinstance(value, str) else f"{key.replace('_', ' ')} {text}")
+    return f"{action}: {'; '.join(parts)}." if parts else f"{action}."
 
 
 async def _record_tool(history_session, ev: dict, args: dict) -> None:

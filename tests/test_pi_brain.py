@@ -188,7 +188,7 @@ class PiBrainTests(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.05)
         self.assertIsNotNone(session.state.pending_confirm, "no confirmation was asked")
-        self.assertIn("create task, 'Buy milk'", out[0])
+        self.assertIn("create task: title 'Buy milk'; project id 1", out[0])
         self.assertIn({"type": "status", "text": "audio_done"}, session.sent)
         self.assertEqual(session.sent[0]["type"], "confirm_request")
         session.state.pending_confirm.set_result(pi_brain.is_yes(answer))
@@ -223,8 +223,19 @@ class PiBrainHelperTests(unittest.TestCase):
     def test_is_yes(self):
         for t in ("yes", "Yeah, do it.", "OK", "go ahead"):
             self.assertTrue(pi_brain.is_yes(t), t)
-        for t in ("no", "nope", "yesterday was fine", "", "wait"):
+        for t in ("no", "nope", "yesterday was fine", "", "wait", "yes, but wait",
+                  "ok don't", "sure, not that one", "yes and also delete the rest",
+                  "okay cancel", "yes no"):
             self.assertFalse(pi_brain.is_yes(t), t)
+
+    def test_describe_confirm_reads_every_argument(self):
+        d = pi_brain._describe_confirm(
+            "Allow update_task?", json.dumps({"task_id": 42, "done": True, "title": "x" * 200}))
+        self.assertTrue(d.startswith("update task:"))
+        self.assertIn("task id 42", d)
+        self.assertIn("done true", d)
+        self.assertIn("(200 characters)", d)
+        self.assertIn("check the screen", pi_brain._describe_confirm("Allow create_task?", "not json"))
 
     def test_tool_label(self):
         labels = {"email_get": "Reading Email", "search_tasks": "Task Search"}
