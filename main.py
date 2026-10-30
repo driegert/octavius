@@ -86,9 +86,23 @@ async def lifespan(app: FastAPI):
     await drain_inflight()
 
 
+UI_PAGES = {"/", "/inbox", "/reader"}
+
+
 def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH,
                verify_search=assert_history_serveable) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
+
+    @app.middleware("http")
+    async def revalidate_ui(request: Request, call_next):
+        # Pages and their assets change together on disk with no build step, so a
+        # browser must not run a cached old script against new HTML: always
+        # revalidate (StaticFiles/FileResponse answer with ETag + 304).
+        response = await call_next(request)
+        if request.url.path.startswith("/static/") or request.url.path in UI_PAGES:
+            response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
     app.mount("/static", StaticFiles(directory="static"), name="static")
     app.include_router(inbox_router)
     app.include_router(conversations_router)

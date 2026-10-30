@@ -12,6 +12,44 @@ from reader_store import get_document, load_speech_data, sentences_before, updat
 
 log = logging.getLogger(__name__)
 
+# Sentences a paced stream may send beyond the last one the client reported hearing.
+READER_AHEAD = 3
+
+
+class ReaderPacer:
+    """Holds a paced stream to READER_AHEAD sentences past what the client has heard.
+
+    Without pacing, playback synthesizes the rest of the document as fast as TTS
+    allows (far faster than speech) and the client buffers all of it. A client
+    that opts in (`reader_play` with `paced: true`) sends `reader_heard` as each
+    sentence starts playing; `report` records it and wakes the stream.
+    """
+
+    def __init__(self, seq: int, ahead: int = READER_AHEAD):
+        self.seq = seq
+        self.ahead = ahead
+        self.heard: int | None = None
+        self._changed = asyncio.Event()
+
+    def start(self, start_global: int) -> None:
+        if self.heard is None:
+            self.heard = start_global - 1
+
+    def report(self, seq, sentence_global) -> bool:
+        if seq != self.seq or not isinstance(sentence_global, int) or isinstance(sentence_global, bool):
+            return False
+        if self.heard is None or sentence_global > self.heard:
+            self.heard = sentence_global
+            self._changed.set()
+        return True
+
+    async def wait_until(self, sentence_global: int, ahead: int | None = None) -> None:
+        """Return once `sentence_global` is within `ahead` sentences of the heard one."""
+        ahead = self.ahead if ahead is None else ahead
+        while self.heard is not None and sentence_global - self.heard > ahead:
+            self._changed.clear()
+            await self._changed.wait()
+
 
 def save_heard_position(db_path: str | Path, doc_id, chunk_index, sentence_index) -> bool:
     """Persist the sentence the client was actually hearing when it paused or stopped.
@@ -44,8 +82,14 @@ async def stream_reader_audio(
     sentence_index: int = 0,
     voice: str | None = None,
     seq: int = 0,
+    pacer: ReaderPacer | None = None,
 ):
-    """Stream TTS audio for a document over WebSocket."""
+    """Stream TTS audio for a document over WebSocket.
+
+    With a `pacer`, the saved place comes from the client's `reader_heard` reports
+    (see `save_heard_position`) and the stream writes no position of its own,
+    except the finished mark once the last sentence has been heard.
+    """
     current_chunk_index = chunk_index
     current_sentence_index = sentence_index
 
@@ -68,6 +112,9 @@ async def stream_reader_audio(
         for chunk in chunks[:chunk_index]:
             sentence_global += len(chunk["sentences"])
         sentence_global += sentence_index
+        if pacer:
+            pacer.start(sentence_global)
+        last_sent = None
 
         try:
             for current_chunk_index in range(chunk_index, total_chunks):
@@ -81,6 +128,8 @@ async def stream_reader_audio(
                         sentence_global += 1
                         continue
 
+                    if pacer:
+                        await pacer.wait_until(sentence_global)
                     await ws.send_text(json.dumps({
                         "type": "reader_position",
                         "seq": seq,
@@ -93,21 +142,28 @@ async def stream_reader_audio(
                         "sentence_text": sentence,
                     }))
 
-                    update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index,
-                                    progress_sentences=sentence_global)
+                    if not pacer:
+                        update_document(conn, doc_id, last_chunk=current_chunk_index,
+                                        last_sentence=current_sentence_index, progress_sentences=sentence_global)
 
                     wav_bytes = await synthesize(sentence, voice=voice)
                     await ws.send_bytes(wav_bytes)
 
+                    last_sent = sentence_global
                     sentence_global += 1
+
+            if pacer and last_sent is not None:
+                # Finished means heard to the end, not merely sent.
+                await pacer.wait_until(last_sent, ahead=0)
 
             # Read to the end: the next play starts over, but the list shows it finished.
             update_document(conn, doc_id, last_chunk=0, last_sentence=0, progress_sentences=total_sentences)
             await ws.send_text(json.dumps({"type": "reader_audio_done", "seq": seq}))
 
         except asyncio.CancelledError:
-            update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index,
-                            progress_sentences=sentences_before(chunks, current_chunk_index, current_sentence_index))
+            if not pacer:
+                update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index,
+                                progress_sentences=sentences_before(chunks, current_chunk_index, current_sentence_index))
             log.info(
                 "Reader: playback paused at chunk %d, sentence %d",
                 current_chunk_index,

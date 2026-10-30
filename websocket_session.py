@@ -22,7 +22,7 @@ except ModuleNotFoundError:
 import docproc_client
 import media_uploads
 from conversation import Conversation
-from reader_playback import save_heard_position, stream_reader_audio
+from reader_playback import ReaderPacer, save_heard_position, stream_reader_audio
 from settings import settings
 from subagent import run_subagent
 from subagent_dispatcher import SubagentTicket
@@ -118,6 +118,8 @@ class WebSocketSessionState:
     voice: str = settings.tts.voice
     tts_enabled: bool = True
     reader_task: asyncio.Task | None = None
+    reader_seq: int | None = None
+    reader_pacer: ReaderPacer | None = None
     item_conversations: dict[int, Conversation] = field(default_factory=dict)
     item_history_sessions: dict[int, object] = field(default_factory=dict)
     history_session: object | None = None
@@ -238,6 +240,7 @@ class WebSocketSessionHandler:
             "reader_play": self.handle_reader_play,
             "reader_pause": self.handle_reader_pause,
             "reader_stop": self.handle_reader_stop,
+            "reader_heard": self.handle_reader_heard,
             "item_chat_load": self.handle_item_chat_load,
             "item_chat": self.handle_item_chat,
             "item_chat_reset": self.handle_item_chat_reset,
@@ -629,6 +632,8 @@ class WebSocketSessionHandler:
 
     async def handle_reader_play(self, data: dict):
         await self.cancel_reader_task()
+        self.state.reader_seq = data.get("seq", 0)
+        self.state.reader_pacer = ReaderPacer(self.state.reader_seq) if data.get("paced") is True else None
         self.state.reader_task = asyncio.create_task(
             stream_reader_audio(
                 self.ws,
@@ -638,8 +643,22 @@ class WebSocketSessionHandler:
                 sentence_index=data.get("sentence_index", 0),
                 voice=data.get("voice", self.state.voice),
                 seq=data.get("seq", 0),
+                pacer=self.state.reader_pacer,
             )
         )
+
+    async def handle_reader_heard(self, data: dict):
+        # Sent by a paced client as each sentence starts playing. Stale frames from
+        # an earlier play (after a seek) are dropped so they can't move the place back.
+        # Only a live paced stream takes them: once it has ended (and written "finished")
+        # a late or duplicate frame must not move the place back.
+        task = self.state.reader_task
+        if not self.state.reader_pacer or data.get("seq") != self.state.reader_seq or not task or task.done():
+            return
+        # Save before waking the stream: on the last sentence it then writes "finished" after this.
+        self._save_heard_position(data)
+        if self.state.reader_pacer:
+            self.state.reader_pacer.report(data.get("seq"), data.get("sentence_global"))
 
     async def handle_reader_pause(self, data: dict):
         await self.cancel_reader_task()

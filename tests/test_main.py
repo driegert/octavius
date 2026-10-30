@@ -172,6 +172,18 @@ class MainTests(unittest.TestCase):
         )
         self.assertFalse(embedding["endpoints"][0]["tripped"])
 
+    def test_ui_pages_and_assets_always_revalidate(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                page = client.get("/reader")
+                asset = client.get("/static/reader-app.js")
+                again = client.get("/static/reader-app.js", headers={"If-None-Match": asset.headers["etag"]})
+                health = client.get("/health")
+        self.assertEqual(page.headers["cache-control"], "no-cache")
+        self.assertEqual(asset.headers["cache-control"], "no-cache")
+        self.assertEqual(again.status_code, 304)
+        self.assertNotIn("cache-control", health.headers)
+
     def test_health_reports_degraded_when_only_partial_runtime_is_ready(self):
         with _isolated_app(_DegradedMCPManager):
             with TestClient(main.app) as client:

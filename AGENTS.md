@@ -516,6 +516,11 @@ WebSocket message families:
   `reader_pause`/`reader_stop` may carry `doc_id`/`chunk_index`/`sentence_index` — the sentence the client was
   *hearing*. Playback synthesizes far ahead of the audio, so the server saves that (`save_heard_position`, after
   the cancel) instead of its own run-ahead place. Older clients omit them and get the old behaviour.
+  **Paced playback (2026-10-30):** `reader_play` with `paced: true` makes the stream wait so it is at most
+  `READER_AHEAD` (3) sentences past the last one the client reported in `reader_heard {seq, doc_id, chunk_index,
+  sentence_index, sentence_global}` (sent as each sentence *starts* playing). A paced stream writes no position of
+  its own — the heard reports are the place — and marks the document finished only once the last sentence is heard.
+  `/reader` always paces; the Android client does not and keeps the old run-ahead behaviour.
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
 - Confirmation (server→client, pi brain only): `confirm_request` (`title`, `message`) — the agent is waiting for Dave's next transcript/`text_input` as a yes/no; sent with the spoken question and an `audio_done`
 - Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
@@ -586,8 +591,8 @@ Frontend:
 - `static/index-app.js` - main voice UI controller: conversation sidebar, settings, transcript rendering, `confirm_request` card, keyboard shortcuts, and WebSocket client logic
 - `static/index-orb.js` - the eight-lobed voice orb (canvas, driven by mic and playback levels); the talk button on `/` and play/pause on `/reader`
 - `static/octavius.css` - shared design tokens, base styles and components (colours, Newsreader/Spline Sans, switch, slider, dropdown) used by every page
-- `static/index.css` / `static/reader.css` - page layouts (desktop-first; the side panel becomes a drawer on phones). Local CSS/JS links carry `?v=<date>` because the server sends no cache headers: bump it when those files change
-- `static/inbox-app.js` - inbox page behavior, filtering, expansion, and item-chat client logic
+- `static/index.css` / `static/reader.css` / `static/inbox.css` - page layouts (desktop-first; the side panel becomes a drawer on phones). `main.py` sends `Cache-Control: no-cache` on the UI pages and `/static`, so browsers revalidate (ETag/304) and no `?v=` cache-busting is needed
+- `static/inbox-app.js` - inbox page: item list with search/filters, item view, item chat panel, keyboard shortcuts; renders untrusted item markdown with raw HTML escaped, non-http(s)/mailto links neutralised and images never loaded
 - `static/reader-app.js` - reader page behavior: document library, reading column with sentence highlight and follow, edit panel, retry flow, keyboard shortcuts, and playback client logic
 - `static/index.html` - main voice UI shell
 - `static/inbox.html` - inbox review UI with inline item chat
@@ -603,6 +608,7 @@ Tests:
 - `tests/test_reader_ingest_handlers.py`
 - `tests/test_reader_ingest_service.py`
 - `tests/test_reader_append.py` - appending to an existing document: incremental chunk append, position preservation, `replace`, retry folding appendices, status rules, tool/route wiring
+- `tests/test_reader_pacing.py` - paced playback: `ReaderPacer`, the stream waiting on `reader_heard`, finished-when-heard, wiring
 - `tests/test_reader_progress.py` - per-document progress (playback, append/replace, lazy backfill, migration) and heading levels
 - `tests/test_reader_edit.py` - renaming a document: DB + speech JSON title update, missing speech file, validation, any-status rename, route wiring
 - `tests/test_document_sources.py`

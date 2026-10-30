@@ -204,6 +204,86 @@
     orb.setState(state);
     statusEl.textContent = text;
     statusEl.dataset.tone = tone;
+    syncMediaSession();
+  }
+
+  // ---------- Media Session (media keys, headset buttons, OS controls) ----------
+
+  const mediaSession = 'mediaSession' in navigator ? navigator.mediaSession : null;
+  let keepalive = null;
+  let mediaMetaKey = '';
+
+  // Each sentence is its own short-lived <audio> (often routed through Web Audio for
+  // the orb), with gaps between them, so the browser has no steady media element to
+  // hang the controls on. A silent looping element, started from the Play gesture,
+  // gives it one for as long as we're reading.
+  function silentWavUrl() {
+    const rate = 8000;
+    const n = rate; // one second of silence, looped
+    const buf = new ArrayBuffer(44 + n * 2);
+    const v = new DataView(buf);
+    const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, n * 2, true);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+
+  function setKeepalive(on) {
+    if (!mediaSession) return;
+    if (on) {
+      if (!keepalive) {
+        keepalive = new Audio(silentWavUrl());
+        keepalive.loop = true;
+      }
+      if (keepalive.paused) keepalive.play().catch(() => {});
+    } else if (keepalive && !keepalive.paused) {
+      keepalive.pause();
+    }
+  }
+
+  function syncMediaSession() {
+    if (!mediaSession) return;
+    const active = isPlaying || !!currentAudio;
+    setKeepalive(active);
+    mediaSession.playbackState = active ? 'playing' : (playable() ? 'paused' : 'none');
+    if (!currentDoc) {
+      if (mediaMetaKey) { mediaSession.metadata = null; mediaMetaKey = ''; }
+      return;
+    }
+    const album = sectionHeading(currentChunk);
+    const key = currentDoc.title + '\u0000' + album;
+    if (key === mediaMetaKey || typeof MediaMetadata === 'undefined') return;
+    mediaMetaKey = key;
+    mediaSession.metadata = new MediaMetadata({
+      title: currentDoc.title || 'Untitled document',
+      artist: 'Octavius Reader',
+      album,
+      artwork: [
+        { src: '/static/icon-192.png', sizes: '192x192', type: 'image/png' },
+        { src: '/static/icon-512.png', sizes: '512x512', type: 'image/png' },
+      ],
+    });
+  }
+
+  if (mediaSession) {
+    const handlers = {
+      play: () => { if (!isPlaying) togglePlay(); },
+      pause: () => { if (isPlaying) sendPause(); },
+      stop: () => { if (isPlaying || currentAudio) sendStop(); },
+      previoustrack: () => stepSection(-1),
+      nexttrack: () => stepSection(1),
+      seekbackward: () => stepSentence(-1),
+      seekforward: () => stepSentence(1),
+    };
+    for (const [action, fn] of Object.entries(handlers)) {
+      try {
+        mediaSession.setActionHandler(action, fn);
+      } catch (_err) {
+        // This browser doesn't support that action.
+      }
+    }
   }
 
   function sectionHeading(chunkIdx) {
@@ -291,6 +371,7 @@
     // Keep the open document's row current; after reader_audio_done the queued
     // tail must not pull "Finished" back down.
     if (!finished) setDocProgress(currentDocId, pos.sentence_global, pos.total_sentences);
+    syncMediaSession();
   }
 
   async function playNextAudio() {
@@ -317,18 +398,52 @@
     currentAudio = audio;
     attachAnalyser(audio);
 
-    audio.onplaying = refreshTransport;
-    audio.onended = () => {
+    // Report the sentence as heard when its audio actually starts. This is a media
+    // event, so it keeps firing in a background tab; the paced server releases the
+    // next sentence on it. A sentence that can't play is reported too, or the
+    // server would wait on it forever.
+    let reported = false;
+    const report = () => {
+      if (reported) return;
+      reported = true;
+      sendHeard(pos);
+    };
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
       URL.revokeObjectURL(url);
       if (currentAudio === audio) currentAudio = null;
       playNextAudio();
     };
+    audio.onplaying = () => {
+      report();
+      refreshTransport();
+    };
+    audio.onended = advance;
     audio.onerror = () => {
-      URL.revokeObjectURL(url);
-      if (currentAudio === audio) currentAudio = null;
-      playNextAudio();
+      report();
+      advance();
     };
-    audio.play().catch(() => playNextAudio());
+    audio.play().catch(() => {
+      report();
+      advance();
+    });
+  }
+
+  function sendHeard(pos) {
+    // Only for the current play, and not for the tail that is still playing after
+    // reader_audio_done (the server already treats the document as finished).
+    if (!pos || pos.seq !== playSeqId || finished || !currentDocId) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: 'reader_heard',
+      seq: pos.seq,
+      doc_id: currentDocId,
+      chunk_index: pos.chunk_index,
+      sentence_index: pos.sentence_index,
+      sentence_global: pos.sentence_global,
+    }));
   }
 
   function clearAudioQueue() {
@@ -428,6 +543,8 @@
         sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
         voice: voiceSelect.value,
         seq: mySeq,
+        // Server stays a few sentences ahead of what reader_heard reports.
+        paced: true,
       }));
     }, 100);
   }
