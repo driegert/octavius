@@ -2,413 +2,138 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="theme-color" content="#172033">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Octavius — Inbox</title>
+<meta name="theme-color" content="#172033">
+<title>Octavius Inbox</title>
 <link rel="icon" type="image/png" href="/static/octavius-dapper_cyber_punk.png">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
 <link rel="manifest" href="/static/manifest.json">
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="/static/app-common.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&family=Spline+Sans:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/static/octavius.css">
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
-    background: #172033;
-    color: #d9d6e8;
-    min-height: 100vh;
-    padding: 2rem;
-  }
-
-  header {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-    max-width: 800px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-
-  header a {
-    color: #7a829e;
-    text-decoration: none;
-    font-size: 0.8rem;
-    transition: color 0.2s;
-  }
-  header a:hover { color: #8088a5; }
-
-  header h1 {
-    font-size: 1.1rem;
-    font-weight: 400;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    color: #8088a5;
-    flex: 1;
-  }
-
-  /* Filters and search */
-  .toolbar {
-    display: flex;
-    gap: 0.6rem;
-    margin-bottom: 1.5rem;
-    max-width: 800px;
-    margin-left: auto;
-    margin-right: auto;
-    flex-wrap: wrap;
-  }
-
-  .toolbar input[type="search"] {
-    flex: 1;
-    min-width: 200px;
-    background: #1e2840;
-    border: 1px solid #2b3754;
-    border-radius: 6px;
-    color: #d9d6e8;
-    font-family: inherit;
-    font-size: 0.85rem;
-    padding: 0.55rem 0.8rem;
-    outline: none;
-    transition: border-color 0.2s;
-  }
-  .toolbar input[type="search"]:focus { border-color: #b9a6ff; }
-  .toolbar input[type="search"]::placeholder { color: #3a4766; }
-
-  .toolbar select {
-    background: #1e2840;
-    border: 1px solid #2b3754;
-    border-radius: 6px;
-    color: #d9d6e8;
-    font-family: inherit;
-    font-size: 0.85rem;
-    padding: 0.55rem 0.6rem;
-    cursor: pointer;
-  }
-  .toolbar select:focus { outline: 1px solid #b9a6ff; border-color: #b9a6ff; }
-
-  /* Item list */
-  .items {
-    max-width: 800px;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 0.8rem;
-  }
-
-  .empty-state {
-    text-align: center;
-    color: #7a829e;
-    font-size: 0.9rem;
-    padding: 3rem 0;
-  }
-
-  /* Card */
-  .card {
-    background: #1e2840;
-    border: 1px solid #2b3754;
-    border-radius: 8px;
-    padding: 1rem 1.2rem;
-    cursor: pointer;
-    transition: border-color 0.2s;
-  }
-  .card:hover { border-color: #3a4766; }
-  .card.expanded { cursor: default; }
-
-  .card-header {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-  }
-
-  .badge {
-    font-size: 0.6rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    padding: 0.15rem 0.45rem;
-    border-radius: 3px;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  .badge.note { background: #1a2a1a; color: #82e0cf; }
-  .badge.search_summary { background: #222c46; color: #6a8abf; }
-  .badge.article { background: #2a2a1a; color: #bfa06a; }
-  .badge.email_draft { background: #2a1a2a; color: #bf6abf; }
-
-  .card-title {
-    flex: 1;
-    font-size: 0.95rem;
-    color: #e1deee;
-  }
-
-  .card-date {
-    font-size: 0.7rem;
-    color: #7a829e;
-    white-space: nowrap;
-  }
-
-  .card-preview {
-    font-size: 0.85rem;
-    color: #8088a5;
-    margin-top: 0.5rem;
-    line-height: 1.45;
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-  }
-
-  .card-full {
-    display: none;
-    margin-top: 0.8rem;
-    font-size: 0.85rem;
-    color: #a9aec6;
-    line-height: 1.6;
-    white-space: pre-wrap;
-    word-break: break-word;
-    border-top: 1px solid #2b3754;
-    padding-top: 0.8rem;
-  }
-  .card.expanded .card-preview { display: none; }
-  .card.expanded .card-full { display: block; }
-
-  .card-meta {
-    display: none;
-    margin-top: 0.6rem;
-    font-size: 0.75rem;
-    color: #7a829e;
-  }
-  .card.expanded .card-meta { display: block; }
-  .card-meta a { color: #b9a6ff; text-decoration: none; }
-  .card-meta a:hover { text-decoration: underline; }
-
-  .card-actions {
-    display: none;
-    margin-top: 0.8rem;
-    gap: 0.5rem;
-  }
-  .card.expanded .card-actions { display: flex; }
-
-  .card-actions button {
-    background: none;
-    border: 1px solid #2b3754;
-    color: #8088a5;
-    padding: 0.35rem 0.8rem;
-    font-size: 0.75rem;
-    letter-spacing: 0.05em;
-    cursor: pointer;
-    border-radius: 4px;
-    transition: all 0.2s;
-    font-family: inherit;
-  }
-  .card-actions button:hover { border-color: #7a829e; color: #d9d6e8; }
-  .card-actions button.done-btn:hover { border-color: #4a8a4a; color: #82e0cf; }
-  .card-actions button.dismiss-btn:hover { border-color: #8a4a4a; color: #f0a6a0; }
-  .card-actions button.read-btn:hover { border-color: #4a6a8a; color: #6aabbf; }
-
-  .status-badge {
-    font-size: 0.6rem;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: #7a829e;
-    padding: 0.1rem 0.35rem;
-    border: 1px solid #2b3754;
-    border-radius: 3px;
-    margin-left: auto;
-  }
-  .status-badge.done { color: #82e0cf; border-color: #3a5a3a; }
-  .status-badge.dismissed { color: #8088a5; border-color: #2b3754; }
-
-  /* Loading */
-  .loading {
-    text-align: center;
-    color: #7a829e;
-    padding: 2rem 0;
-  }
-
-  /* Pagination */
-  .pagination {
-    display: flex;
-    justify-content: center;
-    gap: 0.8rem;
-    margin-top: 1.5rem;
-    max-width: 800px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-
-  .pagination button {
-    background: none;
-    border: 1px solid #2b3754;
-    color: #8088a5;
-    padding: 0.4rem 1rem;
-    font-size: 0.75rem;
-    cursor: pointer;
-    border-radius: 4px;
-    transition: all 0.2s;
-    font-family: inherit;
-  }
-  .pagination button:hover { border-color: #7a829e; color: #d9d6e8; }
-  .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
-
-  /* Chat panel */
-  .card-chat {
-    display: none;
-    margin-top: 0.8rem;
-    border-top: 1px solid #2b3754;
-    padding-top: 0.6rem;
-  }
-  .card.expanded .card-chat { display: block; }
-
-  .chat-toggle-btn {
-    background: none;
-    border: 1px solid #2b3754;
-    color: #b9a6ff;
-    padding: 0.35rem 0.8rem;
-    font-size: 0.75rem;
-    cursor: pointer;
-    border-radius: 4px;
-    transition: all 0.2s;
-    font-family: inherit;
-    width: 100%;
-  }
-  .chat-toggle-btn:hover { border-color: #b9a6ff; color: #cbbcff; }
-
-  .chat-panel { display: none; margin-top: 0.6rem; }
-  .chat-panel.open { display: block; }
-
-  .chat-messages {
-    max-height: 40vh;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 0.5rem;
-    padding: 0.4rem;
-  }
-
-  .chat-msg {
-    font-size: 0.8rem;
-    line-height: 1.45;
-    padding: 0.5rem 0.7rem;
-    border-radius: 6px;
-    max-width: 85%;
-    word-break: break-word;
-  }
-  .chat-msg.user {
-    background: #222c46;
-    color: #a9aec6;
-    align-self: flex-end;
-  }
-  .chat-msg.assistant {
-    background: #1a2a1a;
-    color: #d9d6e8;
-    align-self: flex-start;
-  }
-  .chat-msg.assistant p { margin-bottom: 0.4em; }
-  .chat-msg.assistant p:last-child { margin-bottom: 0; }
-  .chat-msg.assistant ul, .chat-msg.assistant ol { margin: 0.3em 0 0.4em 1.1em; }
-  .chat-msg.assistant li { margin-bottom: 0.15em; }
-  .chat-msg.assistant strong { color: #e8e4f2; }
-  .chat-msg.assistant code { background: #1e2840; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }
-
-  .chat-status {
-    font-size: 0.7rem;
-    color: #b9a6ff;
-    padding: 0.2rem 0;
-    min-height: 1.2em;
-  }
-
-  .chat-input-row {
-    display: flex;
-    gap: 0.4rem;
-  }
-
-  .chat-input-row input {
-    flex: 1;
-    background: #1e2840;
-    border: 1px solid #2b3754;
-    border-radius: 6px;
-    color: #d9d6e8;
-    font-family: inherit;
-    font-size: 0.8rem;
-    padding: 0.5rem 0.7rem;
-    outline: none;
-  }
-  .chat-input-row input:focus { border-color: #b9a6ff; }
-  .chat-input-row input::placeholder { color: #3a4766; }
-
-  .chat-input-row button {
-    background: #1e2840;
-    border: 1px solid #2b3754;
-    border-radius: 6px;
-    color: #8088a5;
-    padding: 0.5rem 0.7rem;
-    font-size: 0.75rem;
-    cursor: pointer;
-    font-family: inherit;
-  }
-  .chat-input-row button:hover { border-color: #7a829e; color: #d9d6e8; }
-
-  .chat-reset-btn {
-    background: none;
-    border: none;
-    color: #7a829e;
-    font-size: 0.65rem;
-    cursor: pointer;
-    padding: 0.3rem 0;
-    margin-top: 0.3rem;
-  }
-  .chat-reset-btn:hover { color: #8088a5; }
-
-  /* Octavius visual language (shared tokens in /static/octavius.css) */
-  body { font-family: var(--font-ui); background: var(--bg); color: var(--ink); }
-  header h1 {
-    font-family: var(--font-voice);
-    font-style: italic;
-    font-weight: 500;
-    font-size: 1.55rem;
-    letter-spacing: -0.01em;
-    text-transform: none;
-    color: var(--ink);
-  }
-  header a { color: var(--ink-3); }
-  header a:hover { color: var(--ink); }
-</style>
+<link rel="stylesheet" href="/static/inbox.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+<script src="/static/app-common.js"></script>
 </head>
 <body>
 
-<header>
-  <a href="/">&larr; Octavius</a>
-  <h1>Inbox</h1>
-</header>
+<div class="shell" id="shell">
 
-<div class="toolbar">
-  <input type="search" id="search" placeholder="Search saved items...">
-  <select id="type-filter">
-    <option value="">All types</option>
-    <option value="note">Notes</option>
-    <option value="search_summary">Search summaries</option>
-    <option value="article">Articles</option>
-    <option value="email_draft">Email drafts</option>
-  </select>
-  <select id="status-filter">
-    <option value="pending">Pending</option>
-    <option value="">All</option>
-    <option value="done">Done</option>
-    <option value="dismissed">Dismissed</option>
-  </select>
-</div>
+  <!-- ===== Rail: saved items ===== -->
+  <aside class="rail" id="rail" aria-label="Saved items">
+    <header class="rail-head">
+      <div class="rail-brand">
+        <a class="wordmark" href="/">Octavius</a>
+        <span class="rail-sub">Inbox</span>
+      </div>
+      <button class="icon-btn only-narrow" id="rail-close" aria-label="Close the item list">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </header>
 
-<div class="items" id="items"></div>
+    <div class="find">
+      <div class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/></svg>
+        <input type="search" id="search" placeholder="Search saved items" aria-label="Search saved items">
+        <kbd class="search-key">/</kbd>
+      </div>
+      <div class="chips" id="status-filter" role="radiogroup" aria-label="Status">
+        <button role="radio" class="chip" data-status="pending" aria-checked="true">Pending</button>
+        <button role="radio" class="chip" data-status="done" aria-checked="false">Done</button>
+        <button role="radio" class="chip" data-status="dismissed" aria-checked="false">Dismissed</button>
+        <button role="radio" class="chip" data-status="" aria-checked="false">All</button>
+      </div>
+      <label class="type-row">
+        <span class="type-label">Type</span>
+        <select id="type-filter" aria-label="Type">
+          <option value="">All types</option>
+          <option value="note">Notes</option>
+          <option value="search_summary">Search summaries</option>
+          <option value="article">Articles</option>
+          <option value="email_draft">Email drafts</option>
+        </select>
+      </label>
+      <p class="list-note" id="list-note" role="status"></p>
+    </div>
 
-<div class="pagination" id="pagination">
-  <button id="prev-btn" disabled>&larr; Prev</button>
-  <button id="next-btn" disabled>Next &rarr;</button>
+    <div class="item-list" id="items" role="list" aria-label="Items"></div>
+
+    <nav class="pager" id="pagination" aria-label="Pages">
+      <button class="btn" id="prev-btn" disabled>Newer</button>
+      <span class="pager-where" id="page-where"></span>
+      <button class="btn" id="next-btn" disabled>Older</button>
+    </nav>
+
+    <footer class="rail-foot">
+      <a class="rail-link" href="/">Talk</a>
+      <a class="rail-link" href="/reader">Reader</a>
+    </footer>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
+
+  <!-- ===== Stage: the selected item ===== -->
+  <main class="stage">
+    <header class="stage-head">
+      <button class="icon-btn only-narrow" id="rail-open" aria-label="Open the item list">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+      </button>
+      <p class="stage-title" id="stage-title">Inbox</p>
+      <span class="conn" id="conn-state" data-state="connecting">Connecting</span>
+    </header>
+
+    <div class="stage-body" id="stage-body">
+      <div class="page" id="page">
+        <div class="column">
+          <div class="empty" id="empty-state">
+            <p class="empty-greeting">Your saved things.</p>
+            <p class="empty-hint">Notes, articles, search summaries and email drafts Octavius kept for you. Pick one on the left.</p>
+            <dl class="keys">
+              <dt><kbd>/</kbd></dt><dd>Search</dd>
+              <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Next and previous item</dd>
+              <dt><kbd>c</kbd></dt><dd>Chat about the item</dd>
+              <dt><kbd>e</kbd></dt><dd>Mark done</dd>
+              <dt><kbd>Esc</kbd></dt><dd>Close or clear</dd>
+            </dl>
+            <button class="btn only-narrow" id="empty-open">Show items</button>
+          </div>
+
+          <article class="item" id="item-view" hidden>
+            <p class="item-kicker" id="item-kicker"></p>
+            <h1 class="item-title" id="item-title"></h1>
+            <p class="item-meta" id="item-meta"></p>
+            <div class="item-actions" id="item-actions"></div>
+            <p class="notice" id="item-notice" role="alert" hidden></p>
+            <div class="prose" id="item-content"></div>
+          </article>
+        </div>
+      </div>
+
+      <!-- Item chat: beside the item on wide screens, below it otherwise -->
+      <section class="chat" id="chat" aria-label="Chat about this item" hidden>
+        <header class="chat-head">
+          <h2 class="chat-title">Ask Octavius</h2>
+          <button class="link-btn" id="chat-reset" hidden>Start over</button>
+        </header>
+        <div class="chat-log" id="chat-log" aria-live="polite">
+          <div class="chat-invite" id="chat-invite">
+            <p>Talk this item through: what it says, what to do with it, what to write back.</p>
+            <button class="btn" id="chat-open">Chat about this item <kbd>c</kbd></button>
+          </div>
+          <div class="chat-turns" id="chat-turns"></div>
+        </div>
+        <div class="chat-dock">
+        <form class="composer" id="chat-form" autocomplete="off" hidden>
+          <textarea id="chat-input" rows="1" placeholder="Ask about this item" aria-label="Message about this item"></textarea>
+          <button type="submit" class="send" id="chat-send" disabled aria-label="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+          </button>
+        </form>
+        </div>
+      </section>
+    </div>
+  </main>
 </div>
 
 <script src="/static/inbox-app.js"></script>
