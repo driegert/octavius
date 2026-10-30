@@ -3,538 +3,170 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Octavius — Reader</title>
+<meta name="theme-color" content="#172033">
+<title>Octavius Reader</title>
 <link rel="icon" type="image/png" href="/static/octavius-dapper_cyber_punk.png">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
 <link rel="manifest" href="/static/manifest.json">
-<script src="/static/app-common.js"></script>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
-    background: #0a0a0f;
-    color: #c8c8d0;
-    min-height: 100vh;
-    padding: 1.5rem 1rem;
-    max-width: 448px;
-    margin: 0 auto;
-  }
-
-  header {
-    display: flex;
-    align-items: center;
-    gap: 0.8rem;
-    margin-bottom: 1.2rem;
-  }
-
-  header a {
-    color: #555;
-    text-decoration: none;
-    font-size: 0.8rem;
-    transition: color 0.2s;
-  }
-  header a:hover { color: #888; }
-
-  header h1 {
-    font-size: 1.1rem;
-    font-weight: 400;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    color: #6a6a7a;
-    flex: 1;
-  }
-
-  /* Ingest bar */
-  .ingest-bar {
-    display: flex;
-    gap: 0.4rem;
-    margin-bottom: 1.2rem;
-  }
-
-  .ingest-bar input {
-    flex: 1;
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #c8c8d0;
-    font-family: inherit;
-    font-size: 0.8rem;
-    padding: 0.5rem 0.7rem;
-    outline: none;
-  }
-  .ingest-bar input:focus { border-color: #60a0ff; }
-  .ingest-bar input::placeholder { color: #444; }
-
-  .ingest-bar button, .small-btn {
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #888;
-    padding: 0.5rem 0.7rem;
-    font-size: 0.7rem;
-    cursor: pointer;
-    transition: all 0.2s;
-    font-family: inherit;
-    white-space: nowrap;
-  }
-  .ingest-bar button:hover, .small-btn:hover { border-color: #555; color: #ccc; }
-
-  /* Paste-text panel (hidden until the Paste button is used) */
-  .paste-bar { display: none; margin-bottom: 1.2rem; }
-  .paste-bar.active { display: block; }
-
-  .paste-bar textarea {
-    width: 100%;
-    min-height: 9rem;
-    resize: vertical;
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #c8c8d0;
-    font-family: inherit;
-    font-size: 0.8rem;
-    line-height: 1.5;
-    padding: 0.6rem 0.7rem;
-    outline: none;
-    box-sizing: border-box;
-  }
-  .paste-bar textarea:focus { border-color: #60a0ff; }
-  .paste-bar textarea::placeholder { color: #444; }
-
-  .paste-actions {
-    display: flex;
-    gap: 0.4rem;
-    margin-top: 0.4rem;
-  }
-  .paste-actions input {
-    flex: 1;
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #c8c8d0;
-    font-family: inherit;
-    font-size: 0.8rem;
-    padding: 0.5rem 0.7rem;
-    outline: none;
-  }
-  .paste-actions input:focus { border-color: #60a0ff; }
-  .paste-actions input::placeholder { color: #444; }
-  .paste-actions button {
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #888;
-    padding: 0.5rem 0.7rem;
-    font-size: 0.7rem;
-    cursor: pointer;
-    transition: all 0.2s;
-    font-family: inherit;
-    white-space: nowrap;
-  }
-  .paste-actions button:hover { border-color: #555; color: #ccc; }
-
-  /* Document list */
-  #doc-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
-  }
-
-  .doc-card {
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    padding: 0.6rem 0.8rem;
-    cursor: pointer;
-    transition: border-color 0.2s;
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-  }
-  .doc-card:hover { border-color: #60a0ff; }
-  .doc-card { user-select: none; -webkit-user-select: none; }
-
-  .doc-card .dc-title { flex: 1; font-size: 0.85rem; color: #d0d0e0; }
-  .doc-card .dc-status {
-    font-size: 0.6rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.15rem 0.4rem;
-    border-radius: 3px;
-  }
-  .dc-status.ready { color: #6abf6a; background: #1a2a1a; }
-  .dc-status.processing { color: #bfa06a; background: #2a2a1a; }
-  .dc-status.failed { color: #bf6a6a; background: #2a1a1a; }
-
-  .doc-card .dc-delete {
-    background: none;
-    border: none;
-    color: #444;
-    font-size: 0.9rem;
-    cursor: pointer;
-    padding: 0.2rem;
-    transition: color 0.2s;
-  }
-  .doc-card .dc-delete:hover { color: #bf6a6a; }
-
-  .doc-card .dc-retry {
-    background: none;
-    border: none;
-    color: #6a8fbf;
-    font-size: 0.7rem;
-    cursor: pointer;
-    padding: 0.2rem 0.35rem;
-    transition: color 0.2s;
-  }
-  .doc-card .dc-retry:hover { color: #9bc0ff; }
-
-  .doc-card .dc-edit {
-    background: none;
-    border: none;
-    color: #6a8fbf;
-    font-size: 0.7rem;
-    cursor: pointer;
-    padding: 0.2rem 0.35rem;
-    transition: color 0.2s;
-  }
-  .doc-card .dc-edit:hover { color: #9bc0ff; }
-
-  .empty-state {
-    text-align: center;
-    color: #555;
-    font-size: 0.85rem;
-    padding: 2rem 0;
-  }
-
-  /* Player view */
-  #player {
-    display: none;
-  }
-  #player.active { display: block; }
-
-  #player-title {
-    font-size: 1rem;
-    color: #d0d0e0;
-    margin-bottom: 0.8rem;
-    text-align: center;
-  }
-
-  #player-back {
-    font-size: 0.75rem;
-    color: #555;
-    cursor: pointer;
-    margin-bottom: 0.6rem;
-    display: inline-block;
-  }
-  #player-back:hover { color: #888; }
-
-  #player-edit {
-    font-size: 0.75rem;
-    color: #555;
-    cursor: pointer;
-    margin-left: 0.8rem;
-    margin-bottom: 0.6rem;
-    display: inline-block;
-  }
-  #player-edit:hover { color: #888; }
-
-  /* Edit panel (reused between list and player views) */
-  .edit-bar { display: none; margin-bottom: 1.2rem; background: #101018; border: 1px solid #2a2a35; border-radius: 6px; padding: 0.7rem; }
-  .edit-bar.active { display: block; }
-
-  .edit-bar-caption {
-    font-size: 0.7rem;
-    color: #666;
-    margin-bottom: 0.5rem;
-  }
-
-  .edit-bar input[type="text"] {
-    width: 100%;
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #c8c8d0;
-    font-family: inherit;
-    font-size: 0.8rem;
-    padding: 0.5rem 0.7rem;
-    outline: none;
-    margin-bottom: 0.5rem;
-    box-sizing: border-box;
-  }
-  .edit-bar input[type="text"]:focus { border-color: #60a0ff; }
-
-  .edit-bar textarea {
-    width: 100%;
-    min-height: 7rem;
-    resize: vertical;
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #c8c8d0;
-    font-family: inherit;
-    font-size: 0.8rem;
-    line-height: 1.5;
-    padding: 0.6rem 0.7rem;
-    outline: none;
-    box-sizing: border-box;
-    margin-bottom: 0.5rem;
-  }
-  .edit-bar textarea:focus { border-color: #60a0ff; }
-  .edit-bar textarea::placeholder { color: #444; }
-
-  .edit-replace-row {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.75rem;
-    color: #999;
-    margin-bottom: 0.5rem;
-    cursor: pointer;
-  }
-
-  .edit-hint {
-    font-size: 0.68rem;
-    color: #555;
-    margin-bottom: 0.5rem;
-    line-height: 1.4;
-  }
-
-  .edit-error {
-    font-size: 0.72rem;
-    color: #bf6a6a;
-    margin-bottom: 0.4rem;
-  }
-  .edit-error:empty { display: none; }
-
-  .edit-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.4rem;
-  }
-  .edit-actions button {
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    color: #888;
-    padding: 0.5rem 0.7rem;
-    font-size: 0.7rem;
-    cursor: pointer;
-    transition: all 0.2s;
-    font-family: inherit;
-  }
-  .edit-actions button:hover { border-color: #555; color: #ccc; }
-  .edit-actions button:disabled { opacity: 0.5; cursor: default; }
-
-  /* Section list */
-  #sections {
-    max-height: 30vh;
-    overflow-y: auto;
-    margin-bottom: 1rem;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-  }
-
-  .section-item {
-    padding: 0.45rem 0.7rem;
-    font-size: 0.78rem;
-    color: #888;
-    cursor: pointer;
-    border-bottom: 1px solid #1a1a25;
-    transition: all 0.15s;
-  }
-  .section-item:last-child { border-bottom: none; }
-  .section-item:hover { background: #1a1a25; color: #ccc; }
-  .section-item.active { background: #1a1a2a; color: #60a0ff; }
-
-  /* Progress bar */
-  .progress-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 0.8rem;
-  }
-
-  #progress-bar {
-    flex: 1;
-    accent-color: #60a0ff;
-    cursor: pointer;
-    height: 6px;
-  }
-
-  .progress-label {
-    font-size: 0.65rem;
-    color: #555;
-    min-width: 3.5em;
-    text-align: right;
-  }
-
-  /* Transport controls */
-  .transport {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    gap: 0.8rem;
-    margin-bottom: 0.8rem;
-  }
-
-  .transport button {
-    background: #151520;
-    border: 1.5px solid #2a2a35;
-    border-radius: 50%;
-    color: #888;
-    cursor: pointer;
-    transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .transport button:hover { border-color: #555; color: #ccc; }
-
-  .transport .skip-btn {
-    width: 36px;
-    height: 36px;
-    font-size: 0.8rem;
-  }
-
-  #play-pause-btn {
-    width: 52px;
-    height: 52px;
-    font-size: 1.2rem;
-    border-color: #60a0ff;
-    color: #60a0ff;
-  }
-  #play-pause-btn:hover { background: #1a1a2a; }
-
-
-  /* Settings row */
-  .settings-row {
-    display: flex;
-    gap: 0.6rem;
-    align-items: center;
-    margin-bottom: 1rem;
-  }
-
-  .settings-row label {
-    font-size: 0.65rem;
-    color: #555;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-  }
-
-  .settings-row select, .settings-row input[type="range"] {
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 4px;
-    color: #c8c8d0;
-    font-family: inherit;
-    font-size: 0.8rem;
-    padding: 0.3rem;
-    cursor: pointer;
-  }
-
-  .settings-row .speed-val {
-    font-size: 0.75rem;
-    color: #8888a0;
-    min-width: 2.5em;
-  }
-
-  /* Read-along text */
-  #read-along {
-    background: #151520;
-    border: 1px solid #2a2a35;
-    border-radius: 6px;
-    padding: 0.8rem;
-    font-size: 0.82rem;
-    line-height: 1.55;
-    color: #999;
-    min-height: 4em;
-    max-height: 20vh;
-    overflow-y: auto;
-  }
-
-  #read-along .current-sentence {
-    color: #e0e0f0;
-    font-weight: 500;
-  }
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&family=Spline+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/static/octavius.css?v=20261030">
+<link rel="stylesheet" href="/static/reader.css?v=20261030">
+<script src="/static/app-common.js?v=20261030"></script>
 </head>
 <body>
 
-<header>
-  <a href="/">&larr; Octavius</a>
-  <h1>Reader</h1>
-</header>
+<div class="shell" id="shell">
 
-<!-- Document list view -->
-<div id="list-view">
-  <div class="ingest-bar">
-    <input type="text" id="ingest-input" placeholder="File path or URL...">
-    <button id="ingest-btn">Add</button>
-    <button id="paste-toggle" title="Paste text instead">Paste</button>
-  </div>
-  <div class="paste-bar" id="paste-bar">
-    <textarea id="paste-input" placeholder="Paste or type text to read aloud..."></textarea>
-    <div class="paste-actions">
-      <input type="text" id="paste-title" placeholder="Title (optional)">
-      <button id="paste-cancel">Cancel</button>
-      <button id="paste-submit">Add Text</button>
-    </div>
-  </div>
-  <div id="edit-bar-mount-list">
-    <div class="edit-bar" id="edit-bar">
-      <div class="edit-bar-caption" id="edit-bar-caption"></div>
-      <input type="text" id="edit-title" placeholder="Title">
-      <textarea id="edit-append" placeholder="Paste text to append to this document…"></textarea>
-      <label class="edit-replace-row">
-        <input type="checkbox" id="edit-replace">
-        Replace the whole document with this text
-      </label>
-      <div class="edit-hint" id="edit-hint">The text is cleaned and math is converted to speech, then added to the end. Playback position is kept.</div>
-      <div class="edit-error" id="edit-error"></div>
-      <div class="edit-actions">
-        <button id="edit-cancel">Cancel</button>
-        <button id="edit-save">Save</button>
+  <!-- ===== Rail: library ===== -->
+  <aside class="rail" id="rail" aria-label="Documents">
+    <header class="rail-head">
+      <div class="rail-brand">
+        <a class="wordmark" href="/">Octavius</a>
+        <span class="rail-sub">Reader</span>
+      </div>
+      <button class="icon-btn only-narrow" id="rail-close" aria-label="Close documents">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </header>
+
+    <section class="add" aria-label="Add a document">
+      <form class="add-row" id="ingest-form" autocomplete="off">
+        <input type="text" id="ingest-input" placeholder="Add a file path or URL" aria-label="File path or URL">
+        <button type="submit" class="add-go" id="ingest-btn" aria-label="Add document">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </form>
+      <button class="link-btn" id="paste-toggle" aria-expanded="false" aria-controls="paste-bar">Paste text instead</button>
+      <div class="paste" id="paste-bar" hidden>
+        <textarea id="paste-input" placeholder="Paste or type text to read aloud" aria-label="Text to read"></textarea>
+        <input type="text" id="paste-title" placeholder="Title (optional)" aria-label="Title">
+        <div class="paste-actions">
+          <span class="paste-key"><kbd>Ctrl</kbd> <kbd>Enter</kbd> adds it</span>
+          <button class="btn" id="paste-cancel">Cancel</button>
+          <button class="btn primary" id="paste-submit">Add text</button>
+        </div>
+      </div>
+      <p class="add-msg" id="add-msg" role="status"></p>
+    </section>
+
+    <div class="find">
+      <div class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/></svg>
+        <input type="search" id="doc-search" placeholder="Find a document" aria-label="Find a document">
+        <kbd class="search-key">/</kbd>
+      </div>
+      <div class="chips" id="status-filter" role="radiogroup" aria-label="Show">
+        <button role="radio" class="chip" data-filter="all" aria-checked="true">All</button>
+        <button role="radio" class="chip" data-filter="ready" aria-checked="false">Ready</button>
+        <button role="radio" class="chip" data-filter="processing" aria-checked="false">Converting</button>
+        <button role="radio" class="chip" data-filter="failed" aria-checked="false">Failed</button>
       </div>
     </div>
-  </div>
-  <div id="doc-list"></div>
+
+    <div class="doc-list" id="doc-list" role="list"></div>
+
+    <footer class="rail-foot">
+      <a class="rail-link" href="/">Talk</a>
+      <a class="rail-link" href="/inbox">Inbox</a>
+    </footer>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
+
+  <!-- ===== Stage ===== -->
+  <main class="stage">
+    <header class="stage-head">
+      <button class="icon-btn only-narrow" id="rail-open" aria-label="Open documents">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+      </button>
+      <h1 class="stage-title" id="player-title">Reader</h1>
+      <button class="btn" id="player-edit" hidden>Edit</button>
+      <span class="conn" id="conn-state" data-state="connecting">Connecting</span>
+    </header>
+
+    <!-- Edit panel: rename / append / replace -->
+    <div class="edit-wrap" id="edit-bar" hidden>
+      <div class="edit">
+        <div class="edit-grid">
+          <label class="field-label" for="edit-title">Title</label>
+          <input type="text" id="edit-title" placeholder="Title">
+          <label class="field-label" for="edit-append">Add text</label>
+          <textarea id="edit-append" placeholder="Paste the rest of the document here, for example the part behind a sign-in wall"></textarea>
+        </div>
+        <label class="switch"><input type="checkbox" id="edit-replace"><span class="switch-track"></span>Replace the whole document with this text</label>
+        <p class="edit-hint" id="edit-hint"></p>
+        <p class="edit-error" id="edit-error" role="alert"></p>
+        <div class="edit-actions">
+          <button class="btn" id="edit-cancel">Cancel</button>
+          <button class="btn primary" id="edit-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="page" id="page">
+      <div class="column" id="column">
+        <div class="empty" id="empty-state">
+          <p class="empty-greeting">Pick something to read.</p>
+          <p class="empty-hint" id="empty-hint">Choose a document on the left, or add a file path, a URL or pasted text.</p>
+        </div>
+        <div class="doc-state" id="doc-state" hidden></div>
+        <div class="notice" id="read-along" role="status" hidden></div>
+        <article class="text" id="sections" aria-label="Document text"></article>
+      </div>
+    </div>
+
+    <button class="follow" id="follow-btn" hidden>Back to the current sentence</button>
+
+    <!-- Transport -->
+    <footer class="transport" id="transport">
+      <div class="transport-inner">
+        <div class="transport-keys">
+          <button class="icon-btn" id="skip-back" title="Previous section (Shift+←)" aria-label="Previous section">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 6h2v12H7zM20 6v12l-9-6z"/></svg>
+          </button>
+          <button class="icon-btn" id="step-back" title="Previous sentence (←)" aria-label="Previous sentence">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+          </button>
+          <button class="orb" id="play-pause-btn" disabled aria-label="Play" title="Play (Space)">
+            <canvas id="orb-canvas" aria-hidden="true"></canvas>
+            <svg class="glyph play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 6.2v11.6a.6.6 0 0 0 .9.5l9.2-5.8a.6.6 0 0 0 0-1L9.4 5.7a.6.6 0 0 0-.9.5z" fill="currentColor"/></svg>
+            <svg class="glyph pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="6" width="3.6" height="12" rx="1" fill="currentColor"/><rect x="13.4" y="6" width="3.6" height="12" rx="1" fill="currentColor"/></svg>
+          </button>
+          <button class="icon-btn" id="step-fwd" title="Next sentence (→)" aria-label="Next sentence">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+          <button class="icon-btn" id="skip-fwd" title="Next section (Shift+→)" aria-label="Next section">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15 6h2v12h-2zM4 6v12l9-6z"/></svg>
+          </button>
+        </div>
+
+        <div class="transport-main">
+          <div class="transport-status">
+            <span class="status" id="status">No document open</span>
+            <span class="where" id="where"></span>
+            <span class="count"><span id="progress-current">0</span> of <span id="progress-total">0</span></span>
+          </div>
+          <input type="range" id="progress-bar" min="0" max="0" value="0" aria-label="Position in document">
+        </div>
+
+        <div class="transport-opts">
+          <label class="opt">
+            <span class="opt-label">Speed <output id="reader-speed-val">1.4x</output></span>
+            <input type="range" id="reader-speed" min="1.0" max="2.0" step="0.1" value="1.4" aria-label="Speaking speed">
+          </label>
+          <label class="opt">
+            <span class="opt-label">Voice</span>
+            <select id="reader-voice" aria-label="Voice"></select>
+          </label>
+        </div>
+      </div>
+    </footer>
+  </main>
 </div>
 
-<!-- Player view -->
-<div id="player">
-  <span id="player-back">&larr; Back to list</span>
-  <span id="player-edit">Edit</span>
-  <div id="player-title"></div>
-
-  <div id="edit-bar-mount-player"></div>
-
-  <div id="sections"></div>
-
-  <div class="progress-row">
-    <span class="progress-label" id="progress-current">0</span>
-    <input type="range" id="progress-bar" min="0" max="100" value="0">
-    <span class="progress-label" id="progress-total">0</span>
-  </div>
-
-  <div class="transport">
-    <button class="skip-btn" id="skip-back" title="Previous section">&#9198;</button>
-    <button id="play-pause-btn" title="Play">&#9654;</button>
-    <button class="skip-btn" id="skip-fwd" title="Next section">&#9197;</button>
-  </div>
-
-  <div class="settings-row">
-    <label>Speed</label>
-    <input type="range" id="reader-speed" min="1.0" max="2.0" step="0.1" value="1.4">
-    <span class="speed-val" id="reader-speed-val">1.4x</span>
-    <label>Voice</label>
-    <select id="reader-voice"></select>
-  </div>
-
-  <div id="read-along"></div>
-</div>
-
-<script src="/static/reader-app.js"></script>
+<script src="/static/index-orb.js?v=20261030"></script>
+<script src="/static/reader-app.js?v=20261030"></script>
 </body>
 </html>

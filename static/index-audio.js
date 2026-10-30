@@ -13,6 +13,8 @@
     let audioDone = false;
     let isPlaying = false;
     let currentAudio = null;
+    let analyser = null;
+    let levelBuf = null;
 
     function getAudioCtx() {
       if (!audioCtx) audioCtx = new AudioContext();
@@ -184,6 +186,25 @@
       return out;
     }
 
+    // Route a playing <audio> through an AnalyserNode so the UI can follow
+    // the reply's loudness. Only when the AudioContext is already running:
+    // routing through a suspended context would play silence, so in that
+    // case the element plays directly and the level just reads as zero.
+    function attachAnalyser(audio) {
+      try {
+        const ctx = getAudioCtx();
+        if (ctx.state !== 'running') return;
+        if (!analyser) {
+          analyser = ctx.createAnalyser();
+          analyser.fftSize = 1024;
+          analyser.connect(ctx.destination);
+          levelBuf = new Float32Array(analyser.fftSize);
+        }
+        ctx.createMediaElementSource(audio).connect(analyser);
+      } catch (_err) {
+      }
+    }
+
     function setIdle() {
       isPlaying = false;
       currentAudio = null;
@@ -218,12 +239,19 @@
         }
       }
 
+      try {
+        const ctx = getAudioCtx();
+        if (ctx.state === 'suspended') await ctx.resume();
+      } catch (_err) {
+      }
+
       const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.preservesPitch = true;
       audio.playbackRate = getPlaybackRate ? getPlaybackRate() : 1.0;
       currentAudio = audio;
+      attachAnalyser(audio);
 
       audio.onended = () => {
         URL.revokeObjectURL(url);
@@ -261,6 +289,16 @@
           currentAudio = null;
         }
         setIdle();
+      },
+      isActive() {
+        return isPlaying || audioQueue.length > 0;
+      },
+      getLevel() {
+        if (!analyser || !currentAudio || currentAudio.paused) return 0;
+        analyser.getFloatTimeDomainData(levelBuf);
+        let sum = 0;
+        for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
+        return Math.min(1, Math.sqrt(sum / levelBuf.length) * 5);
       },
       updatePlaybackRate() {
         if (currentAudio) {

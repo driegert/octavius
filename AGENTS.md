@@ -578,9 +578,12 @@ Frontend:
 
 - `static/app-common.js` - shared browser helpers for WebSocket setup, HTML escaping, and voice-list loading
 - `static/index-audio.js` - streamed TTS queue, silence trimming, and browser audio playback helper for the main voice UI
-- `static/index-app.js` - main voice UI controller, settings/history overlays, transcript rendering, and WebSocket client logic
+- `static/index-app.js` - main voice UI controller: conversation sidebar, settings, transcript rendering, `confirm_request` card, keyboard shortcuts, and WebSocket client logic
+- `static/index-orb.js` - the eight-lobed voice orb (canvas, driven by mic and playback levels); the talk button on `/` and play/pause on `/reader`
+- `static/octavius.css` - shared design tokens, base styles and components (colours, Newsreader/Spline Sans, switch, slider, dropdown) used by every page
+- `static/index.css` / `static/reader.css` - page layouts (desktop-first; the side panel becomes a drawer on phones). Local CSS/JS links carry `?v=<date>` because the server sends no cache headers: bump it when those files change
 - `static/inbox-app.js` - inbox page behavior, filtering, expansion, and item-chat client logic
-- `static/reader-app.js` - reader page behavior, document list, retry flow, and playback client logic
+- `static/reader-app.js` - reader page behavior: document library, reading column with sentence highlight and follow, edit panel, retry flow, keyboard shortcuts, and playback client logic
 - `static/index.html` - main voice UI shell
 - `static/inbox.html` - inbox review UI with inline item chat
 - `static/reader.html` - reader UI with playback controls and polling
