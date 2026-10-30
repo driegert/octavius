@@ -246,6 +246,7 @@ class WebSocketSessionHandler:
             "item_chat_reset": self.handle_item_chat_reset,
             "stt_start": self.handle_stt_start,
             "stt_stop": self.handle_stt_stop,
+            "typing_start": self.handle_typing_start,
             "delegation_list": self.handle_delegation_list,
             "delegation_pull": self.handle_delegation_pull,
             "delegation_dismiss": self.handle_delegation_dismiss,
@@ -270,6 +271,8 @@ class WebSocketSessionHandler:
             pi_brain = getattr(self.ws.app.state, "pi_brain", None)
             if pi_brain is not None:
                 pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
+                # A live re-attached process has history the slot may have lost.
+                self._request_pi_warm("restore_session")
             await self.send_payload(
                 {
                     "type": "session_id",
@@ -360,6 +363,8 @@ class WebSocketSessionHandler:
             source="voice",
             model=settings.llm_chain[0]["model"],
         )
+        # The loaded thread runs on a new process; start it now and warm the template.
+        self._request_pi_warm("load_conversation", start=True)
         history_pairs = [
             {"role": message["role"], "content": message["content"]}
             for message in msgs
@@ -879,6 +884,8 @@ class WebSocketSessionHandler:
 
         self.state.stt_stream.reset()
         self.state.stt_stream.active = True
+        # Dave is speaking: warm pi's cache while he does (never blocks the capture).
+        self._request_pi_warm("stt_start", start=True)
         if self.state.vad is None:
             self.state.vad = SileroVAD()
         else:
@@ -977,6 +984,28 @@ class WebSocketSessionHandler:
 
         await self.send_json("transcript", last_text)
         self._spawn_turn(last_text, source="voice")
+
+    async def handle_typing_start(self, _data: dict):
+        """A client saw Dave start typing: warm pi while he types (text turns)."""
+        self._request_pi_warm("typing_start", start=True)
+
+    def _request_pi_warm(self, reason: str, *, start: bool = False) -> None:
+        """Fire-and-forget /warm for this conversation's pi process (pi brain only).
+
+        Never raises and never awaits: warming must not delay or fail anything.
+        Vision threads stay native, so they are not warmed.
+        """
+        try:
+            pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+            if (
+                pi_brain is None
+                or self.state.history_session is None
+                or getattr(self.state.conversation, "has_images", False)
+            ):
+                return
+            pi_brain.request_warm(self.state.history_session.conv_id, start=start, reason=reason)
+        except Exception:
+            log.debug("pi warm request failed", exc_info=True)
 
     async def _discard_pi_process(self) -> None:
         """The conversation is ending (reset, load): stop its pi process, if any."""

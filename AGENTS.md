@@ -308,11 +308,20 @@ pi_harness `octavius-guard.ts` raises an RPC `confirm`, Octavius speaks the
 question, sends `confirm_request` + `audio_done`, and Dave's next transcript or
 `text_input` answers it (`_spawn_turn`; opening the mic then is not a barge-in).
 Processes are reaped after `OCTAVIUS_PI_IDLE_REAP_S` (4 h), killed on reset,
-load and shutdown, and re-keyed on `restore_session`. Knobs:
+load and shutdown, and re-keyed on `restore_session`. **Cache warming**
+(pi_harness `octavius-warm.ts`, RPC prompt `/warm`): `stt_start`, a new
+`typing_start` WS frame (no client sends it yet), `load_conversation` (these
+three start the process if needed) and `restore_session` warm the conversation's
+process; startup and recovery (after a failed warm or turn, retried with backoff
+until one succeeds) warm system + tools through a short-lived `--no-session`
+process. All fire-and-forget (`PiProcessManager.request_warm`); a process with no
+turns yet is still seeded. Knobs:
 `OCTAVIUS_PI_LAUNCHER`, `OCTAVIUS_PI_BIN` (the user service's PATH lacks
 `~/.local/bin`), `OCTAVIUS_PI_MODEL`, `OCTAVIUS_PI_TURN_TIMEOUT_S` (600),
-`OCTAVIUS_PI_CONFIRM_TIMEOUT_S` (55). `/health` → `pi_brain`. pi never gets
-`OCTAVIUS_*` env vars. Design and status: `docs/pi-backend-design.md`.
+`OCTAVIUS_PI_CONFIRM_TIMEOUT_S` (55), `OCTAVIUS_PI_WARM` (on),
+`OCTAVIUS_PI_WARM_DEBOUNCE_S` (5), `OCTAVIUS_PI_WARM_RETRY_S` (60). `/health` → `pi_brain`. pi never gets
+`OCTAVIUS_*` env vars. `/health` → `pi_brain.warm` has warm counts and the last
+result (`prompt_n` = tokens prefilled, `cache_n` = from cache). Design and status: `docs/pi-backend-design.md`.
 
 The email subagent prompt uses evangeline's `email_hybrid_search` (RRF fusion of
 semantic + BM25) for anything matching on body text. **Folder scope is a closed
@@ -627,7 +636,7 @@ Tests:
 - `tests/test_vault_files.py`
 - `tests/test_media_upload.py` - `media_uploads.save_upload` (sanitization, mime resolution, streaming caps) and the `/api/media/upload` route
 - `tests/test_subagent.py`
-- `tests/test_pi_brain.py` - pi_brain against `tests/fake_pi_rpc.py` (a scripted `pi --mode rpc` subprocess): speaking rule, tool recording, seeding, round cap, abort on close, crash restart, confirm yes/no, reaping
+- `tests/test_pi_brain.py` - pi_brain against `tests/fake_pi_rpc.py` (a scripted `pi --mode rpc` subprocess): speaking rule, tool recording, seeding, round cap, abort on close, crash restart, confirm yes/no, reaping, and `/warm` (triggers, debounce, pre-started processes still seeded, unhandled `/warm` aborted, recovery, `/health` counts)
 - `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
 - `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, LLM endpoint auth headers, and per-entry `params` merging

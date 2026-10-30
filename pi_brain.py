@@ -66,6 +66,10 @@ CONFIRM_VALUE_CHARS = 80
 STDOUT_LIMIT = 64 * 1024 * 1024  # one JSONL record can carry a whole tool result or image
 ABORT_SETTLE_S = 10.0
 COMMAND_TIMEOUT_S = 30.0
+# /warm (pi_harness extensions/octavius-warm.ts) reports through this status key.
+WARM_STATUS_KEY = "octavius-warm"
+WARM_COMMAND_TIMEOUT_S = 30.0  # covers pi start-up when the warm is a process's first command
+WARM_RESULT_TIMEOUT_S = 90.0  # the extension's own fetch timeout is 60 s
 
 
 class PiTurnError(RuntimeError):
@@ -170,6 +174,8 @@ class PiRpcProcess:
         self._events: asyncio.Queue | None = None
         self._stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
         self._tasks: list[asyncio.Task] = []
+        # Called with each octavius-warm report (a dict); set by PiProcessManager.
+        self.on_warm = None
 
     @property
     def alive(self) -> bool:
@@ -209,6 +215,13 @@ class PiRpcProcess:
                     if not fut.done():
                         fut.set_result(record)
                     continue
+                if (
+                    record.get("type") == "extension_ui_request"
+                    and record.get("method") == "setStatus"
+                    and record.get("statusKey") == WARM_STATUS_KEY
+                ):
+                    self._warm_report(record.get("statusText"))
+                    continue
                 if self._events is not None:
                     self._events.put_nowait(record)
                 elif record.get("type") == "extension_ui_request" and record.get("method") in (
@@ -233,6 +246,32 @@ class PiRpcProcess:
             if not line:
                 return
             self._stderr_tail.append(line.decode("utf-8", "replace").rstrip()[:300])
+
+    def _warm_report(self, text) -> None:
+        try:
+            report = json.loads(text) if isinstance(text, str) else None
+            if isinstance(report, dict) and self.on_warm is not None:
+                self.on_warm(report)
+        except Exception:
+            log.debug("Unreadable warm report", exc_info=True)
+
+    async def warm(self) -> str:
+        """Send ``/warm``. Returns the prompt disposition; the warm itself runs in pi.
+
+        "handled" is the only good answer: anything else means the octavius-warm
+        extension is not loaded and pi took "/warm" as a message to the model, so
+        that run is aborted at once.
+        """
+        resp = await self.command("prompt", timeout=WARM_COMMAND_TIMEOUT_S, message="/warm")
+        if not resp.get("success"):
+            raise PiTurnError(f"pi rejected /warm: {resp.get('error')}")
+        disposition = (resp.get("data") or {}).get("disposition") or "?"
+        if disposition != "handled":
+            try:
+                await self.command("abort", timeout=ABORT_SETTLE_S)
+            except Exception:
+                log.warning("pi: aborting an unhandled /warm failed", exc_info=True)
+        return disposition
 
     def stderr_tail(self) -> str:
         return " | ".join(self._stderr_tail)
@@ -297,23 +336,171 @@ class PiProcessManager:
     failures: int = 0
     last_error: str | None = None
     _reaper: asyncio.Task | None = None
+    warm_stats: "WarmStats" = field(default_factory=lambda: WarmStats())
+    _start_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _warm_tasks: set = field(default_factory=set)
+    _last_warm_request: dict = field(default_factory=dict)
+    _recovery: asyncio.Task | None = None
 
     def argv(self) -> list[str]:
         return [self.cfg.launcher, "--mode", "rpc"]
 
     async def get(self, conv_id: int) -> tuple[PiRpcProcess, bool]:
         """The live process for a conversation, and whether it was just started."""
-        proc = self.processes.get(conv_id)
-        if proc is not None and proc.alive:
-            return proc, False
-        if proc is not None:
-            await proc.kill()
-        proc = PiRpcProcess(self.argv(), child_env(self.cfg))
-        await proc.start()
-        self.processes[conv_id] = proc
-        self.starts += 1
-        log.info("pi: started process %s for conversation %s", proc.proc.pid, conv_id)
-        return proc, True
+        # One start at a time: a warm trigger and a turn may ask for the same
+        # conversation's process together, and must not start two.
+        async with self._start_lock:
+            proc = self.processes.get(conv_id)
+            if proc is not None and proc.alive:
+                return proc, False
+            if proc is not None:
+                await proc.kill()
+            proc = self._new_process()
+            await proc.start()
+            self.processes[conv_id] = proc
+            self.starts += 1
+            log.info("pi: started process %s for conversation %s", proc.proc.pid, conv_id)
+            return proc, True
+
+    def _new_process(self, extra: list[str] | None = None) -> PiRpcProcess:
+        argv = self.argv()
+        if extra:
+            argv = argv[:1] + extra + argv[1:]
+        proc = PiRpcProcess(argv, child_env(self.cfg))
+        proc.on_warm = self._on_warm_report
+        return proc
+
+    # --- /warm (docs/pi-backend-design.md, "Cache warming") -------------------------
+    #
+    # Every entry point is fire-and-forget: it schedules a task and returns, the task
+    # swallows every error, and nothing on a turn's path ever awaits a warm. The one
+    # place a turn can wait on a warm is inside pi (octavius-warm makes the real
+    # request wait for an in-flight warm, capped at 20 s), by design.
+
+    def request_warm(self, conv_id: int | None, *, start: bool = False, reason: str = "") -> None:
+        """Warm a conversation's process. ``start``: start it first if it has none.
+
+        A conversation with no live process and ``start=False`` is left alone.
+        Debounced per conversation (``warm_debounce_s``).
+        """
+        if not self.cfg.warm or conv_id is None:
+            return
+        now = time.monotonic()
+        last = self._last_warm_request.get(conv_id)
+        if last is not None and now - last < self.cfg.warm_debounce_s:
+            self.warm_stats.debounced += 1
+            return
+        self._last_warm_request[conv_id] = now
+        self.warm_stats.requested += 1
+        self._spawn(self._warm_conversation(conv_id, start, reason))
+
+    def warm_static_prefix(self, reason: str = "startup") -> None:
+        """Warm system prompt + tools when no conversation is live (startup, recovery)."""
+        if not self.cfg.warm:
+            return
+        self.warm_stats.requested += 1
+        self._spawn(self._warm_any(reason))
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._warm_tasks.add(task)
+        task.add_done_callback(self._warm_tasks.discard)
+
+    async def _warm_conversation(self, conv_id: int, start: bool, reason: str) -> None:
+        try:
+            proc = self.processes.get(conv_id)
+            if proc is None or not proc.alive:
+                if not start:
+                    self.warm_stats.skipped += 1
+                    return
+                proc, _ = await self.get(conv_id)
+            await self._send_warm(proc, reason)
+        except Exception as exc:
+            self.warm_stats.note_error(f"{reason}: {exc}")
+            log.warning("pi warm (%s) failed: %s", reason, exc)
+
+    async def _warm_any(self, reason: str) -> bool:
+        """Warm through a live idle process if there is one, else a short-lived one.
+
+        A short-lived process has no session payload, so it replays the template
+        (system + tools). Returns whether the warm reported ``ok``.
+        """
+        try:
+            live = [p for p in self.processes.values() if p.alive and not p.lock.locked()]
+            if live:
+                proc = max(live, key=lambda p: p.last_used)
+                return await self._send_warm(proc, reason, wait=True) == "ok"
+            proc = self._new_process(["--no-session"])
+            await proc.start()
+            try:
+                return await self._send_warm(proc, reason, wait=True) == "ok"
+            finally:
+                await proc.kill()
+        except Exception as exc:
+            self.warm_stats.note_error(f"{reason}: {exc}")
+            log.warning("pi warm (%s) failed: %s", reason, exc)
+            return False
+
+    async def _send_warm(self, proc: PiRpcProcess, reason: str, wait: bool = False) -> str | None:
+        if proc.lock.locked():
+            # A turn is running: its own request is warming the slot.
+            self.warm_stats.skipped += 1
+            return None
+        fut: asyncio.Future | None = None
+        if wait:
+            fut = asyncio.get_running_loop().create_future()
+            proc.on_warm = lambda r: (self._on_warm_report(r), r.get("event") == "warm"
+                                      and not fut.done() and fut.set_result(r))
+        try:
+            disposition = await proc.warm()
+            self.warm_stats.sent += 1
+            if disposition != "handled":
+                self.warm_stats.unsupported += 1
+                self.warm_stats.note_error(f"/warm not handled by pi ({disposition}); is octavius-warm loaded?")
+                return None
+            log.info("pi: /warm sent (%s)", reason)
+            if fut is None:
+                return None
+            report = await asyncio.wait_for(fut, WARM_RESULT_TIMEOUT_S)
+            return report.get("result")
+        finally:
+            proc.on_warm = self._on_warm_report
+
+    def _on_warm_report(self, report: dict) -> None:
+        self.warm_stats.record(report)
+        if report.get("event") == "warm":
+            log.info(
+                "pi warm %s (%s): prompt_n=%s cache_n=%s prefill=%sms wall=%sms%s",
+                report.get("result"), report.get("source", "-"), report.get("prompt_n"),
+                report.get("cache_n"), report.get("prefill_ms"), report.get("wall_ms"),
+                f" ({report['reason']})" if report.get("reason") else "",
+            )
+            if report.get("result") in ("error", "timeout"):
+                self.schedule_recovery()
+        elif report.get("event") == "wait":
+            log.info("pi: real request waited %sms for a warm%s",
+                     report.get("waited_ms"), " (capped)" if report.get("capped") else "")
+
+    def schedule_recovery(self) -> None:
+        """After a failed warm or turn, warm every ``warm_retry_s`` until one succeeds.
+
+        A dead or reloading model server is what fails a warm, so the first
+        success is the "back up" moment the design's recovery trigger wants.
+        """
+        if not self.cfg.warm or (self._recovery is not None and not self._recovery.done()):
+            return
+
+        async def loop():
+            delay = self.cfg.warm_retry_s
+            while True:
+                await asyncio.sleep(delay)
+                # Back off to 15 min: each retry with no live process starts a pi.
+                delay = min(delay * 2, max(self.cfg.warm_retry_s, 900.0))
+                self.warm_stats.recovery_attempts += 1
+                if await self._warm_any("recovery"):
+                    log.info("pi: warm succeeded again (recovery)")
+                    return
+        self._recovery = asyncio.create_task(loop())
 
     def rekey(self, old: int, new: int) -> None:
         if old == new or old not in self.processes:
@@ -350,6 +537,10 @@ class PiProcessManager:
     async def shutdown(self) -> None:
         if self._reaper:
             self._reaper.cancel()
+        if self._recovery:
+            self._recovery.cancel()
+        for task in list(self._warm_tasks):
+            task.cancel()
         for conv_id in list(self.processes):
             await self.discard(conv_id)
 
@@ -360,6 +551,60 @@ class PiProcessManager:
             "processes": sum(1 for p in self.processes.values() if p.alive),
             "starts": self.starts,
             "failures": self.failures,
+            "last_error": self.last_error,
+            "warm": self.warm_stats.health() if self.cfg.warm else {"enabled": False},
+        }
+
+
+@dataclass
+class WarmStats:
+    """Counters for /health. ``results`` counts the extension's reports by outcome."""
+
+    requested: int = 0
+    debounced: int = 0
+    sent: int = 0
+    skipped: int = 0
+    unsupported: int = 0
+    recovery_attempts: int = 0
+    results: dict = field(default_factory=dict)
+    waits: int = 0
+    waits_capped: int = 0
+    last: dict | None = None
+    last_at: float | None = None
+    last_wait_ms: int | None = None
+    last_error: str | None = None
+
+    def record(self, report: dict) -> None:
+        if report.get("event") == "wait":
+            self.waits += 1
+            self.waits_capped += bool(report.get("capped"))
+            self.last_wait_ms = report.get("waited_ms")
+            return
+        result = str(report.get("result"))
+        self.results[result] = self.results.get(result, 0) + 1
+        self.last = {k: report.get(k) for k in (
+            "result", "source", "reason", "status", "prompt_n", "cache_n", "prefill_ms", "wall_ms",
+        ) if report.get(k) is not None}
+        self.last_at = time.time()
+
+    def note_error(self, err: str) -> None:
+        self.last_error = err[:300]
+
+    def health(self) -> dict:
+        return {
+            "enabled": True,
+            "requested": self.requested,
+            "debounced": self.debounced,
+            "sent": self.sent,
+            "skipped": self.skipped,
+            "unsupported": self.unsupported,
+            "results": dict(self.results),
+            "last": self.last,
+            "last_at": self.last_at,
+            "waits": self.waits,
+            "waits_capped": self.waits_capped,
+            "last_wait_ms": self.last_wait_ms,
+            "recovery_attempts": self.recovery_attempts,
             "last_error": self.last_error,
         }
 
@@ -404,7 +649,9 @@ async def stream_pi_turn(
         log.warning("Memory injection failed; pi turn proceeds without memory", exc_info=True)
 
     proc, fresh = await manager.get(conv_id)
-    seed = build_seed(prior) if fresh else ""
+    # A process that has had no turn holds no history, whether this call started it
+    # or a warm trigger did (request_warm(start=True) starts processes ahead of turns).
+    seed = build_seed(prior) if proc.turns == 0 else ""
     message = build_prompt(user_text, _style_directive(source), memory, seed)
 
     async with proc.lock:
@@ -475,6 +722,7 @@ async def stream_pi_turn(
                 raise PiTurnError(provider_error)
         except PiTurnError as exc:
             manager.record_failure(str(exc))
+            manager.schedule_recovery()
             if not proc.alive:
                 await manager.discard(conv_id)
             raise

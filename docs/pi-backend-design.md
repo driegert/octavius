@@ -1,6 +1,6 @@
 # Octavius on pi: design
 
-Status: **steps 1–2 built 2026-10-30 (see their result sections); the rest is
+Status: **steps 1–3 built 2026-10-30 (see their result sections); the rest is
 proposal**, revised after review (Codex gpt-6.1-sol, local GLM-5.3-Flash). Measurements in this note
 were taken 2026-10-28..30 on the live fleet. Every timing run used synthetic or
 trivial prompts, or reported numbers only, so no mail or calendar content was
@@ -166,9 +166,9 @@ history-bearing payload exists before the first prompt. Until then, that
 first-turn cost is stated, not hidden — measure it at realistic thread sizes
 (today's `Conversation` keeps up to 40 messages).
 
-The template-only warm (static prefix, ~12–14k for the real profile) is itself
-unmeasured — every number above replays a full prior payload. Measure it in
-rollout step 3.
+The template-only warm was measured in step 3: the real profile's static prefix
+is ~7.5k tokens, not the 12–14k estimated, and a template warm caches 7,477 of
+it (see "Step 3 result").
 
 ### Rules the rest of the design must keep
 
@@ -302,6 +302,86 @@ Live, synthetic prompts, lilbuddy 26B, no warming, memory injection off:
 
 Open: Android and the PWA treat a second `audio_done` within one turn (after a
 confirm) as untested; the browser ignores `confirm_request`.
+
+## Step 3 result (2026-10-30)
+
+Built: pi_harness `extensions/octavius-warm.ts` (suite `scripts/test-octavius-warm.ts`,
+14 cases against a stub llama.cpp server) and the Octavius triggers in `pi_brain.py`
+(`PiProcessManager.request_warm` / `warm_static_prefix` / `schedule_recovery`), wired
+into `stt_start`, a new `typing_start` frame, `load_conversation`, `restore_session`
+and startup. `/health` → `pi_brain.warm`. How the requirements landed:
+
+- **Capture** keeps each agent-loop payload as *pending* and promotes it only on a 2xx
+  `after_provider_response`, so a request another extension aborted (remote-model-guard)
+  is never replayed. Headers are attached at promotion (pi assembles them after the
+  payload hook). Payloads are kept with model and baseUrl; a different model drops them (5a).
+- **Replay** returns at once: pi awaits a command handler before replying, so `/warm`
+  starts the fetch and returns, and the RPC reply is `handled` in ~10 ms (0.6 s when it
+  is a new process's first command). If pi answers anything but `handled` (extension not
+  loaded, so `/warm` became a model prompt), Octavius aborts that run and counts it as
+  `unsupported`.
+- **Single flight, skip mid-turn, wait capped at 20 s, own 60 s fetch timeout, no
+  other abort**: as specified. Octavius also skips a warm while it holds the process's
+  turn lock. **Never to a provider outside `localProviders`** (private-data.json),
+  failing closed. That rule is extra to the list above.
+- **Template** (6): `$PI_OCTAVIUS_STATE/warm-template.json`, 0600, rewritten when the
+  static prefix changes. It holds the system (`developer`) message, the tools and a
+  one-character user turn, with no history and no headers. Startup and recovery warm through a short-lived
+  `--no-session` process, or through the most recent live idle process when there is one.
+- **Observability** (7): the extension reports `setStatus("octavius-warm", JSON)` with
+  `prompt_n`, `cache_n`, `prefill_ms`, `wall_ms`, and a `wait` report when a real request
+  waited. Octavius logs each one and keeps counts and the last result for `/health`.
+- **Recovery** is the warm itself: a warm that errors or times out, or a failed pi turn,
+  starts a retry loop (60 s, doubling to 15 min) that stops at the first `ok` warm.
+  There is no separate lilbuddy probe.
+- **A pre-started process is still seeded.** `stream_pi_turn` used to seed only a process
+  it had just started. It now seeds any process with no turns yet, because triggers now
+  start processes ahead of the turn.
+
+Measured live, synthetic prompts (arithmetic, trivia, one `web_search`), memory block
+stubbed, real `pi-octavius` (isolated state dir) on lilbuddy `gemma4-26b-a4b`. Before every
+run both lilbuddy slots were overwritten with synthetic filler, so "cold" means nothing
+cached. Three runs each, first sentence from the moment the turn is sent; `prefilled` is
+the turn's own uncached input tokens.
+
+| Turn | Cold | Warmed (warm finished first) | Warm overlapping 3 s of "speech" |
+|---|---|---|---|
+| New conversation (pi start included in cold) | 7.8–8.3 s (7,574 prefilled) | 0.5–2.5 s (97 prefilled; template warm) | 3.5–5.3 s (waited 1.9 s for the warm) |
+| Follow-up in a live process (3 earlier turns) | 6.2–6.6 s (7,816) | 2.5–3.0 s (105; session warm) | 3.7–4.4 s (waited 1.7 s) |
+| `web_search` follow-up | 7.6–9.0 s (7,665) | 3.4–3.9 s (118) | — |
+| Reseeded 40-message thread (seed capped at 6,000 chars) | 10.0–14.9 s (8,878) | 3.4–11.0 s (1,402; template warm) | — |
+
+- **A warm costs ~4.45 s** for the 7.5k static prefix (template) and ~4.7 s for a short
+  session (prompt_n 7.5–7.7k, cache_n 1). That is ~0.6 s per 1k tokens, the same rate as
+  the cold prefill it replaces. 18 of 18 warms were `ok`, and no wait hit the cap.
+- **3 s of speech does not cover a fully cold prefix.** The real request waits out the
+  remaining ~1.8 s of the warm, as designed. That still halves first-sentence latency
+  (≈8 → ≈4 s), because the waiting turn then prefills ~100 tokens instead of 7.5k.
+  The doc's two-stage plan holds: keep the static prefix warm separately (startup,
+  recovery) so the mic-open warm only has the conversation delta to cover.
+- **What remains after a warm is the model's thinking**, not prefill: 0.5–3 s on these
+  prompts, so the spread in the warmed column is generation, not cache.
+- **Reseeded threads stay partly cold, as predicted.** The template covers system + tools,
+  and the seeded transcript (~1.4k tokens) prefills on the first turn. The 11.0 s run
+  was a long thinking pass: the turn's prefill was the same 1,402 tokens as the
+  3.4 s run.
+
+Open from step 3:
+
+- **No client sends `typing_start` yet** (PWA, Android, Matrix sidecar). The server
+  side exists, with a 5 s per-conversation debounce.
+- The template carries the day's date (`current-date.ts`). After midnight, a startup or
+  recovery warm replays yesterday's prompt until the first real request rewrites it, so it
+  re-caches only the part before the date line.
+- A template warm for a new conversation can land on the slot holding another live
+  conversation's history and truncate it to the shared prefix. Harmless for one user;
+  revisit if two conversations alternate.
+- A template warm sends no `Authorization` header (headers are never persisted). That is
+  fine for lilbuddy (open); a template warm to an authed failover host (`:8020`) would 401
+  until a request from that session supplies one. Matters at step 4.
+- First-*audio* latency through Phonon is still unmeasured, as it was in step 2.
+- Re-check `/warm` after every pi upgrade: it depends on `before_provider_request`
+  chaining, `after_provider_response`, command dispatch in `prompt`, and RPC `setStatus`.
 
 ## What Octavius's own tools become
 

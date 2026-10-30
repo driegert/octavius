@@ -219,6 +219,201 @@ class PiBrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.processes, {})
 
 
+class PiWarmTests(unittest.IsolatedAsyncioTestCase):
+    """/warm triggers: fire-and-forget, reports into /health, never on a turn's path."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "commands.jsonl")
+        self.argv_log = os.path.join(self.tmp.name, "argv.log")
+        launcher = os.path.join(self.tmp.name, "pi-octavius")
+        with open(launcher, "w") as f:
+            f.write(f"#!/bin/sh\necho \"$@\" >> {self.argv_log}\nexec {sys.executable} {FAKE} \"$@\"\n")
+        os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IEXEC)
+        self.env = mock.patch.dict(os.environ, {"FAKE_PI_LOG": self.log})
+        self.env.start()
+        self.cfg = _cfg(launcher, warm_debounce_s=5.0, warm_retry_s=0.05)
+        self.manager = pi_brain.PiProcessManager(self.cfg)
+        self.patches = [
+            mock.patch.object(pi_brain, "settings", SimpleNamespace(
+                pi_brain=self.cfg, max_tool_rounds=7, tool_labels={})),
+            mock.patch("agent._build_memory_block", mock.AsyncMock(return_value="")),
+        ]
+        for p in self.patches:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self.patches:
+            p.stop()
+        await self.manager.shutdown()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def prompts(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(line).get("message") for line in f if '"prompt"' in line]
+
+    async def settle(self, pred=lambda: True, timeout=10.0):
+        """Wait for background warm tasks, then for ``pred``."""
+        end = asyncio.get_running_loop().time() + timeout
+        while self.manager._warm_tasks or not pred():
+            if asyncio.get_running_loop().time() > end:
+                self.fail("background warm did not settle")
+            await asyncio.sleep(0.02)
+
+    async def test_warm_with_start_prestarts_process_and_records_result(self):
+        self.manager.request_warm(7, start=True, reason="stt_start")
+        await self.settle(lambda: self.manager.warm_stats.results.get("ok") == 1)
+        self.assertEqual(self.prompts(), ["/warm"])
+        h = self.manager.health()["warm"]
+        self.assertEqual((h["requested"], h["sent"]), (1, 1))
+        self.assertEqual(h["last"]["prompt_n"], 24)
+        self.assertEqual(h["last"]["cache_n"], 10151)
+        # The pre-started process takes the turn, and the turn still seeds history.
+        session = _Session(self.manager)
+        session.state.conversation.add_user("earlier question")
+        session.state.conversation.add_assistant("earlier answer")
+        out = [s async for s in pi_brain.stream_pi_turn(session, "hi", source="voice")]
+        self.assertEqual("".join(out), "Hello there. How are you?")
+        self.assertEqual(self.manager.starts, 1)
+        self.assertIn("Dave: earlier question", self.prompts()[-1])
+
+    async def test_warm_without_start_leaves_missing_process_alone(self):
+        self.manager.request_warm(7, start=False, reason="restore_session")
+        await self.settle()
+        self.assertEqual(self.manager.processes, {})
+        self.assertEqual(self.manager.warm_stats.skipped, 1)
+        self.assertEqual(self.prompts(), [])
+
+    async def test_debounced_per_conversation(self):
+        self.manager.request_warm(7, start=True)
+        self.manager.request_warm(7, start=True)
+        self.manager.request_warm(8, start=False)
+        await self.settle(lambda: self.manager.warm_stats.sent == 1)
+        self.assertEqual(self.manager.warm_stats.debounced, 1)
+        self.assertEqual(self.prompts().count("/warm"), 1)
+
+    async def test_disabled_does_nothing(self):
+        import dataclasses
+        self.manager.cfg = dataclasses.replace(self.cfg, warm=False)
+        self.manager.request_warm(7, start=True)
+        self.manager.warm_static_prefix()
+        await self.settle()
+        self.assertEqual(self.manager.processes, {})
+        self.assertEqual(self.manager.health()["warm"], {"enabled": False})
+
+    async def test_concurrent_warm_and_turn_start_one_process(self):
+        self.manager.request_warm(7, start=True)
+        session = _Session(self.manager)
+        out = [s async for s in pi_brain.stream_pi_turn(session, "hi", source="voice")]
+        await self.settle()
+        self.assertEqual("".join(out), "Hello there. How are you?")
+        self.assertEqual(self.manager.starts, 1)
+
+    async def test_warm_skipped_while_turn_holds_the_process(self):
+        proc, _ = await self.manager.get(7)
+        async with proc.lock:
+            self.manager.request_warm(7, start=True)
+            await self.settle()
+        self.assertEqual(self.manager.warm_stats.skipped, 1)
+        self.assertEqual(self.prompts(), [])
+
+    async def test_unhandled_warm_is_aborted_and_counted(self):
+        os.environ["FAKE_PI_WARM"] = "unsupported"
+        self.manager.request_warm(7, start=True)
+        await self.settle(lambda: self.manager.warm_stats.unsupported == 1)
+        with open(self.log) as f:
+            types = [json.loads(line)["type"] for line in f]
+        self.assertIn("abort", types)
+        self.assertIn("not handled", self.manager.health()["warm"]["last_error"])
+        # The process is still good for a real turn.
+        out = [s async for s in pi_brain.stream_pi_turn(_Session(self.manager), "hi", source="voice")]
+        self.assertTrue(out)
+
+    async def test_static_prefix_uses_a_short_lived_no_session_process(self):
+        self.manager.warm_static_prefix("startup")
+        await self.settle(lambda: self.manager.warm_stats.results.get("ok") == 1)
+        self.assertEqual(self.manager.processes, {})
+        with open(self.argv_log) as f:
+            self.assertIn("--no-session", f.read())
+        self.assertEqual(self.manager.warm_stats.sent, 1)
+
+    async def test_static_prefix_prefers_a_live_process(self):
+        await self.manager.get(7)
+        self.manager.warm_static_prefix("recovery")
+        await self.settle(lambda: self.manager.warm_stats.results.get("ok") == 1)
+        self.assertEqual(self.manager.starts, 1)
+        with open(self.argv_log) as f:
+            self.assertNotIn("--no-session", f.read())
+
+    async def test_failed_warm_schedules_recovery_until_success(self):
+        os.environ["FAKE_PI_WARM_RESULT"] = "error"
+        self.manager.request_warm(7, start=True)
+        await self.settle(lambda: self.manager.warm_stats.recovery_attempts >= 1)
+        # The fake reads its env at spawn: drop the erroring process, so recovery's
+        # short-lived process is the one that answers "ok".
+        os.environ["FAKE_PI_WARM_RESULT"] = "ok"
+        await self.manager.discard(7)
+        await self.settle(lambda: self.manager.warm_stats.results.get("ok", 0) >= 1)
+        await asyncio.wait_for(self.manager._recovery, 5)
+        self.assertGreaterEqual(self.manager.warm_stats.results["error"], 1)
+
+    async def test_turn_failure_schedules_recovery(self):
+        with self.assertRaises(pi_brain.PiTurnError):
+            async for _ in pi_brain.stream_pi_turn(_Session(self.manager), "ERROR", source="voice"):
+                pass
+        self.assertIsNotNone(self.manager._recovery)
+        await self.settle(lambda: self.manager.warm_stats.recovery_attempts >= 1)
+
+    async def test_warm_report_during_turn_is_not_an_event(self):
+        proc, _ = await self.manager.get(7)
+        events = proc.subscribe()
+        proc._warm_report(json.dumps({"event": "wait", "waited_ms": 1200, "capped": False}))
+        self.assertTrue(events.empty())
+        self.assertEqual(self.manager.health()["warm"]["last_wait_ms"], 1200)
+
+
+class WarmTriggerTests(unittest.IsolatedAsyncioTestCase):
+    """websocket_session's triggers: which events warm, with which ``start``."""
+
+    def handler(self, has_images=False):
+        from websocket_session import WebSocketSessionHandler
+        calls = []
+        recorder = SimpleNamespace(
+            request_warm=lambda conv_id, start=False, reason="": calls.append((conv_id, start, reason)),
+            rekey=lambda old, new: None,
+            discard=mock.AsyncMock(),
+        )
+        ws = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(pi_brain=recorder, history=None, mcp_manager=None, subagent_dispatcher=None)))
+        h = WebSocketSessionHandler(ws)
+        h.state.history_session = SimpleNamespace(conv_id=5)
+        h.state.conversation.has_images = has_images
+        return h, calls
+
+    async def test_stt_start_and_typing_start_warm_with_start(self):
+        h, calls = self.handler()
+        with mock.patch("vad.SileroVAD", return_value=SimpleNamespace(reset=lambda: None)):
+            await h.handle_stt_start({})
+        await h.handle_text_message(json.dumps({"type": "typing_start"}))
+        self.assertEqual(calls, [(5, True, "stt_start"), (5, True, "typing_start")])
+
+    async def test_vision_thread_is_not_warmed(self):
+        h, calls = self.handler(has_images=True)
+        await h.handle_typing_start({})
+        self.assertEqual(calls, [])
+
+    async def test_native_brain_and_errors_are_silent(self):
+        from websocket_session import WebSocketSessionHandler
+        h = WebSocketSessionHandler(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(history=None, mcp_manager=None, subagent_dispatcher=None))))
+        h.state.history_session = SimpleNamespace(conv_id=5)
+        await h.handle_typing_start({})  # no pi_brain: no-op
+        h2, _ = self.handler()
+        h2.ws.app.state.pi_brain.request_warm = mock.Mock(side_effect=RuntimeError("boom"))
+        await h2.handle_typing_start({})  # swallowed
+
+
 class PiBrainHelperTests(unittest.TestCase):
     def test_is_yes(self):
         for t in ("yes", "Yeah, do it.", "OK", "go ahead"):

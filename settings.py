@@ -149,6 +149,10 @@ class PiBrainSettings:
     idle_reap_s: float
     turn_timeout_s: float
     confirm_timeout_s: float
+    # /warm cache warming (rollout step 3): fire-and-forget, never on a turn's path.
+    warm: bool = True
+    warm_debounce_s: float = 5.0
+    warm_retry_s: float = 60.0
 
     @property
     def enabled(self) -> bool:
@@ -806,6 +810,11 @@ def load_settings() -> Settings:
             turn_timeout_s=_env_float("OCTAVIUS_PI_TURN_TIMEOUT_S", 600),
             # Below octavius-guard's 60 s, so Octavius answers before pi gives up.
             confirm_timeout_s=_env_float("OCTAVIUS_PI_CONFIRM_TIMEOUT_S", 55),
+            warm=_env_str("OCTAVIUS_PI_WARM", "1") not in ("0", "false", "no", "off"),
+            warm_debounce_s=_env_float("OCTAVIUS_PI_WARM_DEBOUNCE_S", 5.0),
+            # While warms fail (lilbuddy down, model reloading), retry this often: the first
+            # success after an outage is the recovery warm.
+            warm_retry_s=_env_float("OCTAVIUS_PI_WARM_RETRY_S", 60.0),
         ),
     )
 

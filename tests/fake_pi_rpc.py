@@ -4,6 +4,10 @@ Reads JSONL commands on stdin and answers like pi 1.4.0's RPC mode. The prompt's
 last line picks the script: TOOL, CONFIRM, LOOP, SLOW, DIE, ERROR, or anything
 else for a plain two-sentence answer. Every command received is appended to
 $FAKE_PI_LOG (one JSON line each) so tests can see aborts, steers and prompts.
+
+"/warm" plays pi_harness's octavius-warm extension: the prompt is "handled" and a
+setStatus report follows (result from $FAKE_PI_WARM_RESULT, default "ok"). With
+FAKE_PI_WARM=unsupported it is an ordinary prompt, as in a pi without the extension.
 """
 
 import json
@@ -119,7 +123,14 @@ def main() -> None:
         cmd = commands.get()
         if cmd["type"] == "_eof":
             return
-        if cmd["type"] == "prompt":
+        if cmd["type"] == "prompt" and cmd.get("message") == "/warm" and os.environ.get("FAKE_PI_WARM") != "unsupported":
+            respond(cmd, data={"disposition": "handled"})
+            result = os.environ.get("FAKE_PI_WARM_RESULT", "ok")
+            report = {"event": "warm", "result": result, "source": "template", "prompt_n": 24, "cache_n": 10151,
+                      "prefill_ms": 180, "wall_ms": 210}
+            emit({"type": "extension_ui_request", "id": "w", "method": "setStatus",
+                  "statusKey": "octavius-warm", "statusText": json.dumps(report)})
+        elif cmd["type"] == "prompt":
             respond(cmd, data={"disposition": "started"})
             run(cmd.get("message", ""))
         else:

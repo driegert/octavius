@@ -74,6 +74,8 @@ async def lifespan(app: FastAPI):
     if settings.pi_brain.enabled:
         app.state.pi_brain = PiProcessManager(settings.pi_brain)
         app.state.pi_brain.start_reaper()
+        # Warm system prompt + tools in the background (pi /warm, never awaited).
+        app.state.pi_brain.warm_static_prefix("startup")
         log.info("Brain: pi (%s via %s)", settings.pi_brain.model, settings.pi_brain.launcher)
     yield
     if app.state.pi_brain is not None:
