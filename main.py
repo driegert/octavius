@@ -129,7 +129,10 @@ def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAU
         response = await call_next(request)
         if request.url.path.startswith("/static/") or request.url.path in UI_PAGES:
             response.headers.setdefault("Cache-Control", "no-cache")
-        if request.url.path in UI_PAGES:
+        # Every HTML response, not just the page routes: the same files are also
+        # reachable as /static/index.html etc., and that copy must not escape the CSP.
+        is_html = response.headers.get("content-type", "").startswith("text/html")
+        if request.url.path in UI_PAGES or is_html:
             for name, value in UI_SECURITY_HEADERS.items():
                 response.headers.setdefault(name, value)
         return response

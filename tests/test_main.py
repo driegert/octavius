@@ -187,7 +187,10 @@ class MainTests(unittest.TestCase):
     def test_ui_pages_carry_content_security_policy(self):
         with _isolated_app(_FakeMCPManager):
             with TestClient(main.app) as client:
-                pages = {path: client.get(path) for path in ("/", "/inbox", "/reader")}
+                pages = {path: client.get(path) for path in (
+                    "/", "/inbox", "/reader",
+                    # The same files served directly must not escape the policy.
+                    "/static/index.html", "/static/inbox.html", "/static/reader.html")}
                 health = client.get("/health")
                 asset = client.get("/static/app-common.js")
         for path, page in pages.items():
