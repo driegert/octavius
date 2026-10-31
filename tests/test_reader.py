@@ -70,6 +70,17 @@ class MathConversionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReaderTests(unittest.TestCase):
+    def test_citation_abbreviations_do_not_end_sentences(self):
+        split = reader_text.split_sentences
+        self.assertEqual(split("Smith et al. (2020) found it. Jones et al. 2021 agreed."),
+                         ["Smith et al. (2020) found it.", "Jones et al. 2021 agreed."])
+        self.assertEqual(split("Methods, e.g. multitaper, i.e. Thomson's, help. See Fig. 3 and Eq. 2. A vs. B."),
+                         ["Methods, e.g. multitaper, i.e. Thomson's, help.", "See Fig. 3 and Eq. 2.", "A vs. B."])
+        # "et al." ending a sentence still breaks before the next one.
+        self.assertEqual(split("Shown by Smith et al. The next differs."),
+                         ["Shown by Smith et al.", "The next differs."])
+        self.assertEqual(split("One. Two! Three? Four."), ["One.", "Two!", "Three?", "Four."])
+
 
     def test_clean_for_speech_strips_links_urls_and_citations(self):
         text = "See [paper](https://example.com) and https://x.test [1] (Smith et al., 2024)."

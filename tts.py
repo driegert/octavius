@@ -29,6 +29,9 @@ _MD_LIST = re.compile(r'^[ \t]*(?:[-*+]|\d+[.)])\s+', re.MULTILINE)  # -, *, 1.,
 _MD_ORPHAN_BOLD = re.compile(r'\*{2,}')
 _MD_ORPHAN_EMPH = re.compile(r'(?<!\S)\*(?=\S)|(?<=\S)\*(?!\S)')
 _WS = re.compile(r'[ \t]{2,}')
+# "et al." in citations: the engine reads the period as a sentence end and pauses
+# mid-sentence. Only the text sent to TTS changes; the document keeps the period.
+_ET_AL = re.compile(r'\b(et al)\.', re.IGNORECASE)
 
 
 def speechify(text: str) -> str:
@@ -48,6 +51,7 @@ def speechify(text: str) -> str:
     cleaned = _MD_CODE.sub(r'\1', cleaned)
     cleaned = _MD_HEADING.sub('', cleaned)
     cleaned = _MD_LIST.sub('', cleaned)        # only line-leading markers (real lists)
+    cleaned = _ET_AL.sub(r'\1', cleaned)
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()
 

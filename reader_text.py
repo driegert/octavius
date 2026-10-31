@@ -29,7 +29,16 @@ log = logging.getLogger(__name__)
 READER_PATH = Path(settings.reader.directory)
 READER_PATH.mkdir(parents=True, exist_ok=True)
 
-SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+# A sentence ends at . ! or ? and whitespace, except after an abbreviation academic
+# writing uses mid-sentence: each piece is its own TTS call, so a false break is a
+# pause (and a highlight jump) in the middle of "Smith et al. (2020) found". "et al."
+# can also end a sentence, so it still breaks before a capital letter.
+SENTENCE_END = re.compile(
+    r'(?<=[.!?])'
+    r'(?<!\be\.g\.)(?<!\bE\.g\.)(?<!\bi\.e\.)(?<!\bI\.e\.)(?<!\bcf\.)(?<!\bCf\.)'
+    r'(?<!\bvs\.)(?<!\bFig\.)(?<!\bFigs\.)(?<!\bEq\.)(?<!\bEqs\.)'
+    r'(?:(?<!\bet al\.)\s+|(?<=\bet al\.)\s+(?=[A-Z]))'
+)
 HEADING_RE = re.compile(r'^(#{1,3})\s+(.+)$', re.MULTILINE)
 MATH_RE = re.compile(
     r'\$\$?.+?\$\$?'          # $inline$ / $$display$$

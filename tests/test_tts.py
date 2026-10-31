@@ -4,6 +4,12 @@ from tts import speechify
 
 
 class SpeechifyTests(unittest.TestCase):
+    def test_et_al_loses_its_period(self):
+        self.assertEqual(speechify("Smith et al. (2020) and Jones Et Al., 1982."),
+                         "Smith et al (2020) and Jones Et Al, 1982.")
+        self.assertEqual(speechify("Thomson et al."), "Thomson et al")
+        self.assertEqual(speechify("pet al. fetal."), "pet al. fetal.")
+
     def test_strips_bold_and_leading_list_marker(self):
         # The motivating case: "**Important news:** \n1) the weather ..."
         out = speechify("**Important news:**\n1) the weather looks clear")
