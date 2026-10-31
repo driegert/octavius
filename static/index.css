@@ -372,6 +372,10 @@ body { overflow: hidden; }
 }
 .confirm-title { margin: 0 0 0.3rem; font-weight: 600; color: var(--ink); }
 .confirm-message { margin: 0; color: var(--ink-2); white-space: pre-wrap; }
+.confirm-fields { margin: 0; color: var(--ink-2); }
+.confirm-fields > div { display: flex; gap: 0.4rem; }
+.confirm-fields dt { font-weight: 600; color: var(--ink); white-space: nowrap; }
+.confirm-fields dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .confirm-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.85rem; }
 .confirm-actions .confirm-or { margin-left: 0.4rem; font-size: 0.8rem; color: var(--ink-3); }
 .turn.confirm.answered { background: transparent; border-color: var(--line-soft); }

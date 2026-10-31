@@ -359,14 +359,9 @@
     const el = addTurn('confirm', true);
     const title = document.createElement('p');
     title.className = 'confirm-title';
-    title.textContent = msg.title || 'Confirm';
+    title.textContent = String(msg.title || 'Confirm').replace(/_/g, ' ');
     el.appendChild(title);
-    if (msg.message) {
-      const body = document.createElement('p');
-      body.className = 'confirm-message';
-      body.textContent = msg.message;
-      el.appendChild(body);
-    }
+    if (msg.message) el.appendChild(confirmDetail(msg.message));
     const actions = document.createElement('div');
     actions.className = 'confirm-actions';
     const yes = document.createElement('button');
@@ -384,6 +379,40 @@
     el.appendChild(actions);
     pendingConfirm = el;
     scrollToEnd(true);
+  }
+
+  // The guard sends the tool's arguments as JSON; show a JSON object as
+  // "Field: value" lines. Anything else is shown as sent.
+  function confirmDetail(message) {
+    let args = null;
+    try { args = JSON.parse(message); } catch (_err) { }
+    if (!args || typeof args !== 'object' || Array.isArray(args) || !Object.keys(args).length) {
+      const body = document.createElement('p');
+      body.className = 'confirm-message';
+      body.textContent = message;
+      return body;
+    }
+    const list = document.createElement('dl');
+    list.className = 'confirm-fields';
+    for (const [key, value] of Object.entries(args)) {
+      const row = document.createElement('div');
+      const dt = document.createElement('dt');
+      const label = key.replace(/[_-]+/g, ' ').trim();
+      dt.textContent = label.charAt(0).toUpperCase() + label.slice(1) + ':';
+      const dd = document.createElement('dd');
+      dd.textContent = confirmValue(value);
+      row.append(dt, dd);
+      list.appendChild(row);
+    }
+    return list;
+  }
+
+  function confirmValue(value) {
+    if (value === null || value === undefined) return '—';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value) && value.every((v) => v === null || typeof v !== 'object')) return value.join(', ');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
   }
 
   function resolveConfirm() {
