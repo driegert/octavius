@@ -95,6 +95,12 @@
             const raw = typeof token === 'string' ? token : (token && (token.raw || token.text)) || '';
             return OctaviusApp.escapeHtml(raw);
           },
+          // The CSP blocks remote images (tracking pixels, exfiltration), so link them instead.
+          image(token) {
+            const href = (token && token.href) || '#';
+            const label = (token && token.text) || 'image';
+            return `<a href="${OctaviusApp.escapeHtml(href)}" target="_blank" rel="noopener noreferrer">[image: ${OctaviusApp.escapeHtml(label)}]</a>`;
+          },
         },
         // Replies can quote web pages: only web and mail links survive.
         walkTokens(token) {
@@ -1051,9 +1057,17 @@
       submitText();
     }
   });
+  // Tell the server Dave is typing so the pi brain can warm its cache meanwhile.
+  // Throttled here; the server debounces too and ignores it on the native brain.
+  let lastTypingSent = 0;
   textInput.addEventListener('input', () => {
     autosize();
     refreshUi();
+    const now = Date.now();
+    if (textInput.value.trim() && now - lastTypingSent > 10000) {
+      lastTypingSent = now;
+      send({ type: 'typing_start' });
+    }
   });
 
   // ---------- Controls ----------

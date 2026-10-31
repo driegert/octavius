@@ -184,6 +184,50 @@ class MainTests(unittest.TestCase):
         self.assertEqual(again.status_code, 304)
         self.assertNotIn("cache-control", health.headers)
 
+    def test_ui_pages_carry_content_security_policy(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                pages = {path: client.get(path) for path in ("/", "/inbox", "/reader")}
+                health = client.get("/health")
+                asset = client.get("/static/app-common.js")
+        for path, page in pages.items():
+            with self.subTest(path=path):
+                self.assertEqual(page.status_code, 200)
+                self.assertEqual(page.headers["content-security-policy"], main.UI_CSP)
+                self.assertEqual(page.headers["x-content-type-options"], "nosniff")
+                self.assertEqual(page.headers["referrer-policy"], "same-origin")
+        # JSON and assets are not documents: no policy needed there.
+        self.assertNotIn("content-security-policy", health.headers)
+        self.assertNotIn("content-security-policy", asset.headers)
+
+        csp = main.UI_CSP
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("unsafe-eval", csp)
+        directives = dict(d.strip().split(" ", 1) for d in csp.split(";"))
+        self.assertEqual(directives["object-src"], "'none'")
+        self.assertEqual(directives["frame-ancestors"], "'none'")
+
+        # Every external script/stylesheet a page loads must be allowed by the
+        # policy (or the page breaks silently), and cross-origin scripts must
+        # be pinned with SRI.
+        import re
+        for name in ("index.html", "inbox.html", "reader.html"):
+            html = (Path(__file__).resolve().parent.parent / "static" / name).read_text()
+            self.assertNotRegex(html, r"<script(?![^>]*\bsrc=)", f"{name}: inline <script>")
+            self.assertNotRegex(html, r"\sstyle=", f"{name}: style attribute")
+            self.assertNotRegex(html, r"\son[a-z]+=", f"{name}: inline event handler")
+            for tag in re.findall(r"<script\b[^>]*\bsrc=\"https://[^\"]+\"[^>]*>", html):
+                origin = re.search(r"src=\"(https://[^/\"]+)", tag).group(1)
+                with self.subTest(page=name, script=origin):
+                    self.assertIn(origin, directives["script-src"])
+                    self.assertRegex(tag, r'integrity="sha(256|384|512)-')
+                    self.assertIn('crossorigin="anonymous"', tag)
+            for tag in re.findall(r"<link\b[^>]*rel=\"stylesheet\"[^>]*>", html):
+                m = re.search(r"href=\"(https://[^/\"]+)", tag)
+                if m:
+                    with self.subTest(page=name, stylesheet=m.group(1)):
+                        self.assertIn(m.group(1), directives["style-src"])
+
     def test_health_reports_degraded_when_only_partial_runtime_is_ready(self):
         with _isolated_app(_DegradedMCPManager):
             with TestClient(main.app) as client:

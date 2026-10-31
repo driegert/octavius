@@ -90,6 +90,32 @@ async def lifespan(app: FastAPI):
 
 UI_PAGES = {"/", "/inbox", "/reader"}
 
+# Defence in depth for pages that render untrusted text (replies quoting web
+# pages, saved items, reader documents): even if an escaping bug lets markup
+# through, it cannot run script, load remote images, or post anywhere.
+# No 'unsafe-inline' anywhere: the pages have no inline <script>, no on*=
+# handlers and no style="" attributes (JS sets styles through el.style, which
+# CSP allows). Adding an external resource means adding its origin here; see
+# AGENTS.md "Frontend". connect-src 'self' covers same-origin ws:/wss: (CSP3).
+UI_CSP = "; ".join([
+    "default-src 'self'",
+    "script-src 'self'",  # marked is vendored in static/vendor/, so no CDN is trusted
+    "style-src 'self' https://fonts.googleapis.com",
+    "font-src https://fonts.gstatic.com",
+    "img-src 'self' data: blob:",
+    "media-src 'self' blob:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+])
+UI_SECURITY_HEADERS = {
+    "Content-Security-Policy": UI_CSP,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
+
 
 def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH,
                verify_search=assert_history_serveable) -> FastAPI:
@@ -103,6 +129,9 @@ def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAU
         response = await call_next(request)
         if request.url.path.startswith("/static/") or request.url.path in UI_PAGES:
             response.headers.setdefault("Cache-Control", "no-cache")
+        if request.url.path in UI_PAGES:
+            for name, value in UI_SECURITY_HEADERS.items():
+                response.headers.setdefault(name, value)
         return response
 
     app.mount("/static", StaticFiles(directory="static"), name="static")

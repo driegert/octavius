@@ -608,6 +608,7 @@ Frontend:
 - `static/inbox.html` - inbox review UI with inline item chat
 - `static/reader.html` - reader UI with playback controls and polling
 - `static/manifest.json` - PWA manifest
+- **Content-Security-Policy** (since 2026-10-30): `main.py`'s `UI_CSP` / `UI_SECURITY_HEADERS` go on `/`, `/inbox`, `/reader` only (plus `nosniff`, `Referrer-Policy: same-origin`) — defence in depth for pages that render untrusted text. No `'unsafe-inline'` or `'unsafe-eval'`: never add inline `<script>`, `on*=` handlers, `style="..."` (in HTML, `innerHTML` templates or `setAttribute('style')` — `el.style.x = ...` is fine), `eval`/`new Function`, or `javascript:` URLs. `script-src` is `'self'` only: third-party scripts are vendored into `static/vendor/` (today `marked-15.0.12.min.js`, the byte-identical jsdelivr build, with its `integrity` hash kept on the tag — recompute it when bumping). A new external stylesheet, font, image or fetch origin must be added to the matching directive in `UI_CSP`; `tests/test_main.py` checks the pages against it. Remote images in markdown are blocked by `img-src` on purpose; `/` and `/inbox` render them as links instead. Browser-verify with headless Chrome and a `securitypolicyviolation` listener (note Playwright's `wait_for_function` itself needs eval and fails under this policy — poll with `page.evaluate`).
 
 Tests:
 
