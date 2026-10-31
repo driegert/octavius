@@ -56,6 +56,7 @@
 
   // Turn state, driven by server `status` frames
   let phase = 'idle'; // idle | transcribing | thinking | speaking
+  let acceptPartials = false; // true from stt_start until that capture's transcript
   let dropAudio = false; // after barge-in, ignore stale audio until the next transcript
 
   let currentVoice = 'de_male';
@@ -268,7 +269,9 @@
   }
 
   function showPartial(text) {
-    if (!text) return;
+    // Partials belong to the capture in progress; one arriving after its
+    // transcript would otherwise open a second, ghost line.
+    if (!text || !acceptPartials) return;
     if (!liveUserEl) {
       const stick = nearBottom();
       liveUserEl = addTurn('user live', true);
@@ -280,6 +283,7 @@
 
   function commitUser(text) {
     const stick = nearBottom();
+    acceptPartials = false;
     const el = liveUserEl || addTurn('user', true);
     el.classList.remove('live');
     el.textContent = text;
@@ -690,6 +694,7 @@
 
       sttStreaming = true;
       sttChunks = [];
+      acceptPartials = true;
       send({ type: 'stt_start' });
       sttSendTimer = setInterval(sendPCMChunks, 250);
 

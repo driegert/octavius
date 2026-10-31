@@ -55,6 +55,7 @@ def create_item_conversation(item: dict, item_id: int) -> Conversation:
 
 
 VAD_SILENCE_SECONDS = 1.5  # auto-stop after this much silence post-speech
+STT_FINAL_WAIT_S = 3.0  # longest wait at stop for an in-flight Whisper run
 
 # Max chars in the per-delegation preview line shown in the UI badge.
 _DELEGATION_PREVIEW_CHARS = 180
@@ -75,16 +76,34 @@ class StreamingSTTState:
     active: bool = False
     pcm_buffer: bytes = b""
     last_text: str = ""
+    last_partial: str = ""
     speech_detected: bool = False
     silence_start: float | None = None
+    # Bytes of pcm_buffer that last_text covers, and the buffer length at the end of
+    # the last chunk VAD heard speech in: speech past last_len is not in last_text yet.
+    last_len: int = 0
+    speech_end: int = 0
+    # Bumped on every reset, so a transcription started for one utterance cannot
+    # write into the next one or send a partial after its transcript.
+    generation: int = 0
     _transcribe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def reset(self):
         self.active = False
         self.pcm_buffer = b""
         self.last_text = ""
+        self.last_partial = ""
         self.speech_detected = False
         self.silence_start = None
+        self.last_len = 0
+        self.speech_end = 0
+        self.generation += 1
+
+
+
+async def _acquire_and_release(lock: asyncio.Lock) -> None:
+    async with lock:
+        pass
 
 
 @dataclass
@@ -906,6 +925,7 @@ class WebSocketSessionHandler:
             if has_speech:
                 stream.speech_detected = True
                 stream.silence_start = None
+                stream.speech_end = len(stream.pcm_buffer)
             elif stream.speech_detected:
                 # Silence after speech — track duration
                 now = time.monotonic()
@@ -938,45 +958,63 @@ class WebSocketSessionHandler:
             if not stream.active:
                 return
             buf = stream.pcm_buffer
+            generation = stream.generation
             try:
                 text = await transcribe_pcm(buf)
-                if text and text != stream.last_text:
-                    stream.last_text = text
-                    await self.send_payload({"type": "transcript_partial", "text": text})
             except Exception:
                 log.debug("Streaming STT chunk transcription failed", exc_info=True)
+                return
+            if not text or stream.generation != generation:
+                return  # empty, or the utterance was reset while Whisper ran
+            stream.last_text, stream.last_len = text, len(buf)
+            # Once the capture has stopped, handle_stt_stop owns the text: a partial
+            # sent now would land after the transcript and show as a second line.
+            if stream.active and text != stream.last_partial:
+                stream.last_partial = text
+                await self.send_payload({"type": "transcript_partial", "text": text})
 
     async def handle_stt_stop(self, _data: dict):
         """Finalize streaming transcription and start agent turn.
 
-        If we already have a partial transcription, use it immediately without
-        waiting for any in-flight Whisper call (which is likely just processing
-        silence). Only waits/re-transcribes if no partial was captured yet.
+        The latest partial usually lags the audio: Whisper was still working on a
+        newer buffer when the capture stopped, and that run is the one that heard
+        the last words. So wait (briefly) for an in-flight run instead of using a
+        stale partial, then transcribe once more only if VAD heard speech past
+        what the text covers. Nothing is sent as a partial after this point.
         """
         from stt import transcribe_pcm
 
         stream = self.state.stt_stream
         stream.active = False
-        last_text = stream.last_text
+        generation = stream.generation
 
-        if last_text:
-            # Already have good text from partials — use it immediately
-            stream.reset()
-        else:
-            # No partials yet (very short recording) — wait and transcribe
-            buf = stream.pcm_buffer
+        if stream._transcribe_lock.locked():
+            try:
+                await asyncio.wait_for(_acquire_and_release(stream._transcribe_lock), STT_FINAL_WAIT_S)
+            except asyncio.TimeoutError:
+                log.info("STT: in-flight transcription still running after %.1fs; using what we have", STT_FINAL_WAIT_S)
+        if stream.generation != generation:
+            return  # a new capture started while we waited
+
+        last_text = stream.last_text
+        buf = stream.pcm_buffer
+        if (not last_text or stream.speech_end > stream.last_len) and len(buf) >= 1600 * 4:
             async with stream._transcribe_lock:
-                last_text = stream.last_text
-                if not last_text and len(buf) >= 1600 * 4:
+                if not last_text:
                     await self.send_json("status", "Transcribing...")
-                    try:
-                        last_text = await transcribe_pcm(buf)
-                    except Exception as exc:
-                        log.exception("Streaming STT final transcription failed")
+                try:
+                    text = await transcribe_pcm(buf)
+                except Exception as exc:
+                    log.exception("Streaming STT final transcription failed")
+                    if not last_text:
                         await self.send_json("status", f"Transcription failed: {exc}")
                         stream.reset()
                         return
-            stream.reset()
+                    text = ""
+                if stream.generation != generation:
+                    return
+                last_text = text or last_text
+        stream.reset()
 
         if not last_text:
             await self.send_json("status", "Couldn't hear anything. Try again.")

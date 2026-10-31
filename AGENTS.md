@@ -665,7 +665,12 @@ Streaming STT: the browser captures PCM at 16kHz via Web Audio API
 ScriptProcessor and sends binary chunks every 250ms over the WebSocket. The
 server accumulates a buffer, runs background faster-whisper transcription, and
 sends `transcript_partial` messages. On stop (manual or VAD auto-stop), the
-server uses the latest partial text immediately — no re-transcription needed.
+server waits up to `STT_FINAL_WAIT_S` (3 s) for an in-flight Whisper run —
+the latest partial usually lags the audio by one run and misses the last
+words — and transcribes once more only if VAD heard speech past what the text
+covers. No partial is sent after stop (a late one used to show as a second,
+"ghost" line under the reply); `StreamingSTTState.generation` keeps a run from
+one capture out of the next.
 
 Server-side VAD: Silero VAD v6 ONNX model (`models/silero_vad.onnx`) runs on
 CPU via onnxruntime. Each 512-sample window (32ms at 16kHz) is prepended with
