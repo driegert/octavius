@@ -131,6 +131,12 @@ class LookupToolTests(unittest.TestCase):
         out = asyncio.run(tools.call_tool("reader_document_outline", {"document_id": other}, self.fx.session(), None, ws))
         self.assertIn("only it can be read", out)
 
+    def test_place_context_invites_exploring_beyond_the_passage(self):
+        ctx = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 1, "sentence_index": 0})
+        self.assertIn("It has 3 chunks (paragraphs) in 2 sections.", ctx)
+        self.assertIn("not the limit of what you may read", ctx)
+        self.assertIn("explore the whole document", ctx)
+
     def test_place_context_gives_the_paragraphs_around_the_place(self):
         ctx = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 1, "sentence_index": 0})
         self.assertIn("The paragraph before:\n<document_excerpt>Tapers reduce leakage (Thomson, 1982).", ctx)
