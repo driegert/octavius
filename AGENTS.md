@@ -319,7 +319,23 @@ turns yet is still seeded. Knobs:
 `OCTAVIUS_PI_LAUNCHER`, `OCTAVIUS_PI_BIN` (the user service's PATH lacks
 `~/.local/bin`), `OCTAVIUS_PI_MODEL`, `OCTAVIUS_PI_TURN_TIMEOUT_S` (600),
 `OCTAVIUS_PI_CONFIRM_TIMEOUT_S` (55), `OCTAVIUS_PI_WARM` (on),
-`OCTAVIUS_PI_WARM_DEBOUNCE_S` (5), `OCTAVIUS_PI_WARM_RETRY_S` (60). `/health` → `pi_brain`. pi never gets
+`OCTAVIUS_PI_WARM_DEBOUNCE_S` (5), `OCTAVIUS_PI_WARM_RETRY_S` (60), `OCTAVIUS_PI_TOOLS_PORT` (8032). `/health` → `pi_brain`.
+**Failover** (Octavius-driven over RPC, `set_model`): hops `OCTAVIUS_PI_MODEL` then `OCTAVIUS_PI_FALLBACK_MODELS`
+(`lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b`), pi's own auto-retry off. A turn moves on a provider error (5xx, 401, 400/404,
+refused connect) or when the model is silent for `OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S` (60, before its first output)
+or `OCTAVIUS_PI_SILENCE_TIMEOUT_S` (30, after; thinking counts, tool runs do not); a context overflow instead moves that
+turn alone to a bigger-window hop (`OCTAVIUS_PI_MODEL_CONTEXTS`), never touching the shared hop. It then resumes in the same pi session with a short note (a tool that already ran is not re-run). One shared
+current hop (`FailoverState`): new processes start on it, live ones `set_model` before their turn, and
+`OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300) later the next turn tries the primary again. `/health` → `pi_brain.failover`;
+each failover logs at WARNING.
+**Octavius's own tools for pi** (`pi_tools_server.py`): 13 of the local tools (notes, memory,
+conversation history, reader; not `download_file`/`process_pdf`/`check_document_status`) are served to pi
+as the `octavius` MCP server, dispatched through `tools.call_tool`. It listens on its own socket on
+`127.0.0.1:8032`, never on the FastAPI app (Caddy publishes that), started in `main.py`'s lifespan only
+when the pi brain is on. Each pi process gets a random token in `PI_OCTAVIUS_TOOLS_TOKEN` (not an
+`OCTAVIUS_*` name, which `child_env` strips); `stream_pi_turn` binds it to the turn's
+`history_session`/`mcp_manager`/session for the turn and unbinds in `finally`, so a call outside a
+turn is a tool error. pi never gets
 `OCTAVIUS_*` env vars. `/health` → `pi_brain.warm` has warm counts and the last
 result (`prompt_n` = tokens prefilled, `cache_n` = from cache). Design and status: `docs/pi-backend-design.md`.
 
@@ -574,6 +590,7 @@ Conversation and tool loop:
 - `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
 - `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
 - `tools.py` - local tool schemas and dispatch entrypoint used by the agent loop
+- `pi_tools_server.py` - loopback MCP server for the pi brain: Octavius's local notes/memory/history/reader tools, per-process bearer tokens, per-turn context binding
 - `pi_brain.py` - opt-in pi turn brain: RPC process per conversation, manager (reaping, re-key), `stream_pi_turn`, confirm relay
 - `subagent.py` - internal scoped subagent for specialist domains (email, research, tasks); invoked inline via `consult_specialist` (`run_inline_subagent`)
 - `local_tool_specs.py` - local tool schemas
@@ -648,6 +665,7 @@ Tests:
 - `tests/test_vault_files.py`
 - `tests/test_media_upload.py` - `media_uploads.save_upload` (sanitization, mime resolution, streaming caps) and the `/api/media/upload` route
 - `tests/test_subagent.py`
+- `tests/test_pi_tools_server.py` - tool list equals the specs, auth, no-turn error, per-turn binding (including a raising turn), loopback-only bind
 - `tests/test_pi_brain.py` - pi_brain against `tests/fake_pi_rpc.py` (a scripted `pi --mode rpc` subprocess): speaking rule, tool recording, seeding, round cap, abort on close, crash restart, confirm yes/no, reaping, and `/warm` (triggers, debounce, pre-started processes still seeded, unhandled `/warm` aborted, recovery, `/health` counts)
 - `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`

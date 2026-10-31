@@ -452,7 +452,7 @@ voice/text path is proven.
 
 ## Failover
 
-Today the main chain has three hosts (lilbuddy → lilripper :8020 → triplestuffed).
+Today the main chain has three hosts (lilbuddy → lilripper :8020 → workhorse).
 pi's main agent has one `--model`; `subagent/fallback.ts` covers children only.
 The new path must not ship with less availability than the old one, so
 failover is a **gate before the default flips**, not an open item.
@@ -475,7 +475,177 @@ that path too. Either way:
   pi's session (which already holds the tool result), don't replay the turn.
 
 The chain order mirrors today's: lilbuddy 26B → lilripper `:8020` qwen3.8-27b →
-triplestuffed gemma4-12b.
+workhorse gemma4-12b (workhorse `:8010` vLLM, 64K ctx; it replaced triplestuffed,
+which stopped serving the 12B on 2026-10-30). Built as (b): see "Step 4 result".
+
+## Step 4 result (2026-10-31)
+
+Built (b), Octavius-driven over RPC. `pi_brain.py`: `FailoverState` (the shared hop),
+`HopFailure` / `classify_provider_error`, `PiRpcProcess.use_model` (`set_model`), the attempt
+loop and silence watchdog in `stream_pi_turn`; settings `OCTAVIUS_PI_FALLBACK_MODELS`
+(`lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b`), `OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300),
+`OCTAVIUS_PI_SILENCE_TIMEOUT_S` (30). pi_harness `octavius-warm.ts`: per-model templates and
+credentials on template warms.
+
+**What pi does on each failure** (real `pi-octavius`, scratch OpenAI stub, pi 1.4.0):
+
+| Failure | pi's events, auto-retry on | auto-retry off |
+|---|---|---|
+| refused connect | `message_end` assistant `stopReason: "error"`, `errorMessage: "Connection error."`, `turn_end`, `agent_settled` at +0.28 s | same |
+| 5xx | `errorMessage: "500: {json}"`, then `agent_end{willRetry:true}` + `auto_retry_start` (attempts at +0, 2, 6 s, 3 tries, delay 2/4/8 s), `auto_retry_end{success:false,finalError}` at ~14 s | error at +0.02 s, settled +0.28 s |
+| 401, 400, 404 | `errorMessage: "<status>: {json}"` at once; not retryable | same |
+| accepts, never answers (`hang`), or headers and a first chunk then nothing (`stall`) | **no event for 150 s** (the longest watched; the SDK's timeout is minutes) | same |
+
+So: pi's retry is turned off per process (`set_auto_retry false` at start), and a hung hop is
+only detectable on Octavius's side. `set_model` to an unknown id answers `success:false`
+("Model not found") and is treated as a `client_error` hop failure.
+
+**Detection.** Provider errors are classified from `errorMessage` with `service_clients`'s bucket names:
+`^\d{3}` status (401/403 `auth`, 400/404 `client_error`, 429 and 5xx `server_error`, 408 `timeout`), else
+timeout and connection phrases (`connect`, `timeout`), else `bad_response`. The zombie is a **silence
+watchdog**: no streaming event (`message_*`, `turn_*`; thinking deltas included) for
+`OCTAVIUS_PI_SILENCE_TIMEOUT_S` (30 s) from the prompt or from a tool result is a `timeout` failure.
+It is off while a tool runs and while Dave is asked to confirm, and the cold prefill it must cover
+(7.5k tokens, ~5-8 s; ~15 s for a reseeded thread) fits inside it. A host that drops packets rather
+than refusing them falls to the same watchdog. On failure Octavius aborts the run if one is going
+(waits for `agent_settled`), `set_model`s the next hop and resumes.
+
+**Resume.** pi has no "continue" RPC. Probed against the real hops: after an errored attempt the
+session holds `[system, …, user]` (pi drops the failed assistant message from the model's context),
+and a follow-up `prompt` is `[system, user, user]`; lilbuddy, `:8020` and workhorse's gemma4 all
+accepted that. So the resume is a short user note, not a replay of Dave's message: "answer Dave's
+last message now" before any tool ran, or the same with "your tool results are above; do not repeat
+them" after one. With the tool case run against the stub, the request after failover was
+`[system, user, assistant(tool call), tool, user(note)]` and the tool ran once. The cost is a
+dangling note in the session (and a consecutive-user pair if the first attempt left no
+output), which the next turn's context carries. A pi `fork` back to before the message would
+avoid it, but it rebuilds the session and resets the model, so it was not used.
+
+**Shared breaker.** `FailoverState.index` is the hop new turns start on. A failure moves it down
+the chain (never back past a hop another conversation already moved it to); processes started
+meanwhile get `PI_OCTAVIUS_MODEL=<hop>` from `child_env`, live ones `set_model` before their next
+turn, and a warm switches the process first, so warms always target the current hop. After
+`OCTAVIUS_PI_FAILOVER_COOLDOWN_S` the next turn tries the primary; if it is still down it moves on
+again (a refused connect costs ~0.3 s, a zombie a full silence timeout every cooldown). With every
+hop failing the turn raises. `/health` → `pi_brain.failover`: `current`, `hops`, `failed_over`,
+`cooldown_remaining`, `failovers`, `returns_to_primary`, `failures_by_kind`, `last_failure`.
+Each failover logs at WARNING with the hop and the classified reason.
+
+**/warm.** Template warms sent no `Authorization`, so a template warm to `lrv-p01` would 401.
+`octavius-warm.ts` now resolves the model's credentials the way pi does
+(`modelRegistry.getApiKeyAndHeaders`) for any entry without captured headers; the key goes only
+into the request. Templates are one file per model (`warm-template.<provider>_<id>.json`), so a hop's
+traffic no longer overwrites the primary's. Checked live: template warms to `lrv-p01`, `wh-vllm`
+and `lb-unified` all returned 200 (the first two as `ok` with no `timings`, vLLM reports none).
+
+**Measured** (real pi through `stream_pi_turn`, synthetic prompts; seconds from the turn
+to the first sentence; process already running, caches warm from the day's earlier runs, so these are
+the *mechanism's* cost, not a cold prefill):
+
+| Scenario | First sentence |
+|---|---|
+| normal turn, lilbuddy (no warm, fresh state) | 4.8 s; next turn 0.5 s |
+| primary refuses connect → lilbuddy | 2.1 s |
+| primary 500 / 401 / 404 → lilbuddy | 0.5 / 2.1 / 2.0 s |
+| primary hangs / stalls, silence limit 8 s → lilbuddy | 10.4 / 14.2 s (limit + 2-6 s); default limit 30 s adds 22 s |
+| refused → refused → `lrv-p01` (authed) | 2.0 s |
+| refused → 500 → `wh-vllm` | 5.4 s |
+| tool ran, then 500 → resume (stub) | 1.0 s, `web_search` executed once |
+
+Cold failover turns (a fresh session: nothing cached, thinking on), from the failure to the
+final sentence: 10.5 s on `wh-vllm`, 8.7 s on `lrv-p01`, 11.2 s on `lb-unified`. A turn that
+fails over then stays on the new hop: the next turn is 1-2.6 s.
+
+Review fixes (Codex, same day):
+
+- **Two budgets.** `OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S` (60) covers the wait from the prompt to the
+  model's first output (the real request may wait up to 20 s for a warm, then prefill cold); the 30 s
+  silence limit applies after that first output and after tool results.
+- **Context overflow** (vLLM "maximum context length", llama.cpp "exceeds the available context
+  size", "too many tokens"…) is its own kind, `context_overflow`, and never touches the shared
+  hop. That turn moves to the first untried hop with a larger window (`OCTAVIUS_PI_MODEL_CONTEXTS`,
+  defaults 295k / 262k / 64K), never a smaller one; with none, Octavius speaks "this conversation
+  has grown too long" and ends the turn. Only a missing alias (400/404) stays a hop failure. The
+  wording is matched broadly, from the servers' documented messages, not from live oversized requests.
+- **Cancellation.** The run counts as possibly active from the moment a prompt is sent, so a
+  barge-in or timeout during the prompt ack still aborts pi.
+- **Speech before a failure.** If sentences were already spoken, the resume note quotes them and
+  asks pi to continue without repeating.
+- **Generations.** `FailoverState.generation` bumps on every move (cooldown return included); a
+  failure from an attempt that started under an older one is counted (`stale_failures`) but leaves
+  the shared hop alone.
+
+Second review round (local GLM review):
+
+- A `length` stop with no text and no tool call (max_tokens spent on reasoning) is turn-local like
+  an overflow: the turn tries the next untried hop, the breaker is untouched (`turn_local` in `/health`);
+  with none left Dave hears the usual "not sure how to respond".
+- Chain exhaustion resets the shared hop to the primary (generation bumped), not the smallest hop.
+- A provider error after speech still ends the turn on what was said, but now records the hop in the breaker.
+- Stopping a failed run drains its events: tools that finish are recorded, dialogs cancelled, rounds counted;
+  a started tool counts as run for the resume note. A turn cancelled while a confirm is pending cancels that dialog.
+- `OCTAVIUS_PI_TOOL_TIMEOUT_S` (120; x3 for `subagent`): a tool past it is aborted and Dave hears a short apology.
+  It is spoken text, not an exception, because the websocket layer only shows turn errors on the status line; it
+  counts as a turn failure, never a hop failure.
+- `FailoverState.health()` is read-only (a `/health` poll no longer triggers the return to the primary).
+- `octavius-warm.ts`: pi's resolved credentials now win over captured headers (a rotated key reaches session
+  replays), and a failed lookup shows as `auth_error` in the warm report (name or pi's message, never a key).
+
+Open from step 4:
+
+- The 30 s silence default is a guess above the cold-prefill range; the right number needs
+  real zombie data. A zombie primary costs a full first-output budget once per cooldown.
+- Image turns stay native, so the "image-capable hops only" rule does not apply yet.
+
+## Step 5 result (2026-10-31)
+
+`pi_tools_server.py` serves 13 of Octavius's local tools to pi as the `octavius` MCP server:
+`save_note`, `read_note`, `edit_note`, `commit_edit`, `remember`, `forget`, `correct`,
+`what_do_you_know`, `search_conversation_history`, `read_conversation`, `read_document`,
+`list_reader_documents`, `append_to_reader_document`. Names, descriptions and JSON schemas are
+`local_tool_specs.TOOLS` verbatim, in that order (a test pins this), and every call goes through
+`tools.call_tool` with the native path's arguments, so behaviour is identical. Input is not
+schema-validated server-side, as on the native path (handlers check their own arguments; a
+double-encoded `arguments` is unwrapped the same way).
+
+**Isolation.** The server runs in the Octavius process (reader jobs and the recorder live there) on
+its own socket, bound to `127.0.0.1:8032` (`OCTAVIUS_PI_TOOLS_PORT`) and only when the pi brain is
+on; it is never mounted on the app Caddy publishes. Port 8031, the first choice, is the memory
+service. Loopback alone is not an access control on a shared host, so there are two more layers:
+a bearer token per pi process, and a Host-header allowlist (DNS-rebinding guard). If the port cannot
+be bound, startup logs an error and pi runs without these tools. The token sits in the child's
+environment, so a same-UID process can read it from `/proc/<pid>/environ`; accepted, since such a
+process can already read the DB, vault and secrets. The token guards against other local users and
+cross-conversation mixups. Octavius also passes the bound URL in `PI_OCTAVIUS_TOOLS_URL`, which
+`mcp-scope.ts` uses over the catalog's (loopback `http://` only, else the server is skipped with a
+reported problem), so changing the port cannot desync pi. Unbinding at the end of a turn cancels any
+tool call still running for it.
+
+**Auth and binding.** `PiProcessManager._new_process` mints `secrets.token_urlsafe(32)` for every pi
+process, warm-only ones included (the tool list must be byte-identical across processes), puts it in
+`PI_OCTAVIUS_TOOLS_TOKEN` (not `OCTAVIUS_*`, which `child_env` strips) and revokes it when the process
+is killed. The catalog entry sends `Authorization: Bearer ${PI_OCTAVIUS_TOOLS_TOKEN}`. Requests with a
+missing or unknown token get 401 (`hmac.compare_digest`). A token is useless on its own:
+`stream_pi_turn` binds it to that turn's `history_session`, `mcp_manager` and session handler before
+the prompt and unbinds in `finally` (also when the turn raises or is aborted). A call with a valid
+token and no bound turn returns an `isError` result ("No active conversation turn"), so a tool call
+always acts for the conversation whose turn is in flight. Status lines reuse the native labels
+(`mcp__octavius__save_note` → "Saving Note").
+
+**pi_harness.** `mcp-servers.json` has the `octavius` entry (loopback URL, so it is exempt from the
+catalog test that forbids loopback URLs; it is profile-only). `mcp-scope.ts` lists the 13 tools in
+`PROFILE_TOOLS.octavius`, and `REQUIRES_ENV` skips the server silently when
+`PI_OCTAVIUS_TOOLS_TOKEN` is unset (Dave running `scripts/pi-octavius` in a terminal). It is not in
+`AGENT_SERVERS`, so main and every subagent never get it. `scripts/pi-octavius` allowlists
+`mcp__octavius__*`; the profile prompt lost "cannot yet save notes" and gained a short guidance block.
+
+**Checked live** (real `pi --mode rpc` through `scripts/pi-octavius`, tools server on a spare port,
+throwaway DB): pi declares the 13 `mcp__octavius__*` tools (29 tools in all; 16 without the token, no
+stderr output), and a `list_reader_documents` call round-trips with `isError=false`.
+
+**Deferred.** `download_file`, `process_pdf`, `check_document_status` (rollout "later"). `consult_specialist` and
+the delegation tools never. Tool descriptions are verbatim, so `read_note` still says `vault_search`;
+the profile prompt maps it to `mcp__vault__search`.
 
 ## Rollout
 
@@ -490,8 +660,8 @@ triplestuffed gemma4-12b.
 3. `/warm` extension in `pi_harness` (requirements above) and the Octavius
    triggers; re-measure. Building it second means its gain is measured against
    a working slice, not assumed.
-4. Failover (above).
-5. Loopback `octavius` MCP server (notes, memory, conversation history).
+4. Failover (above; done, see "Step 4 result").
+5. Loopback `octavius` MCP server (notes, memory, conversation history). Done: see "Step 5 result".
 6. Flip the default when a written capability checklist passes — every
    current domain (email, calendar via the email specialist today, vault,
    web, tasks, research, notes, memory) has a home or an explicit decision to

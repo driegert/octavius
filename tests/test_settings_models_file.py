@@ -181,6 +181,25 @@ class ModelsFileTests(unittest.TestCase):
                 {"url": "http://r:2/v1"},
             ]}})
 
+    def test_pi_failover_settings_defaults_and_env(self):
+        for var in ("OCTAVIUS_PI_FALLBACK_MODELS", "OCTAVIUS_PI_FAILOVER_COOLDOWN_S", "OCTAVIUS_PI_SILENCE_TIMEOUT_S"):
+            os.environ.pop(var, None)
+        _, st = self._load()
+        pi = st.pi_brain
+        self.assertEqual(pi.fallback_models, ("lrv-p01/qwen3.8-27b", "wh-vllm/gemma4-12b"))
+        self.assertEqual((pi.failover_cooldown_s, pi.silence_timeout_s), (300.0, 30.0))
+        self.assertEqual((pi.first_output_timeout_s, pi.tool_timeout_s), (60.0, 120.0))
+        self.assertEqual(pi.model_contexts["wh-vllm/gemma4-12b"], 65536)
+        os.environ["OCTAVIUS_PI_FALLBACK_MODELS"] = " a/b , c/d ,"
+        os.environ["OCTAVIUS_PI_FAILOVER_COOLDOWN_S"] = "60"
+        os.environ["OCTAVIUS_PI_SILENCE_TIMEOUT_S"] = "12.5"
+        _, st = self._load()
+        self.assertEqual(st.pi_brain.fallback_models, ("a/b", "c/d"))
+        self.assertEqual((st.pi_brain.failover_cooldown_s, st.pi_brain.silence_timeout_s), (60.0, 12.5))
+        os.environ["OCTAVIUS_PI_FALLBACK_MODELS"] = ""
+        _, st = self._load()
+        self.assertEqual(st.pi_brain.fallback_models, ())  # failover off: one hop
+
     def test_malformed_json_raises_rather_than_silently_defaulting(self):
         """Restarting onto routing the operator did not ask for is the exact
         class of bug this file was added to prevent."""

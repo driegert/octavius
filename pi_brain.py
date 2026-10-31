@@ -70,10 +70,130 @@ COMMAND_TIMEOUT_S = 30.0
 WARM_STATUS_KEY = "octavius-warm"
 WARM_COMMAND_TIMEOUT_S = 30.0  # covers pi start-up when the warm is a process's first command
 WARM_RESULT_TIMEOUT_S = 90.0  # the extension's own fetch timeout is 60 s
+SET_MODEL_TIMEOUT_S = 10.0
+# Sent as the next prompt when a hop fails mid-turn. pi's session already holds Dave's
+# message (and any tool results), and RPC has no "continue", so a short user message
+# stands in for it. The failed assistant message is dropped from the model's context by pi.
+RESUME_MESSAGE = (
+    "[System note: the previous attempt to answer was cut off by a connection problem. "
+    "Answer Dave's last message now.]"
+)
+SPOKEN_RESUME_TEMPLATE = (
+    "[System note: the previous attempt to answer was cut off by a connection problem. "
+    "You have already said this aloud to Dave: {spoken!r}. Continue from there without "
+    "repeating it; if nothing more is needed, say a brief closing sentence.]"
+)
+TOOL_TIMEOUT_REPLY = "Sorry, that is taking too long and I had to stop it. Please try again."
+SUBAGENT_TOOL_BUDGET_FACTOR = 3  # scholar alone took 228 s in the step-1 run
+CONTEXT_OVERFLOW_REPLY = (
+    "This conversation has grown too long for the model I can reach right now. "
+    "Please start a new conversation."
+)
+RESUME_AFTER_TOOLS_MESSAGE = (
+    "[System note: the previous attempt to answer was cut off by a connection problem after "
+    "your tool calls. Their results are above; do not repeat them. Answer Dave's last message now.]"
+)
 
 
 class PiTurnError(RuntimeError):
     """A pi turn failed: process died, prompt rejected, provider error or timeout."""
+
+
+class ToolTimeout(PiTurnError):
+    """A tool ran past ``tool_timeout_s``; the turn is stopped. Not the model hop's fault."""
+
+
+class HopFailure(PiTurnError):
+    """The model hop serving a turn failed; the turn may move to the next hop.
+
+    ``kind`` uses service_clients.classify_chain_error's names: auth, client_error,
+    server_error, connect, timeout, bad_response.
+    """
+
+    def __init__(self, kind: str, reason: str):
+        super().__init__(f"{kind}: {reason}")
+        self.kind = kind
+        self.reason = reason
+
+
+_STATUS_RE = re.compile(r"^\s*(\d{3})\b")
+_CONNECT_RE = re.compile(
+    r"connection|connect |econnrefused|econnreset|enotfound|ehostunreach|getaddrinfo|fetch failed|"
+    r"socket|network|other side closed|terminated|stream (?:was )?(?:interrupted|ended)",
+    re.IGNORECASE,
+)
+# vLLM: "maximum context length is N tokens"; llama.cpp: "request exceeds the available context
+# size" (exceed_context_size_error); others: "prompt is too long", "too many tokens".
+_OVERFLOW_RE = re.compile(
+    r"context.?(?:length|size|window)|exceed\w* .{0,40}context|too many (?:input )?tokens|"
+    r"prompt is too long|input is too long|maximum .{0,20}tokens",
+    re.IGNORECASE,
+)
+_TIMEOUT_RE = re.compile(r"timed? ?out|timeout|etimedout", re.IGNORECASE)
+
+
+def classify_provider_error(message: str) -> str:
+    """Bucket a pi provider errorMessage the way service_clients.classify_chain_error does.
+
+    pi writes HTTP failures as ``"<status>: <body>"`` and transport failures as the
+    SDK's text (``"Connection error."``, ``"Request timed out."``).
+    """
+    text = message or ""
+    if _OVERFLOW_RE.search(text):
+        return "context_overflow"  # about this request, not the hop: never trips the breaker
+    m = _STATUS_RE.match(text)
+    if m:
+        status = int(m.group(1))
+        if status in (401, 403):
+            return "auth"
+        if status == 408:
+            return "timeout"
+        if status >= 500 or status == 429:
+            return "server_error"
+        if status >= 400:
+            return "client_error"  # 400/404: usually the alias is missing from that endpoint
+    if _TIMEOUT_RE.search(text):
+        return "timeout"
+    if _CONNECT_RE.search(text):
+        return "connect"
+    return "bad_response"
+
+
+# Events that prove the model is generating (they reset the silence watchdog).
+PROGRESS_EVENTS = frozenset({"message_start", "message_update", "message_end", "turn_start", "turn_end"})
+
+
+def _larger_context_hop(manager: "PiProcessManager", failed: int, tried: set) -> int | None:
+    """The first untried hop whose configured window is bigger than the failed hop's."""
+    contexts = getattr(manager.cfg, "model_contexts", None) or {}
+    hops = manager.failover.hops
+    have = contexts.get(hops[failed])
+    if not have:
+        return None
+    for i, hop in enumerate(hops):
+        if i not in tried and (contexts.get(hop) or 0) > have:
+            return i
+    return None
+
+
+async def _stop_run(proc: "PiRpcProcess", events: asyncio.Queue, on_event=None) -> bool:
+    """Abort pi's current run and wait for it to settle. False: pi is stuck or gone.
+
+    ``on_event`` sees every event drained on the way (a tool may still finish, a dialog
+    may be pending), so the turn's bookkeeping stays true.
+    """
+    try:
+        await proc.command("abort", timeout=ABORT_SETTLE_S)
+        while True:
+            ev = await asyncio.wait_for(events.get(), ABORT_SETTLE_S)
+            if on_event is not None:
+                await on_event(ev)
+            if ev.get("type") == "agent_settled":
+                return True
+            if ev.get("type") == "_exit":
+                return False
+    except Exception:
+        return False
 
 
 def is_yes(text: str) -> bool:
@@ -150,11 +270,14 @@ def build_prompt(text: str, style: str, memory: str = "", seed: str = "") -> str
     return "\n\n".join(blocks)
 
 
-def child_env(cfg) -> dict[str, str]:
-    """pi's environment: Octavius's own config and keys (OCTAVIUS_*) stay out."""
+def child_env(cfg, model: str | None = None) -> dict[str, str]:
+    """pi's environment: Octavius's own config and keys (OCTAVIUS_*) stay out.
+
+    ``model`` is the failover hop a new process starts on (default: the primary).
+    """
     env = {k: v for k, v in os.environ.items() if not k.startswith("OCTAVIUS_")}
     env["PI_BIN"] = cfg.pi_bin
-    env["PI_OCTAVIUS_MODEL"] = cfg.model
+    env["PI_OCTAVIUS_MODEL"] = model or cfg.model
     return env
 
 
@@ -176,6 +299,12 @@ class PiRpcProcess:
         self._tasks: list[asyncio.Task] = []
         # Called with each octavius-warm report (a dict); set by PiProcessManager.
         self.on_warm = None
+        # This process's credential for the loopback tools server (pi_tools_server);
+        # revoked when the process is killed.
+        self.tool_token: str | None = None
+        self.on_kill = None
+        # The provider/model id this process's session is on (failover hop).
+        self.model: str | None = None
 
     @property
     def alive(self) -> bool:
@@ -273,6 +402,19 @@ class PiRpcProcess:
                 log.warning("pi: aborting an unhandled /warm failed", exc_info=True)
         return disposition
 
+    async def use_model(self, model: str) -> None:
+        """Switch the session to ``model`` (``provider/id``) if it is not on it already.
+
+        Raises HopFailure when pi does not know the model (a missing alias).
+        """
+        if self.model == model:
+            return
+        provider, _, model_id = model.partition("/")
+        resp = await self.command("set_model", timeout=SET_MODEL_TIMEOUT_S, provider=provider, modelId=model_id)
+        if not resp.get("success"):
+            raise HopFailure("client_error", f"set_model {model}: {resp.get('error')}")
+        self.model = model
+
     def stderr_tail(self) -> str:
         return " | ".join(self._stderr_tail)
 
@@ -308,6 +450,8 @@ class PiRpcProcess:
         self._events = None
 
     async def kill(self) -> None:
+        if self.on_kill is not None:
+            self.on_kill(self)
         for task in self._tasks:
             task.cancel()
         if self.proc is None or self.proc.returncode is not None:
@@ -327,6 +471,104 @@ class PiRpcProcess:
 
 
 @dataclass
+class FailoverState:
+    """The shared "current hop": a circuit breaker over the model chain.
+
+    Every conversation's pi process serves the same models, so one failure is
+    everyone's news. ``index`` is the hop new turns start on; it moves down the
+    chain on a failure and snaps back to the primary after ``cooldown_s`` (the
+    next turn simply tries it, and a primary that is still down moves it on again).
+    """
+
+    hops: tuple
+    cooldown_s: float
+    index: int = 0
+    since: float = 0.0  # monotonic time of the last move off the primary
+    failovers: int = 0
+    returns: int = 0
+    # Bumped on every move of the shared hop (cooldown return included). An attempt carries the
+    # generation it started under: a failure from an older one is news about a hop the shared
+    # state has already moved past, and must not move everyone off the primary again.
+    generation: int = 0
+    stale_failures: int = 0
+    local: dict = field(default_factory=dict)  # turn-local problems (context_overflow, empty_output)
+    by_kind: dict = field(default_factory=dict)
+    last_failure: dict | None = None
+
+    def current(self) -> int:
+        if self.index > 0 and time.monotonic() - self.since >= self.cooldown_s:
+            log.info("pi failover: cooldown over, trying %s again", self.hops[0])
+            self.index = 0
+            self.returns += 1
+            self.generation += 1
+        return self.index
+
+    @property
+    def context_overflows(self) -> int:
+        return self.local.get("context_overflow", 0)
+
+    def note_local(self, index: int, kind: str, reason: str) -> None:
+        """A problem with one request (too big, empty answer), not the hop: counted only."""
+        self.local[kind] = self.local.get(kind, 0) + 1
+        self.last_failure = {
+            "hop": self.hops[index], "kind": kind, "reason": reason[:200], "at": time.time(),
+        }
+
+    def model(self) -> str:
+        return self.hops[self.current()]
+
+    def fail(self, index: int, kind: str, reason: str, generation: int | None = None) -> int | None:
+        """Hop ``index`` failed: note it, and return the hop to try next (None: chain exhausted).
+
+        ``generation`` is the one the failing attempt started under; a stale one is recorded
+        but leaves the shared hop alone.
+        """
+        self.by_kind[kind] = self.by_kind.get(kind, 0) + 1
+        self.last_failure = {
+            "hop": self.hops[index], "kind": kind, "reason": reason[:200], "at": time.time(),
+        }
+        if generation is not None and generation != self.generation:
+            self.stale_failures += 1
+            log.warning("pi failover: %s failed (%s: %s) after the shared hop moved on; not moving it",
+                        self.hops[index], kind, reason[:200])
+            return index + 1 if index + 1 < len(self.hops) else None
+        # Another conversation may already have moved the shared hop past this one.
+        nxt = max(index + 1, self.index)
+        if nxt >= len(self.hops):
+            log.error("pi failover: %s failed (%s: %s); no hops left", self.hops[index], kind, reason[:200])
+            # All hops down: start the next turn from the top, not on the smallest hop.
+            if self.index != 0:
+                self.index = 0
+                self.generation += 1
+            return None
+        if nxt > self.index:
+            self.index = nxt
+            self.since = time.monotonic()
+            self.failovers += 1
+            self.generation += 1
+        log.warning("pi failover: %s failed (%s: %s); moving to %s",
+                    self.hops[index], kind, reason[:200], self.hops[nxt])
+        return nxt
+
+    def health(self) -> dict:
+        # Read-only: a /health poll must not trigger the return to the primary.
+        remaining = max(0.0, self.cooldown_s - (time.monotonic() - self.since)) if self.index > 0 else 0.0
+        return {
+            "current": self.hops[self.index],
+            "hops": list(self.hops),
+            "failed_over": self.index > 0,
+            "cooldown_remaining": round(remaining, 1),
+            "failovers": self.failovers,
+            "stale_failures": self.stale_failures,
+            "context_overflows": self.context_overflows,
+            "turn_local": dict(self.local),
+            "returns_to_primary": self.returns,
+            "failures_by_kind": dict(self.by_kind),
+            "last_failure": self.last_failure,
+        }
+
+
+@dataclass
 class PiProcessManager:
     """conversation_id → pi process. Lazy start, idle reaping, killed on shutdown."""
 
@@ -341,6 +583,15 @@ class PiProcessManager:
     _warm_tasks: set = field(default_factory=set)
     _last_warm_request: dict = field(default_factory=dict)
     _recovery: asyncio.Task | None = None
+    # pi_tools_server.PiToolsServer when running (main.py's lifespan sets it).
+    tools_server: object = None
+    failover: FailoverState = field(init=False)
+
+    def __post_init__(self):
+        self.failover = FailoverState(
+            hops=(self.cfg.model, *getattr(self.cfg, "fallback_models", ())),
+            cooldown_s=getattr(self.cfg, "failover_cooldown_s", 300.0),
+        )
 
     def argv(self) -> list[str]:
         return [self.cfg.launcher, "--mode", "rpc"]
@@ -357,6 +608,7 @@ class PiProcessManager:
                 await proc.kill()
             proc = self._new_process()
             await proc.start()
+            await self._configure(proc)
             self.processes[conv_id] = proc
             self.starts += 1
             log.info("pi: started process %s for conversation %s", proc.proc.pid, conv_id)
@@ -366,9 +618,40 @@ class PiProcessManager:
         argv = self.argv()
         if extra:
             argv = argv[:1] + extra + argv[1:]
-        proc = PiRpcProcess(argv, child_env(self.cfg))
+        # A process started while failed over starts on the current hop.
+        hop = self.failover.model()
+        env = child_env(self.cfg, hop)
+        proc = PiRpcProcess(argv, env)
+        proc.model = hop
+        if self.tools_server is not None:
+            # Every process, warm-only ones included, needs a token to list the
+            # octavius tools: the tool list must match across processes for the cache.
+            proc.tool_token = env["PI_OCTAVIUS_TOOLS_TOKEN"] = self.tools_server.new_token()
+            # The real bound port, so a changed OCTAVIUS_PI_TOOLS_PORT cannot desync pi's catalog.
+            env["PI_OCTAVIUS_TOOLS_URL"] = self.tools_server.url
+            proc.on_kill = lambda p: self.tools_server.revoke(p.tool_token)
         proc.on_warm = self._on_warm_report
         return proc
+
+    async def _configure(self, proc: PiRpcProcess) -> None:
+        """Turn off pi's own retry: it backs off 2+4+8 s on a 5xx before surfacing the
+        error, which is time Octavius would rather spend on the next hop."""
+        try:
+            await proc.command("set_auto_retry", timeout=COMMAND_TIMEOUT_S, enabled=False)
+        except Exception as exc:
+            log.warning("pi: could not disable auto-retry (%s); failover will be slower", exc)
+
+    def bind_tools(self, proc: PiRpcProcess, session):
+        """Bind ``proc``'s tools token to this turn's context; returns the unbind callable."""
+        if self.tools_server is None or proc.tool_token is None:
+            return lambda: None
+        from pi_tools_server import ToolContext
+        state = session.state
+        return self.tools_server.bind(proc.tool_token, ToolContext(
+            history_session=state.history_session,
+            mcp_manager=state.mcp_manager,
+            session=session,
+        ))
 
     # --- /warm (docs/pi-backend-design.md, "Cache warming") -------------------------
     #
@@ -446,6 +729,12 @@ class PiProcessManager:
             # A turn is running: its own request is warming the slot.
             self.warm_stats.skipped += 1
             return None
+        # Warm the model the next turn will use: after a failover (or the return to the
+        # primary) an idle process may still be on another hop.
+        try:
+            await proc.use_model(self.failover.model())
+        except Exception as exc:
+            log.warning("pi: could not switch to the current hop before warming: %s", exc)
         fut: asyncio.Future | None = None
         if wait:
             fut = asyncio.get_running_loop().create_future()
@@ -548,6 +837,7 @@ class PiProcessManager:
         return {
             "brain": self.cfg.brain,
             "model": self.cfg.model,
+            "failover": self.failover.health(),
             "processes": sum(1 for p in self.processes.values() if p.alive),
             "starts": self.starts,
             "failures": self.failures,
@@ -583,7 +873,7 @@ class WarmStats:
         result = str(report.get("result"))
         self.results[result] = self.results.get(result, 0) + 1
         self.last = {k: report.get(k) for k in (
-            "result", "source", "reason", "status", "prompt_n", "cache_n", "prefill_ms", "wall_ms",
+            "result", "source", "reason", "auth_error", "status", "prompt_n", "cache_n", "prefill_ms", "wall_ms",
         ) if report.get(k) is not None}
         self.last_at = time.time()
 
@@ -663,63 +953,225 @@ async def stream_pi_turn(
         rounds = 0
         tool_args: dict[str, dict] = {}
         started = time.monotonic()
+        unbind_tools = manager.bind_tools(proc, session)
+        hop_idx = manager.failover.current()
+        tools_ran = False  # a tool has executed: its result is in pi's session, never re-run it
+        prompt_sent = False
+        deadline = started + settings.pi_brain.turn_timeout_s
+        silence = getattr(settings.pi_brain, "silence_timeout_s", 30.0)
+        first_budget = max(silence, getattr(settings.pi_brain, "first_output_timeout_s", 60.0))
+        tool_budget = getattr(settings.pi_brain, "tool_timeout_s", 120.0)
+        tried: set[int] = set()
+        pending_ui: str | None = None  # a confirm pi is waiting on
+
+        async def drain(ev: dict) -> None:
+            """Bookkeeping for events that arrive while a failed run is being stopped."""
+            nonlocal tools_ran, rounds
+            t = ev.get("type")
+            if t == "tool_execution_start":
+                tools_ran = True
+                tool_args[ev.get("toolCallId", "")] = ev.get("args") or {}
+            elif t == "tool_execution_end":
+                tools_ran = True
+                await _record_tool(history_session, ev, tool_args.pop(ev.get("toolCallId", ""), {}))
+            elif t == "turn_end":
+                rounds += 1
+            elif t == "extension_ui_request" and ev.get("method") in ("select", "confirm", "input", "editor"):
+                await proc.respond_ui(ev.get("id"), cancelled=True)  # a dialog would block settling
+
         try:
-            resp = await proc.command("prompt", message=message)
-            if not resp.get("success"):
-                raise PiTurnError(f"pi rejected the prompt: {resp.get('error')}")
-            if (resp.get("data") or {}).get("disposition") == "handled":
-                settled = True
-                return
-            deadline = started + settings.pi_brain.turn_timeout_s
-            provider_error: str | None = None
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PiTurnError("pi turn timed out")
-                ev = await asyncio.wait_for(events.get(), remaining)
-                etype = ev.get("type")
-                if etype == "_exit":
-                    raise PiTurnError(f"pi process exited mid-turn ({proc.stderr_tail()[:200]})")
-                if etype == "message_end":
-                    msg = ev.get("message") or {}
-                    if msg.get("role") != "assistant":
-                        continue
-                    stop = msg.get("stopReason")
-                    if stop == "error":
-                        provider_error = msg.get("errorMessage") or "provider error"
-                    elif stop in ("stop", "length"):
-                        provider_error = None
-                        text = message_text(msg).strip()
-                        if text:
-                            answer_parts.append(text)
-                            for sentence in split_sentences(text):
-                                yield sentence
-                elif etype == "tool_execution_start":
-                    tool_args[ev.get("toolCallId", "")] = ev.get("args") or {}
-                    if status_callback:
-                        await status_callback(f"{tool_label(ev.get('toolName', ''))}...")
-                elif etype == "tool_execution_end":
-                    await _record_tool(history_session, ev, tool_args.pop(ev.get("toolCallId", ""), {}))
-                elif etype == "turn_end":
-                    rounds += 1
-                    if rounds == STEER_AT_ROUND:
-                        await proc.command("steer", message=STEER_MESSAGE)
-                    elif rounds >= settings.max_tool_rounds:
-                        await proc.command("abort", timeout=ABORT_SETTLE_S)
+            while True:  # one pass per model hop
+                hop = manager.failover.hops[hop_idx]
+                tried.add(hop_idx)
+                generation = manager.failover.generation
+                settled = True  # nothing is running until a prompt is on its way
+                provider_error: str | None = None
+                try:
+                    if getattr(proc, "model", hop) != hop:
+                        await proc.use_model(hop)
+                    if prompt_sent:
+                        # pi's session already holds Dave's message (and any tool results);
+                        # RPC has no "continue", so a short note stands in for it.
+                        if answer_parts:
+                            outgoing = SPOKEN_RESUME_TEMPLATE.format(spoken=" ".join(answer_parts))
+                        else:
+                            outgoing = RESUME_AFTER_TOOLS_MESSAGE if tools_ran else RESUME_MESSAGE
+                    else:
+                        outgoing = message
+                    # From here pi may be running (or about to), even if the ack never comes:
+                    # a cancel or timeout during it must still reach the abort in `finally`.
+                    settled = False
+                    resp = await proc.command("prompt", message=outgoing)
+                    if not resp.get("success"):
                         settled = True
-                        answer_parts.append(ROUND_CAP_REPLY)
-                        yield ROUND_CAP_REPLY
-                        break
-                elif etype == "extension_ui_request":
-                    async for sentence in _handle_ui_request(session, proc, ev):
-                        yield sentence
-                elif etype == "auto_retry_end" and ev.get("success") is False:
-                    provider_error = ev.get("finalError") or provider_error
-                elif etype == "agent_settled":
+                        raise PiTurnError(f"pi rejected the prompt: {resp.get('error')}")
+                    if (resp.get("data") or {}).get("disposition") == "handled":
+                        settled = True
+                        return
+                    prompt_sent = True
+                    tools_running = 0
+                    tool_until_budget = tool_budget
+                    empty_output = False  # a "length" stop with nothing in it
+                    got_output = False  # the model has not produced anything for this request yet
+                    # The silence watchdog: pi's own timeouts are minutes long, so a hop that
+                    # accepts the request and never generates (a "zombie") would hold the
+                    # turn. Any streaming event, thinking included, resets it; it is off
+                    # while a tool runs and while Dave is being asked to confirm.
+                    def arm() -> float:
+                        # The first output of an attempt may wait out a warm and a cold prefill.
+                        return time.monotonic() + (silence if got_output else first_budget)
+
+                    quiet_until: float | None = arm()
+                    while True:
+                        now = time.monotonic()
+                        remaining = deadline - now
+                        if remaining <= 0:
+                            raise PiTurnError("pi turn timed out")
+                        try:
+                            ev = events.get_nowait()
+                        except asyncio.QueueEmpty:
+                            wait = remaining if quiet_until is None else min(remaining, max(quiet_until - now, 0.001))
+                            try:
+                                ev = await asyncio.wait_for(events.get(), wait)
+                            except asyncio.TimeoutError:
+                                if quiet_until is not None and time.monotonic() >= quiet_until and tools_running:
+                                    raise ToolTimeout(f"a tool ran longer than {tool_until_budget:g}s") from None
+                                if quiet_until is not None and time.monotonic() >= quiet_until:
+                                    budget = silence if got_output else first_budget
+                                    raise HopFailure("timeout", f"no output from {hop} for {budget:g}s") from None
+                                raise PiTurnError("pi turn timed out") from None
+                        etype = ev.get("type")
+                        if etype in PROGRESS_EVENTS and not tools_running:
+                            # The echo of the system/user message is not the model's output.
+                            # pi announces the assistant message ("start") as soon as the request
+                            # is sent, before the server has produced anything.
+                            if (
+                                etype == "message_update"
+                                and (ev.get("assistantMessageEvent") or {}).get("type") != "start"
+                            ) or (etype == "message_end" and (ev.get("message") or {}).get("role") == "assistant"):
+                                got_output = True
+                            quiet_until = arm()
+                        if etype == "_exit":
+                            raise PiTurnError(f"pi process exited mid-turn ({proc.stderr_tail()[:200]})")
+                        if etype == "message_end":
+                            msg = ev.get("message") or {}
+                            if msg.get("role") != "assistant":
+                                continue
+                            stop = msg.get("stopReason")
+                            if stop == "error":
+                                provider_error = msg.get("errorMessage") or "provider error"
+                            elif stop in ("stop", "length"):
+                                provider_error = None
+                                text = message_text(msg).strip()
+                                has_tool_call = any(
+                                    isinstance(b, dict) and b.get("type") == "toolCall"
+                                    for b in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+                                )
+                                if stop == "length" and not text and not has_tool_call:
+                                    # max_tokens spent on reasoning (AGENTS.md, gemma4): nothing to say.
+                                    empty_output = True
+                                if text:
+                                    answer_parts.append(text)
+                                    for sentence in split_sentences(text):
+                                        yield sentence
+                                    if not tools_running:
+                                        quiet_until = arm()
+                        elif etype == "tool_execution_start":
+                            tools_running += 1
+                            tools_ran = True  # a started tool may already have had side effects
+                            factor = SUBAGENT_TOOL_BUDGET_FACTOR if ev.get("toolName") == "subagent" else 1
+                            tool_until_budget = max(tool_until_budget if tools_running > 1 else 0, tool_budget * factor)
+                            quiet_until = time.monotonic() + tool_until_budget
+                            tool_args[ev.get("toolCallId", "")] = ev.get("args") or {}
+                            if status_callback:
+                                await status_callback(f"{tool_label(ev.get('toolName', ''))}...")
+                        elif etype == "tool_execution_end":
+                            tools_running = max(0, tools_running - 1)
+                            tools_ran = True
+                            got_output = True  # the next request is on the silence limit
+                            quiet_until = arm() if not tools_running else time.monotonic() + tool_until_budget
+                            await _record_tool(history_session, ev, tool_args.pop(ev.get("toolCallId", ""), {}))
+                        elif etype == "turn_end":
+                            rounds += 1
+                            if rounds == STEER_AT_ROUND:
+                                await proc.command("steer", message=STEER_MESSAGE)
+                            elif rounds >= settings.max_tool_rounds:
+                                await proc.command("abort", timeout=ABORT_SETTLE_S)
+                                settled = True
+                                answer_parts.append(ROUND_CAP_REPLY)
+                                yield ROUND_CAP_REPLY
+                                break
+                        elif etype == "extension_ui_request":
+                            pending_ui = ev.get("id") if ev.get("method") == "confirm" else None
+                            async for sentence in _handle_ui_request(session, proc, ev):
+                                yield sentence
+                            pending_ui = None
+                            quiet_until = arm() if not tools_running else time.monotonic() + tool_until_budget
+                        elif etype == "auto_retry_end" and ev.get("success") is False:
+                            provider_error = ev.get("finalError") or provider_error
+                        elif etype == "agent_settled":
+                            settled = True
+                            break
+                    if provider_error and not answer_parts:
+                        raise HopFailure(classify_provider_error(provider_error), provider_error)
+                    if empty_output and not answer_parts:
+                        raise HopFailure("empty_output", f"{hop} stopped at its token limit with no answer")
+                    if provider_error:
+                        # Text was already spoken, so the turn ends on it; but the hop broke, and
+                        # the next conversation should hear about that before it hits it too.
+                        kind = classify_provider_error(provider_error)
+                        if kind == "context_overflow":
+                            manager.failover.note_local(hop_idx, kind, provider_error)
+                        else:
+                            manager.failover.fail(hop_idx, kind, provider_error, generation)
+                    break  # the turn is answered
+                except ToolTimeout as exc:
+                    log.error("pi: %s; stopping the turn", exc)
+                    if not settled and proc.alive and not await _stop_run(proc, events, drain):
+                        await manager.discard(conv_id)
                     settled = True
+                    manager.record_failure(str(exc))
+                    answer_parts.append(TOOL_TIMEOUT_REPLY)
+                    yield TOOL_TIMEOUT_REPLY
                     break
-            if provider_error and not answer_parts:
-                raise PiTurnError(provider_error)
+                except HopFailure as failure:
+                    if not settled and proc.alive:
+                        if not await _stop_run(proc, events, drain):
+                            await manager.discard(conv_id)
+                            raise PiTurnError(f"pi would not stop after {hop} failed: {failure}") from failure
+                        settled = True
+                    if failure.kind == "empty_output":
+                        # Also about the request (the token budget), not the hop's health.
+                        manager.failover.note_local(hop_idx, failure.kind, failure.reason)
+                        untried = [i for i in range(len(manager.failover.hops)) if i not in tried]
+                        if not untried:
+                            break  # nothing left: the "not sure how to respond" fallback speaks
+                        log.warning("pi: empty answer from %s; trying %s for this turn",
+                                    hop, manager.failover.hops[untried[0]])
+                        hop_idx = untried[0]
+                        continue
+                    if failure.kind == "context_overflow":
+                        # About this request, not the hop: the shared hop is left alone, and the
+                        # turn moves to a hop with a bigger window than the one that refused it.
+                        manager.failover.note_local(hop_idx, failure.kind, failure.reason)
+                        next_idx = _larger_context_hop(manager, hop_idx, tried)
+                        if next_idx is None:
+                            log.error("pi: context overflow on %s and no larger hop to try: %s", hop, failure.reason[:200])
+                            answer_parts.append(CONTEXT_OVERFLOW_REPLY)
+                            yield CONTEXT_OVERFLOW_REPLY
+                            break
+                        log.warning("pi: context overflow on %s; trying %s for this turn",
+                                    hop, manager.failover.hops[next_idx])
+                        hop_idx = next_idx
+                        if status_callback:
+                            await status_callback("Trying a model with a bigger context...")
+                        continue
+                    next_idx = manager.failover.fail(hop_idx, failure.kind, failure.reason, generation)
+                    if next_idx is None:
+                        raise PiTurnError(f"every model failed; last, {failure}") from failure
+                    hop_idx = next_idx
+                    if status_callback:
+                        await status_callback("Trying another model...")
         except PiTurnError as exc:
             manager.record_failure(str(exc))
             manager.schedule_recovery()
@@ -730,6 +1182,10 @@ async def stream_pi_turn(
             manager.record_failure("pi turn timed out")
             raise PiTurnError("pi turn timed out") from exc
         finally:
+            if pending_ui is not None:
+                # Cancelled while a confirm was pending: pi must not wait on a dialog nobody sees.
+                session.state.pending_confirm = None
+                await proc.respond_ui(pending_ui, cancelled=True)
             if not settled and proc.alive:
                 # Barge-in, reset or error mid-turn: stop pi before the next prompt.
                 try:
@@ -737,6 +1193,7 @@ async def stream_pi_turn(
                 except Exception:
                     log.warning("pi abort failed; discarding the process", exc_info=True)
                     await manager.discard(conv_id)
+            unbind_tools()
             proc.unsubscribe()
             proc.last_used = time.monotonic()
             log.info(

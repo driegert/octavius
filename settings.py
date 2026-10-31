@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -135,6 +135,14 @@ class TTSSettings:
     voxtral_enabled: bool = False
 
 
+# lilbuddy 26B 295k, lilripper :8020 262144, workhorse 64K (see docs/pi-backend-design.md).
+DEFAULT_PI_MODEL_CONTEXTS = {
+    "lb-unified/gemma4-26b-a4b": 295000,
+    "lrv-p01/qwen3.8-27b": 262144,
+    "wh-vllm/gemma4-12b": 65536,
+}
+
+
 @dataclass(frozen=True)
 class PiBrainSettings:
     """pi as the turn brain (docs/pi-backend-design.md, rollout step 2).
@@ -153,6 +161,24 @@ class PiBrainSettings:
     warm: bool = True
     warm_debounce_s: float = 5.0
     warm_retry_s: float = 60.0
+    # Failover (rollout step 4): the hops after `model`, in order, as pi provider/model ids.
+    fallback_models: tuple = ("lrv-p01/qwen3.8-27b", "wh-vllm/gemma4-12b")
+    # How long failed-over processes stay on a fallback before the next turn tries `model` again.
+    failover_cooldown_s: float = 300.0
+    # Longest the model may go without a streaming event (thinking deltas count), from the
+    # prompt or from a tool result, before the hop is declared a zombie and the turn moves on.
+    silence_timeout_s: float = 30.0
+    # The first model output after a prompt gets a larger budget: the real request can wait up
+    # to 20 s for an in-flight /warm and then pays a cold prefill. The silence limit takes over
+    # after the first output and after tool results.
+    first_output_timeout_s: float = 60.0
+    # A tool that runs longer than this is cut off with a spoken apology (3x for the subagent tool).
+    tool_timeout_s: float = 120.0
+    # Context window (tokens) per hop, for moving a context-overflow turn to a bigger one.
+    # A hop missing here is never chosen as the bigger one.
+    model_contexts: dict = field(default_factory=lambda: dict(DEFAULT_PI_MODEL_CONTEXTS))
+    # Loopback MCP server exposing Octavius's own tools to pi (pi_tools_server.py).
+    tools_port: int = 8032
 
     @property
     def enabled(self) -> bool:
@@ -810,11 +836,22 @@ def load_settings() -> Settings:
             turn_timeout_s=_env_float("OCTAVIUS_PI_TURN_TIMEOUT_S", 600),
             # Below octavius-guard's 60 s, so Octavius answers before pi gives up.
             confirm_timeout_s=_env_float("OCTAVIUS_PI_CONFIRM_TIMEOUT_S", 55),
+            tools_port=_env_int("OCTAVIUS_PI_TOOLS_PORT", 8032),
             warm=_env_str("OCTAVIUS_PI_WARM", "1") not in ("0", "false", "no", "off"),
             warm_debounce_s=_env_float("OCTAVIUS_PI_WARM_DEBOUNCE_S", 5.0),
             # While warms fail (lilbuddy down, model reloading), retry this often: the first
             # success after an outage is the recovery warm.
             warm_retry_s=_env_float("OCTAVIUS_PI_WARM_RETRY_S", 60.0),
+            fallback_models=tuple(
+                m.strip() for m in os.getenv(
+                    "OCTAVIUS_PI_FALLBACK_MODELS", "lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b",
+                ).split(",") if m.strip()
+            ),
+            failover_cooldown_s=_env_float("OCTAVIUS_PI_FAILOVER_COOLDOWN_S", 300.0),
+            silence_timeout_s=_env_float("OCTAVIUS_PI_SILENCE_TIMEOUT_S", 30.0),
+            first_output_timeout_s=_env_float("OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S", 60.0),
+            tool_timeout_s=_env_float("OCTAVIUS_PI_TOOL_TIMEOUT_S", 120.0),
+            model_contexts=_env_json("OCTAVIUS_PI_MODEL_CONTEXTS", dict(DEFAULT_PI_MODEL_CONTEXTS)),
         ),
     )
 

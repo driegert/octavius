@@ -10,6 +10,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -373,6 +374,444 @@ class PiWarmTests(unittest.IsolatedAsyncioTestCase):
         proc._warm_report(json.dumps({"event": "wait", "waited_ms": 1200, "capped": False}))
         self.assertTrue(events.empty())
         self.assertEqual(self.manager.health()["warm"]["last_wait_ms"], 1200)
+
+
+PRIMARY = "fake/model"
+HOP2 = "lrv-p01/qwen3.8-27b"
+HOP3 = "wh-vllm/gemma4-12b"
+
+
+class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
+    """Failover over RPC: classification, the silence watchdog, resume, the shared breaker."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "commands.jsonl")
+        self.fail_file = os.path.join(self.tmp.name, "fail.json")
+        launcher = os.path.join(self.tmp.name, "pi-octavius")
+        with open(launcher, "w") as f:
+            f.write(f"#!/bin/sh\nexec {sys.executable} {FAKE} \"$@\"\n")
+        os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IEXEC)
+        self.env = mock.patch.dict(os.environ, {"FAKE_PI_LOG": self.log, "FAKE_PI_FAIL_FILE": self.fail_file})
+        self.env.start()
+        self.cfg = _cfg(launcher, fallback_models=(HOP2, HOP3), failover_cooldown_s=300.0,
+                        silence_timeout_s=0.5, first_output_timeout_s=0.5, warm_debounce_s=0.0)
+        self.manager = pi_brain.PiProcessManager(self.cfg)
+        self.patches = [
+            mock.patch.object(pi_brain, "settings", SimpleNamespace(
+                pi_brain=self.cfg, max_tool_rounds=7, tool_labels={})),
+            mock.patch("agent._build_memory_block", mock.AsyncMock(return_value="")),
+        ]
+        for p in self.patches:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self.patches:
+            p.stop()
+        await self.manager.shutdown()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def fail(self, **models):
+        with open(self.fail_file, "w") as f:
+            json.dump(models, f)
+
+    def records(self, type_=None):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            rows = [json.loads(line) for line in f]
+        return [r for r in rows if type_ is None or r["type"] == type_]
+
+    def runs(self):
+        return [(r["model"], r["script"]) for r in self.records("_run")]
+
+    async def turn(self, text, session=None, **kw):
+        session = session or _Session(self.manager)
+        statuses = []
+
+        async def status(t):
+            statuses.append(t)
+        out = []
+        async for s in pi_brain.stream_pi_turn(session, text, source="voice", status_callback=status, **kw):
+            out.append(s)
+        return "".join(out), statuses, session
+
+    # --- classification -----------------------------------------------------------
+
+    def test_classify_provider_error(self):
+        c = pi_brain.classify_provider_error
+        self.assertEqual(c('500: {"message":"Internal Server Error"}'), "server_error")
+        self.assertEqual(c("503: busy"), "server_error")
+        self.assertEqual(c("429: slow down"), "server_error")
+        self.assertEqual(c('401: {"message":"Invalid API key"}'), "auth")
+        self.assertEqual(c("403: no"), "auth")
+        self.assertEqual(c("404: model not found"), "client_error")
+        self.assertEqual(c("400: model does not exist"), "client_error")
+        self.assertEqual(c("Connection error."), "connect")
+        self.assertEqual(c("fetch failed"), "connect")
+        self.assertEqual(c("Request timed out."), "timeout")
+        self.assertEqual(c("something odd"), "bad_response")
+
+    # --- each failure class moves the turn to the next hop --------------------------
+
+    async def _fails_over(self, primary_fault, kind, hang=False):
+        self.fail(**{PRIMARY: primary_fault})
+        t0 = time.monotonic()
+        text, statuses, _ = await self.turn("hi")
+        self.assertEqual(text, f"Resumed on {HOP2}. All good.")
+        self.assertIn("Trying another model...", statuses)
+        self.assertEqual(self.runs(), [(PRIMARY, "hi"), (HOP2, "RESUME")])
+        # Dave's message is sent once; the second prompt is the resume note.
+        prompts = [r["message"] for r in self.records("prompt")]
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(prompts[0].endswith("hi"))
+        self.assertTrue(prompts[1].startswith(pi_brain.RESUME_MESSAGE[:30]))
+        self.assertIn({"type": "set_model", "provider": "lrv-p01", "modelId": "qwen3.8-27b"},
+                      [{k: v for k, v in r.items() if k != "id"} for r in self.records("set_model")])
+        health = self.manager.failover.health()
+        self.assertEqual(health["current"], HOP2)
+        self.assertEqual(health["failures_by_kind"], {kind: 1})
+        self.assertEqual(health["last_failure"]["hop"], PRIMARY)
+        self.assertEqual(self.manager.failures, 0)  # the turn succeeded
+        if hang:
+            self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+            self.assertTrue(self.records("abort"))  # the hung request was cancelled
+
+    async def test_5xx_fails_over(self):
+        await self._fails_over("error:500: Internal Server Error", "server_error")
+
+    async def test_auth_fails_over(self):
+        await self._fails_over("error:401: Invalid API key", "auth")
+
+    async def test_missing_alias_fails_over(self):
+        await self._fails_over("error:404: model not found", "client_error")
+
+    async def test_connect_failure_fails_over(self):
+        await self._fails_over("error:Connection error.", "connect")
+
+    async def test_zombie_that_never_generates_fails_over_after_the_silence_timeout(self):
+        await self._fails_over("hang", "timeout", hang=True)
+
+    async def test_stall_after_a_thinking_delta_fails_over(self):
+        await self._fails_over("stall", "timeout", hang=True)
+
+    async def test_set_model_refusal_skips_the_hop(self):
+        self.fail(**{PRIMARY: "error:500: x", "_unknown": [HOP2]})
+        text, _, _ = await self.turn("hi")
+        self.assertEqual(text, f"Resumed on {HOP3}. All good.")
+        self.assertEqual(self.manager.failover.health()["failures_by_kind"], {"server_error": 1, "client_error": 1})
+        # Nothing was sent to the hop that does not exist, and the prompt went out once per sent hop.
+        self.assertEqual(self.runs(), [(PRIMARY, "hi"), (HOP3, "RESUME")])
+
+    async def test_every_hop_failing_raises_and_counts_one_failure(self):
+        self.fail(**{PRIMARY: "error:500: a", HOP2: "error:401: b", HOP3: "error:Connection error."})
+        with self.assertRaisesRegex(pi_brain.PiTurnError, "every model failed"):
+            await self.turn("hi")
+        self.assertEqual(self.manager.failures, 1)
+        health = self.manager.failover.health()
+        # Exhausted: the next turn probes from the top, not on the smallest hop.
+        self.assertEqual(health["current"], PRIMARY)
+        self.assertEqual(health["failures_by_kind"], {"server_error": 1, "auth": 1, "connect": 1})
+
+    # --- tools -----------------------------------------------------------------------
+
+    async def test_failure_after_a_tool_resumes_without_rerunning_it(self):
+        self.fail(**{PRIMARY: "tool_then_error:500: gone"})
+        session = _Session(self.manager)
+        text, statuses, _ = await self.turn("TOOL", session)
+        self.assertEqual(text, f"Resumed on {HOP2}. All good. Tools were kept.")
+        self.assertEqual(self.runs(), [(PRIMARY, "TOOL"), (HOP2, "RESUME_TOOLS")])
+        self.assertEqual(statuses.count("Email Search...") + statuses.count("hybrid_search..."), 1)
+        self.assertEqual(len(session.state.history_session.tool_calls), 1)
+        prompts = [r["message"] for r in self.records("prompt")]
+        self.assertEqual(prompts[1], pi_brain.RESUME_AFTER_TOOLS_MESSAGE)
+
+    # --- the watchdog ------------------------------------------------------------------
+
+    async def test_thinking_deltas_are_progress(self):
+        text, _, _ = await self.turn("THINK")  # 1.2 s of reasoning, 0.5 s silence limit
+        self.assertEqual(text, "Done thinking.")
+        self.assertEqual(self.manager.failover.health()["failovers"], 0)
+
+    async def test_a_running_tool_is_not_silence(self):
+        text, _, _ = await self.turn("SLOWTOOL")  # the tool takes 1.0 s
+        self.assertEqual(text, "The slow tool finished.")
+        self.assertEqual(self.manager.failover.health()["failovers"], 0)
+        self.assertEqual(self.records("abort"), [])
+
+    # --- the shared breaker --------------------------------------------------------------
+
+    async def test_new_processes_start_on_the_current_hop(self):
+        self.fail(**{PRIMARY: "error:500: x"})
+        await self.turn("hi", _Session(self.manager, conv_id=7))
+        self.fail()  # the primary is "back", but the breaker has not cooled down
+        text, _, _ = await self.turn("hi", _Session(self.manager, conv_id=8))
+        self.assertEqual(text, "Hello there. How are you?")
+        self.assertEqual(self.runs()[-1], (HOP2, "hi"))
+        # Started on the hop through the environment, so there was no set_model for it.
+        self.assertEqual(self.manager._new_process().env["PI_OCTAVIUS_MODEL"], HOP2)
+        self.assertEqual(len([r for r in self.records("set_model") if r["modelId"] == "qwen3.8-27b"]), 1)
+
+    async def test_live_processes_switch_before_their_next_turn(self):
+        await self.turn("hi", _Session(self.manager, conv_id=9))  # a process on the primary
+        self.fail(**{PRIMARY: "error:500: x"})
+        await self.turn("hi", _Session(self.manager, conv_id=7))  # moves the shared hop
+        self.fail()
+        before = len(self.records("set_model"))
+        await self.turn("again", _Session(self.manager, conv_id=9))
+        sets = self.records("set_model")
+        self.assertEqual(len(sets), before + 1)
+        self.assertEqual(sets[-1]["modelId"], "qwen3.8-27b")
+        self.assertEqual(self.runs()[-1], (HOP2, "again"))
+
+    async def test_primary_is_tried_again_after_the_cooldown(self):
+        self.manager.failover.cooldown_s = 0.3
+        self.fail(**{PRIMARY: "error:500: x"})
+        await self.turn("hi")
+        self.assertEqual(self.manager.failover.health()["current"], HOP2)
+        self.assertGreater(self.manager.failover.health()["cooldown_remaining"], 0)
+        self.fail()
+        await asyncio.sleep(0.4)
+        text, _, _ = await self.turn("hi")
+        self.assertEqual(self.runs()[-1], (PRIMARY, "hi"))
+        self.assertEqual(text, "Hello there. How are you?")
+        health = self.manager.failover.health()
+        self.assertEqual((health["current"], health["returns_to_primary"], health["cooldown_remaining"]), (PRIMARY, 1, 0.0))
+
+    async def test_primary_still_down_after_the_cooldown_fails_over_again(self):
+        self.manager.failover.cooldown_s = 0.3
+        self.fail(**{PRIMARY: "error:Connection error."})
+        await self.turn("hi")
+        await asyncio.sleep(0.4)
+        text, _, _ = await self.turn("hi")
+        self.assertEqual(text, f"Resumed on {HOP2}. All good.")
+        health = self.manager.failover.health()
+        self.assertEqual((health["failovers"], health["returns_to_primary"], health["current"]), (2, 1, HOP2))
+
+    async def test_concurrent_conversations_do_not_regress_the_hop(self):
+        state = self.manager.failover
+        self.assertEqual(state.fail(0, "connect", "x"), 1)
+        self.assertEqual(state.fail(0, "connect", "x"), 1)  # a second conversation hit hop 0 too
+        self.assertEqual((state.failovers, state.index), (1, 1))
+
+    # --- cancellation, overflow, budgets, repeated speech, generations -------------------------
+
+    def reconfigure(self, **over):
+        import dataclasses
+        self.cfg = dataclasses.replace(self.cfg, **over)
+        self.manager.cfg = self.cfg
+        pi_brain.settings.pi_brain = self.cfg
+
+    async def _until(self, pred, timeout=5.0):
+        end = time.monotonic() + timeout
+        while not pred() and time.monotonic() < end:
+            await asyncio.sleep(0.02)
+        self.assertTrue(pred())
+
+    async def test_cancel_during_the_prompt_ack_still_aborts_pi(self):
+        self.fail(_ack_delay={PRIMARY: 1.0})
+        task = asyncio.create_task(self.turn("hi"))
+        await self._until(lambda: len(self.records("prompt")) == 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(self.records("abort"))
+
+    async def test_cancel_during_the_ack_of_a_failover_attempt_aborts_pi(self):
+        self.fail(**{PRIMARY: "error:500: x", "_ack_delay": {HOP2: 1.0}})
+        task = asyncio.create_task(self.turn("hi"))
+        await self._until(lambda: len(self.records("prompt")) == 2)
+        self.assertEqual(self.records("abort"), [])
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(self.records("abort"))
+
+    def test_context_overflow_is_classified_not_blamed_on_the_hop(self):
+        c = pi_brain.classify_provider_error
+        for msg in (
+            '400: {"message":"This model\'s maximum context length is 65536 tokens. However, you requested 70000"}',
+            '400: {"error":{"code":400,"message":"the request exceeds the available context size, try increasing it",'
+            '"type":"exceed_context_size_error"}}',
+            "400: prompt is too long", "400: too many tokens",
+        ):
+            self.assertEqual(c(msg), "context_overflow", msg)
+        self.assertEqual(c("404: model not found"), "client_error")
+        self.assertEqual(c("400: Invalid schema for function"), "client_error")
+
+    async def test_context_overflow_moves_this_turn_to_a_bigger_window_only(self):
+        self.reconfigure(model_contexts={PRIMARY: 1000, HOP2: 5000, HOP3: 500})
+        self.fail(**{PRIMARY: "error:400: maximum context length is 1000 tokens"})
+        text, _, _ = await self.turn("hi")
+        self.assertEqual(text, f"Resumed on {HOP2}. All good.")  # HOP3 (500) is smaller: never chosen
+        health = self.manager.failover.health()
+        self.assertEqual((health["current"], health["failovers"], health["failures_by_kind"]), (PRIMARY, 0, {}))
+        self.assertEqual(health["context_overflows"], 1)
+        self.fail()
+        text, _, _ = await self.turn("hi")  # the next turn starts on the primary again
+        self.assertEqual(self.runs()[-1], (PRIMARY, "hi"))
+
+    async def test_context_overflow_with_no_bigger_hop_says_so_and_ends_the_turn(self):
+        self.reconfigure(model_contexts={PRIMARY: 1000, HOP2: 500, HOP3: 500})
+        self.fail(**{PRIMARY: "error:400: exceeds the available context size"})
+        text, _, session = await self.turn("hi")
+        self.assertEqual(text, pi_brain.CONTEXT_OVERFLOW_REPLY)
+        self.assertEqual(self.manager.failures, 0)
+        self.assertEqual(self.manager.failover.health()["failovers"], 0)
+        self.assertEqual(self.runs(), [(PRIMARY, "hi")])
+
+    async def test_a_slow_first_output_gets_the_larger_budget(self):
+        self.reconfigure(first_output_timeout_s=3.0)  # silence limit stays 0.5 s
+        text, _, _ = await self.turn("LATE")  # first output after 1.0 s
+        self.assertEqual(text, "Late but fine.")
+        self.assertEqual(self.manager.failover.health()["failovers"], 0)
+
+    async def test_silence_limit_applies_once_output_has_started(self):
+        self.reconfigure(first_output_timeout_s=3.0)
+        self.fail(**{PRIMARY: "stall"})  # one thinking delta, then nothing
+        t0 = time.monotonic()
+        await self.turn("hi")
+        self.assertLess(time.monotonic() - t0, 2.0)  # 0.5 s of silence, not the 3 s budget
+        self.assertEqual(self.manager.failover.health()["failures_by_kind"], {"timeout": 1})
+
+    async def test_hang_with_no_output_waits_the_first_output_budget(self):
+        self.reconfigure(first_output_timeout_s=1.2)
+        self.fail(**{PRIMARY: "hang"})
+        t0 = time.monotonic()
+        await self.turn("hi")
+        self.assertGreaterEqual(time.monotonic() - t0, 1.2)
+
+    async def test_failover_after_speech_does_not_repeat_it(self):
+        text, _, _ = await self.turn("SPEAKSTALL")
+        self.assertEqual(text.count("First part."), 1)
+        self.assertIn(f"Resumed on {HOP2}", text)
+        note = [r["message"] for r in self.records("prompt")][1]
+        self.assertIn("First part.", note)
+        self.assertIn("without repeating", note)
+
+    def test_stale_failure_does_not_move_the_shared_hop(self):
+        st = pi_brain.FailoverState(hops=(PRIMARY, HOP2, HOP3), cooldown_s=300.0)
+        gen = st.generation
+        self.assertEqual(st.fail(0, "connect", "x", gen), 1)
+        slow_gen = st.generation  # a slow attempt starts on HOP2 here
+        st.since -= 1000  # the cooldown passes: back on the primary
+        self.assertEqual(st.current(), 0)
+        self.assertGreater(st.generation, slow_gen)
+        self.assertEqual(st.fail(1, "timeout", "slow", slow_gen), 2)  # its own chain moves on
+        self.assertEqual((st.index, st.failovers, st.stale_failures), (0, 1, 1))
+        self.assertEqual(st.by_kind, {"connect": 1, "timeout": 1})  # stats still recorded
+
+    # --- second review round -------------------------------------------------------------------
+
+    async def test_empty_length_answer_tries_the_next_hop_without_moving_the_breaker(self):
+        self.fail(**{PRIMARY: "empty_length"})
+        text, _, _ = await self.turn("hi")
+        self.assertEqual(text, f"Resumed on {HOP2}. All good.")
+        health = self.manager.failover.health()
+        self.assertEqual((health["current"], health["failovers"], health["failures_by_kind"]), (PRIMARY, 0, {}))
+        self.assertEqual(health["turn_local"], {"empty_output": 1})
+        self.assertNotIn("I'm not sure", text)
+
+    async def test_empty_length_on_every_hop_ends_with_the_fallback_sentence(self):
+        self.fail(**{PRIMARY: "empty_length", HOP2: "empty_length", HOP3: "empty_length"})
+        text, _, _ = await self.turn("hi")
+        self.assertEqual(text, "I'm not sure how to respond to that.")
+        self.assertEqual(self.manager.failover.health()["failovers"], 0)
+
+    async def test_exhausted_chain_resets_to_the_primary(self):
+        st = pi_brain.FailoverState(hops=(PRIMARY, HOP2, HOP3), cooldown_s=300.0)
+        st.fail(0, "connect", "x")
+        st.fail(1, "connect", "x")
+        gen = st.generation
+        self.assertIsNone(st.fail(2, "connect", "x"))
+        self.assertEqual(st.index, 0)
+        self.assertGreater(st.generation, gen)
+
+    async def test_provider_error_after_speech_ends_the_turn_and_records_the_hop(self):
+        text, _, _ = await self.turn("SPEAKERR")
+        self.assertEqual(text, "Said it.")
+        health = self.manager.failover.health()
+        self.assertEqual((health["current"], health["failures_by_kind"]), (HOP2, {"server_error": 1}))
+        self.assertEqual(self.runs(), [(PRIMARY, "SPEAKERR")])  # no resume: it had spoken
+
+    async def test_a_started_tool_counts_as_run_for_the_resume_note(self):
+        self.fail(**{PRIMARY: "toolstart_then_error:500: x"})
+        await self.turn("TOOL")
+        prompts = [r["message"] for r in self.records("prompt")]
+        self.assertEqual(prompts[1], pi_brain.RESUME_AFTER_TOOLS_MESSAGE)
+
+    async def test_hung_tool_is_cut_off_with_an_apology_not_a_failover(self):
+        self.reconfigure(tool_timeout_s=0.5)
+        self.fail(**{PRIMARY: "toolhang"})
+        session = _Session(self.manager)
+        text, _, _ = await self.turn("TOOL", session)
+        self.assertEqual(text, pi_brain.TOOL_TIMEOUT_REPLY)
+        health = self.manager.failover.health()
+        self.assertEqual((health["failovers"], health["failures_by_kind"], health["current"]), (0, {}, PRIMARY))
+        self.assertEqual(self.manager.failures, 1)
+        self.assertTrue(self.records("abort"))
+        # Events drained while stopping were handled: the tool is recorded, and the dialog
+        # that appeared during the abort was cancelled so it cannot block settling.
+        self.assertEqual(len(session.state.history_session.tool_calls), 1)
+        replies = [r for r in self.records("extension_ui_response") if r["id"] == "zz"]
+        self.assertTrue(replies and replies[0]["cancelled"] is True)
+        # and the process is still usable
+        text, _, _ = await self.turn("hi", session)
+        self.assertEqual(text, "Hello there. How are you?")
+
+    async def test_slow_tool_inside_its_budget_is_not_cut_off(self):
+        self.reconfigure(tool_timeout_s=3.0)
+        text, _, _ = await self.turn("SLOWTOOL")
+        self.assertEqual(text, "The slow tool finished.")
+
+    async def test_cancel_while_a_confirm_is_pending_cancels_the_dialog(self):
+        session = _Session(self.manager)
+        task = asyncio.create_task(self.turn("CONFIRM", session))
+        await self._until(lambda: any(p.get("type") == "confirm_request" for p in session.sent))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        replies = [r for r in self.records("extension_ui_response") if r["id"] == "u1"]
+        self.assertTrue(replies and replies[0]["cancelled"] is True)
+        self.assertIsNone(session.state.pending_confirm)
+
+    async def test_health_does_not_trigger_the_return_to_the_primary(self):
+        self.manager.failover.cooldown_s = 0.1
+        self.manager.failover.fail(0, "connect", "x")
+        await asyncio.sleep(0.2)
+        for _ in range(3):
+            health = self.manager.health()["failover"]
+        self.assertEqual((health["current"], health["returns_to_primary"], health["cooldown_remaining"]), (HOP2, 0, 0.0))
+        self.assertEqual(self.manager.failover.current(), 0)  # the next turn does it
+        self.assertEqual(self.manager.failover.returns, 1)
+
+    # --- housekeeping ----------------------------------------------------------------------
+
+    async def test_auto_retry_is_off_before_the_first_prompt(self):
+        await self.turn("hi")
+        types = [r["type"] for r in self.records() if r["type"] in ("set_auto_retry", "prompt")]
+        self.assertEqual(types, ["set_auto_retry", "prompt"])
+        self.assertIs(self.records("set_auto_retry")[0]["enabled"], False)
+
+    async def test_warm_targets_the_current_hop(self):
+        await self.turn("hi")  # idle process on the primary
+        self.manager.failover.fail(0, "connect", "x")
+        self.manager.request_warm(7, reason="test")
+        end = time.monotonic() + 5
+        while not self.manager.warm_stats.sent and time.monotonic() < end:
+            await asyncio.sleep(0.02)
+        order = [r["type"] + ":" + str(r.get("modelId") or r.get("message")) for r in self.records()
+                 if r["type"] in ("set_model", "prompt")][-2:]
+        self.assertEqual(order, ["set_model:qwen3.8-27b", "prompt:/warm"])
+        # and a short-lived warm process starts on the hop too
+        self.assertEqual(self.manager._new_process(["--no-session"]).model, HOP2)
+
+    async def test_health_has_a_failover_block(self):
+        health = self.manager.health()["failover"]
+        self.assertEqual(health["hops"], [PRIMARY, HOP2, HOP3])
+        self.assertFalse(health["failed_over"])
+        self.assertIsNone(health["last_failure"])
 
 
 class WarmTriggerTests(unittest.IsolatedAsyncioTestCase):

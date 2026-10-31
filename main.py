@@ -11,6 +11,7 @@ from history_enrichment import drain_inflight
 from history_store import assert_history_serveable
 from mcp_manager import MCPManager
 from pi_brain import PiProcessManager
+from pi_tools_server import PiToolsServer
 from settings import settings
 from routes.conversations import router as conversations_router
 from routes.inbox import router as inbox_router
@@ -73,6 +74,15 @@ async def lifespan(app: FastAPI):
     app.state.pi_brain = None
     if settings.pi_brain.enabled:
         app.state.pi_brain = PiProcessManager(settings.pi_brain)
+        # Octavius's own tools for pi, on a loopback-only port (never on this app).
+        # If it cannot start, pi still runs, without those tools.
+        app.state.pi_tools = PiToolsServer(port=settings.pi_brain.tools_port)
+        try:
+            await app.state.pi_tools.start()
+            app.state.pi_brain.tools_server = app.state.pi_tools
+        except Exception:
+            log.exception("pi tools server failed to start; pi runs without Octavius's tools")
+            app.state.pi_tools = None
         app.state.pi_brain.start_reaper()
         # Warm system prompt + tools in the background (pi /warm, never awaited).
         app.state.pi_brain.warm_static_prefix("startup")
@@ -80,6 +90,8 @@ async def lifespan(app: FastAPI):
     yield
     if app.state.pi_brain is not None:
         await app.state.pi_brain.shutdown()
+    if getattr(app.state, "pi_tools", None) is not None:
+        await app.state.pi_tools.stop()
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
     # Nothing spawns detached embeds any more (see history_enrichment), so this
