@@ -1224,6 +1224,10 @@ async def _handle_ui_request(session, proc: PiRpcProcess, ev: dict) -> AsyncGene
     question = f"Before I go ahead: {_describe_confirm(title, detail)} Shall I? "
     await session.send_payload({"type": "confirm_request", "title": title, "message": detail})
     yield question
+    # The question is its own reply; what follows Dave's answer is the next one.
+    commit = getattr(session, "commit_reply_so_far", None)
+    if commit:
+        await commit()
     fut = asyncio.get_running_loop().create_future()
     session.state.pending_confirm = fut
     # The question has been spoken; re-arm the client's mic for the answer.

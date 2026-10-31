@@ -1080,6 +1080,10 @@ class WebSocketSessionHandler:
         if pending is not None and not pending.done():
             from pi_brain import is_yes
             pending.set_result(is_yes(user_text))
+            if self.state.history_session:
+                # The answer is a turn of its own in history, between the question and the result.
+                self._confirm_answer_task = asyncio.create_task(
+                    self.state.history_session.add_message_async(role="user", content=user_text))
             return
         if self.state.turn_task and not self.state.turn_task.done():
             log.warning("Turn already in flight; dropping new turn request")
@@ -1146,6 +1150,8 @@ class WebSocketSessionHandler:
                 await self.send_json("status", text)
 
             full_reply_parts = []
+            # commit_reply_so_far (pi's confirm question) sends and clears these mid-turn.
+            self._turn_reply = (full_reply_parts, turn_model)
             first_sentence = True
             agent_error: Exception | None = None
             if use_pi:
@@ -1221,6 +1227,25 @@ class WebSocketSessionHandler:
                 # and continuous mode re-arms recording. This must run on
                 # every path: success, empty reply, or exception.
                 await self.send_json("status", "audio_done")
+
+    async def commit_reply_so_far(self) -> None:
+        """Send and record what this turn has said so far as a reply of its own.
+
+        pi_brain calls it after speaking a confirm question, so the question shows (and is
+        stored) before Dave's yes/no and the turn's final `response` holds only what came
+        after, instead of repeating the question under his answer.
+        """
+        reply = getattr(self, "_turn_reply", None)
+        if not reply:
+            return
+        parts, model = reply
+        text = "".join(parts).strip()
+        parts.clear()
+        if not text:
+            return
+        await self.send_json("response", text)
+        if self.state.history_session:
+            await self.state.history_session.add_message_async(role="assistant", content=text, model=model)
 
     async def cancel_reader_task(self):
         if self.state.reader_task and not self.state.reader_task.done():

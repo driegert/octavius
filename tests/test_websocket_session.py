@@ -318,6 +318,26 @@ class RunTurnAudioDoneTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_confirm_question_is_its_own_response(self):
+        """pi's confirm question is committed before Dave answers, so the final
+        response holds only what came after it instead of repeating it."""
+        async def run():
+            import json
+            handler, ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                yield "Before I go ahead: create task. Shall I? "
+                await handler.commit_reply_so_far()
+                yield "Done."
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                await handler.run_turn("make a task", source="voice")
+
+            responses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "response"]
+            self.assertEqual(responses, ["Before I go ahead: create task. Shall I?", "Done."])
+
+        asyncio.run(run())
+
     def test_response_delta_streams_each_sentence_before_final_response(self):
         """Text clients (the Matrix sidecar) render progressively from
         response_delta; `response` still carries the authoritative full text."""
