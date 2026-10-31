@@ -828,7 +828,7 @@ re-stats the file against `IMAGE_MAX_BYTES` rather than trusting
 `size_bytes`; every rejection sends `status: audio_done` too, so a rejected
 frame can't leave a client's turn hanging. Both this
 directory and the Matrix spool (the sidecar does no cleanup of its own) are
-swept by `scripts/octavius-media-gc` (30-day mtime retention, dry run unless
+swept by `scripts/octavius-media-gc` (45-day mtime retention, dry run unless
 `--apply`; daily via `deploy/octavius-media-gc.{service,timer}`, not installed
 by default). A re-attached thread whose image was swept just loses the pixels
 (`_rehydrate_image_content` falls back to the text placeholder). The Caddy

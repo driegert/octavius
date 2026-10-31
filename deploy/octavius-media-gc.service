@@ -7,11 +7,11 @@
 # Dry-run first: scripts/octavius-media-gc
 
 [Unit]
-Description=Delete Octavius media spool files older than 30 days
+Description=Delete Octavius media spool files older than 45 days
 RequiresMountsFor=/media/extra_stuff
 ConditionPathIsMountPoint=/media/extra_stuff
 
 [Service]
 Type=oneshot
 WorkingDirectory=/home/dave/school_lab/git_repositories/octavius
-ExecStart=/usr/bin/uv run python scripts/octavius-media-gc --apply --days 30
+ExecStart=/usr/bin/uv run python scripts/octavius-media-gc --apply --days 45

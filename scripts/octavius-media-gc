@@ -10,7 +10,7 @@ this script manages both. The directory list is `OCTAVIUS_MEDIA_SPOOL_DIRS`
 (colon-separated), else those two defaults; `--dir` overrides it.
 
 Selection: only regular files that sit DIRECTLY inside a spool dir, whose
-mtime is more than `--days` (default 30) old. Symlinks are never followed or
+mtime is more than `--days` (default 45) old. Symlinks are never followed or
 removed, subdirectories are never entered, and deletion goes through a
 directory fd so nothing outside the dir can be reached. Docproc output that
 lands next to a spooled PDF is a regular file in the same dir, so it ages out
@@ -134,7 +134,7 @@ def fmt_bytes(n: int) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--days", type=float, default=30, help="retention age in days (default 30)")
+    ap.add_argument("--days", type=float, default=45, help="retention age in days (default 45)")
     ap.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
     ap.add_argument("--dir", action="append", help="spool dir (repeatable); overrides env/defaults")
     args = ap.parse_args(argv)
