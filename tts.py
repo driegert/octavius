@@ -32,6 +32,13 @@ _WS = re.compile(r'[ \t]{2,}')
 # "et al." in citations: the engine reads the period as a sentence end and pauses
 # mid-sentence. Only the text sent to TTS changes; the document keeps the period.
 _ET_AL = re.compile(r'\b(et al)\.', re.IGNORECASE)
+# Dotted initialisms (U.S., U.K.): Phonon garbles one that ends the text ("published
+# by U.S." came back as "by you later state" with extra babble) and reads "US" cleanly.
+_INITIALISM = re.compile(r'\b(?:[A-Z]\.){2,}(?=[\s,;:)]|$)')
+
+
+def _undot(m: re.Match) -> str:
+    return m.group(0).replace('.', '') + ('.' if m.end() == len(m.string) else '')
 
 
 def speechify(text: str) -> str:
@@ -52,6 +59,7 @@ def speechify(text: str) -> str:
     cleaned = _MD_HEADING.sub('', cleaned)
     cleaned = _MD_LIST.sub('', cleaned)        # only line-leading markers (real lists)
     cleaned = _ET_AL.sub(r'\1', cleaned)
+    cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()
 

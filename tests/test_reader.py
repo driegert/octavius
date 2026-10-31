@@ -81,6 +81,14 @@ class ReaderTests(unittest.TestCase):
                          ["Shown by Smith et al.", "The next differs."])
         self.assertEqual(split("One. Two! Three? Four."), ["One.", "Two!", "Three?", "Four."])
 
+    def test_initialisms_and_lowercase_continuations_do_not_end_sentences(self):
+        split = reader_text.split_sentences
+        self.assertEqual(
+            split("Tano et al. analyzed releases published by U.S. state governors. Next."),
+            ["Tano et al. analyzed releases published by U.S. state governors.", "Next."])
+        self.assertEqual(split("The U.S. Senate agreed. Thomson, D. J. Spectra. It rose approx. twice. Done."),
+                         ["The U.S. Senate agreed.", "Thomson, D. J. Spectra.", "It rose approx. twice.", "Done."])
+
     def test_page_break_mid_sentence_is_rejoined(self):
         join = reader_text.join_page_breaks
         self.assertEqual(join("The spectrum was estimated with the\n\nmultitaper method. Next."),

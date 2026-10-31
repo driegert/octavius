@@ -10,6 +10,12 @@ class SpeechifyTests(unittest.TestCase):
         self.assertEqual(speechify("Thomson et al."), "Thomson et al")
         self.assertEqual(speechify("pet al. fetal."), "pet al. fetal.")
 
+    def test_dotted_initialisms_lose_their_dots(self):
+        self.assertEqual(speechify("published by U.S."), "published by US.")
+        self.assertEqual(speechify("by U.S. state governors"), "by US state governors")
+        self.assertEqual(speechify("the U.K., and U.S.A.)"), "the UK, and USA)")
+        self.assertEqual(speechify("e.g. D. J. Thomson"), "e.g. D. J. Thomson")
+
     def test_strips_bold_and_leading_list_marker(self):
         # The motivating case: "**Important news:** \n1) the weather ..."
         out = speechify("**Important news:**\n1) the weather looks clear")
