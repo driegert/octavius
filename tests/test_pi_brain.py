@@ -26,7 +26,7 @@ FAKE = Path(__file__).with_name("fake_pi_rpc.py")
 
 
 def _cfg(launcher: str, **over) -> PiBrainSettings:
-    base = dict(brain="pi", launcher=launcher, pi_bin="pi", model="fake/model",
+    base = dict(brain="pi", launcher=launcher, pi_bin="pi", model="fake/model", path_prepend="",
                 idle_reap_s=3600, turn_timeout_s=20, confirm_timeout_s=5)
     base.update(over)
     return PiBrainSettings(**base)
@@ -897,6 +897,14 @@ class PiBrainHelperTests(unittest.TestCase):
             env = pi_brain.child_env(_cfg("/x"))
         self.assertNotIn("OCTAVIUS_LR_API_KEY", env)
         self.assertEqual(env["PI_OCTAVIUS_MODEL"], "fake/model")
+
+    def test_child_env_prepends_pi_path(self):
+        # The user service's PATH finds the system's Node 18 first; pi 1.4.0 needs newer.
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin"}):
+            env = pi_brain.child_env(_cfg("/x", path_prepend="/node24/bin"))
+            plain = pi_brain.child_env(_cfg("/x"))
+        self.assertEqual(env["PATH"], "/node24/bin" + os.pathsep + "/usr/bin")
+        self.assertEqual(plain["PATH"], "/usr/bin")
 
     def test_wants_pi(self):
         conv = Conversation()

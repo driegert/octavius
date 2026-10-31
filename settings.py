@@ -155,6 +155,9 @@ class PiBrainSettings:
     pi_bin: str
     model: str
     idle_reap_s: float
+    # Directories put in front of PATH for pi only (colon-separated). The user
+    # service's PATH finds the system's Node 18 first, which cannot run pi 1.4.0.
+    path_prepend: str
     turn_timeout_s: float
     confirm_timeout_s: float
     # /warm cache warming (rollout step 3): fire-and-forget, never on a turn's path.
@@ -827,6 +830,7 @@ def load_settings() -> Settings:
             ),
             # The user service's PATH has no ~/.local/bin, so name pi explicitly.
             pi_bin=_env_str("OCTAVIUS_PI_BIN", os.path.expanduser("~/.local/bin/pi")),
+            path_prepend=_env_str("OCTAVIUS_PI_PATH", ""),
             # Passed to the launcher as PI_OCTAVIUS_MODEL; also what history records.
             model=_env_str("OCTAVIUS_PI_MODEL", "lb-unified/gemma4-26b-a4b"),
             # Hours, not minutes: a reaped process loses its warm session and the

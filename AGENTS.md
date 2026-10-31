@@ -315,9 +315,16 @@ three start the process if needed) and `restore_session` warm the conversation's
 process; startup and recovery (after a failed warm or turn, retried with backoff
 until one succeeds) warm system + tools through a short-lived `--no-session`
 process. All fire-and-forget (`PiProcessManager.request_warm`); a process with no
-turns yet is still seeded. Knobs:
+turns yet is still seeded. **Live since 2026-10-31** (`OCTAVIUS_BRAIN=pi` in
+`~/.config/octavius/env`; roll back by setting `native` and restarting). pi's own key
+for lilripper `:8020` is `PI_AGENT_LR_API_KEY` (pi_harness models.json, provider
+`lrv-p01`), exported by the service drop-in the same way as `OCTAVIUS_LR_API_KEY`;
+without it the `:8020` failover hop is invisible to pi. Knobs:
 `OCTAVIUS_PI_LAUNCHER`, `OCTAVIUS_PI_BIN` (the user service's PATH lacks
-`~/.local/bin`), `OCTAVIUS_PI_MODEL`, `OCTAVIUS_PI_TURN_TIMEOUT_S` (600),
+`~/.local/bin`), `OCTAVIUS_PI_PATH` (prepended to pi's PATH only: the service's PATH
+finds `/usr/bin/node` 18, which cannot run pi 1.4.0 — the live env points it at nvm's
+Node 24, so bump it when nvm's version changes; without it every pi start fails with
+`enableCompileCache` and every warm reports "pi process exited"), `OCTAVIUS_PI_MODEL`, `OCTAVIUS_PI_TURN_TIMEOUT_S` (600),
 `OCTAVIUS_PI_CONFIRM_TIMEOUT_S` (55), `OCTAVIUS_PI_WARM` (on),
 `OCTAVIUS_PI_WARM_DEBOUNCE_S` (5), `OCTAVIUS_PI_WARM_RETRY_S` (60), `OCTAVIUS_PI_TOOLS_PORT` (8032). `/health` → `pi_brain`.
 **Failover** (Octavius-driven over RPC, `set_model`): hops `OCTAVIUS_PI_MODEL` then `OCTAVIUS_PI_FALLBACK_MODELS`

@@ -278,6 +278,9 @@ def child_env(cfg, model: str | None = None) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("OCTAVIUS_")}
     env["PI_BIN"] = cfg.pi_bin
     env["PI_OCTAVIUS_MODEL"] = model or cfg.model
+    prepend = getattr(cfg, "path_prepend", "")
+    if prepend:
+        env["PATH"] = prepend + os.pathsep + env.get("PATH", "")
     return env
 
 
