@@ -65,7 +65,7 @@ class ModelsFileTests(unittest.TestCase):
         _, st = self._load()
         lb = "http://lilbuddy:8010/v1/chat/completions"
         lr = "http://lilripper:8020/v1/chat/completions"
-        ts = "http://triplestuffed:8010/v1/chat/completions"
+        ts = "http://workhorse:8010/v1/chat/completions"
         self.assertEqual(
             [(e["url"], e["model"]) for e in st.llm_chain],
             [(lb, "gemma4-26b-a4b"), (lr, "qwen3.8-27b"), (ts, "gemma4-12b")],

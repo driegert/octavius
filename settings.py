@@ -581,7 +581,7 @@ DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
 
 # Origins whose bearer token may be supplied by the dedicated
 # OCTAVIUS_LR_API_KEY env var ("LR" = lilripper). The scope is the *host*, not
-# the port: `lilbuddy:8010` (main-chain fallback) and `triplestuffed:8010` also
+# the port: `lilbuddy:8010` (main-chain fallback), `workhorse:8010` and `triplestuffed:8010` also
 # listen on 8010 and are OPEN — they must never receive this header.
 #
 # Both lilripper router ports went behind the same token: `:8020` began
@@ -641,21 +641,22 @@ def load_settings() -> Settings:
     #     warm. Fallback only: Dave loads other models there by hand, and as a
     #     primary every turn would evict them. lilripper:8010 now serves only
     #     glm-5.3-flash and is not used by Octavius.
-    #  3. triplestuffed:8010 gemma4-12b — third host, so voice survives lilbuddy
-    #     and lilripper both being down. Text-only (image turns use the vision
-    #     chain), --parallel 4.
+    #  3. workhorse:8010 gemma4-12b — third host, so voice survives lilbuddy
+    #     and lilripper both being down. vLLM, open, 64K ctx, text-only (image
+    #     turns use the vision chain). Was triplestuffed:8010 until 2026-10-31,
+    #     when triplestuffed stopped serving gemma4-12b.
     llm_chain = _role_chain(
         "main",
         "OCTAVIUS_LLM_CHAIN",
         [
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
-            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "gemma4-12b"},
+            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gemma4-12b"},
         ],
     )
-    # Subagents (inline consult_specialist) run on triplestuffed:8010 gemma4-12b.
-    # `capacity` 3 of its --parallel 4 leaves one slot for main hop 3, the reader
-    # and summaries, which share the model. :8020 is the HTTP-level fallback
+    # Subagents (inline consult_specialist) run on workhorse:8010 gemma4-12b
+    # (vLLM). `capacity` 3 leaves room for main hop 3, the reader and summaries,
+    # which share the model, and for pi_harness agents that also use it. :8020 is the HTTP-level fallback
     # (capacity is a guess: vLLM's limit is not readable from /v1/models); the
     # dispatcher keeps only the first role=fallback entry. The model is resolved
     # per ENDPOINT URL (subagent.py::_model_for_url), not per domain.
@@ -663,13 +664,13 @@ def load_settings() -> Settings:
         "subagent",
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://triplestuffed:8010/v1/chat/completions", "model": "gemma4-12b", "role": "primary", "capacity": 3},
+            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gemma4-12b", "role": "primary", "capacity": 3},
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b", "role": "fallback", "capacity": 2},
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS
     # frames). Kept separate from llm_chain because that chain's third hop is
-    # chosen for availability, not modality: triplestuffed's gemma4-12b is
+    # chosen for availability, not modality: workhorse's gemma4-12b is
     # text-only and must never be added here. Check architecture.input_modalities
     # AND --ubatch-size (>= ~1152 for a gemma4v image) before adding a hop.
     vision_llm_chain = _role_chain(
@@ -703,10 +704,9 @@ def load_settings() -> Settings:
     _reader_fb_model = None if _reader_in_file else "qwen3.8-27b"
     reader = ReaderSettings(
         directory=_env_str("OCTAVIUS_READER_DIR", "/home/dave/octavius-reader"),
-        llm_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_URL", "http://triplestuffed:8010/v1/chat/completions"),
-        # gemma4-12b on triplestuffed, the same alias as that host's other
-        # consumers (subagent, summary, main hop 3) so the router does not thrash
-        # between resident models. Verify the alias is live after router rebuilds.
+        llm_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_URL", "http://workhorse:8010/v1/chat/completions"),
+        # gemma4-12b on workhorse, the same model as that host's other consumers
+        # (subagent, summary, main hop 3). Verify the alias is live after rebuilds.
         llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "gemma4-12b"),
         # The reader is single-endpoint per call, but the role's second entry is
         # its failover target (reader_text.py tries it before giving up to
@@ -743,12 +743,12 @@ def load_settings() -> Settings:
         tool_labels=_env_json("OCTAVIUS_TOOL_LABELS", DEFAULT_TOOL_LABELS),
         mcp_servers=_env_json("OCTAVIUS_MCP_SERVERS", DEFAULT_MCP_SERVERS),
         system_prompt=_env_str("OCTAVIUS_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
-        # triplestuffed gemma4-12b primary, lilripper:8020 qwen3.8-27b fallback.
+        # workhorse gemma4-12b primary, lilripper:8020 qwen3.8-27b fallback.
         # Summaries fire at conversation END, long after Dave has moved on, so
         # :8020 stays the fallback: a background job must not evict a model he
         # loaded there by hand. SummaryClient carries a model PER URL and sends
         # auth_headers, so the authed fallback is fine.
-        summary_url=_role_single("summary", "url", "OCTAVIUS_SUMMARY_URL", "http://triplestuffed:8010/v1/chat/completions"),
+        summary_url=_role_single("summary", "url", "OCTAVIUS_SUMMARY_URL", "http://workhorse:8010/v1/chat/completions"),
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8020/v1/chat/completions"),
         summary_model=_role_single("summary", "model", "OCTAVIUS_SUMMARY_MODEL", "gemma4-12b"),
         # The two endpoints do not share an alias; the fallback needs its own
