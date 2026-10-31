@@ -206,5 +206,46 @@ class DocumentRouteLevelTests(unittest.TestCase):
         self.assertEqual(doc["total_sentences"], 5)
 
 
+
+@unittest.skipIf(TestClient is None, "fastapi not installed")
+class MarkFinishedTests(unittest.TestCase):
+    def _post(self, db_path, body, doc_id=1):
+        app = FastAPI()
+        app.include_router(reader_api.router)
+        app.state.db_path = db_path
+        with TestClient(app) as client:
+            return client.post(f"/api/reader/documents/{doc_id}/finished", json=body)
+
+    def test_finished_sets_full_progress_and_rewinds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp, last_chunk=1, last_sentence=0)
+            resp = self._post(db_path, {"finished": True})
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json(), {"id": 1, "total_sentences": 5, "progress_sentences": 5})
+            self.assertEqual(_row(db_path), (0, 0, 5, 5))
+            docs = reader_store.list_documents(sqlite3.connect(db_path))
+            self.assertEqual(docs[0]["progress_sentences"], docs[0]["total_sentences"])
+
+    def test_unread_clears_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp, last_chunk=2)
+            self._post(db_path, {"finished": True})
+            resp = self._post(db_path, {"finished": False})
+            self.assertEqual(resp.json()["progress_sentences"], 0)
+            self.assertEqual(_row(db_path), (0, 0, 5, 0))
+
+    def test_rejects_non_bool_and_non_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp, last_chunk=1)
+            for body in ({"finished": "false"}, {"finished": 1}, {}, [True]):
+                self.assertEqual(self._post(db_path, body).status_code, 400, body)
+            self.assertEqual(_row(db_path), (1, 0, None, None))
+
+    def test_missing_is_404_and_unready_is_409(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp, status="processing")
+            self.assertEqual(self._post(db_path, {"finished": True}, doc_id=9).status_code, 404)
+            self.assertEqual(self._post(db_path, {"finished": True}).status_code, 409)
+
 if __name__ == "__main__":
     unittest.main()

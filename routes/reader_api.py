@@ -2,7 +2,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from db import connect_db
-from reader_store import delete_document, get_document, list_documents, load_speech_data, sentences_before
+from reader_store import (
+    delete_document, get_document, list_documents, load_speech_data, sentences_before, set_finished,
+)
 from reader_ingest_service import (
     ReaderIngestError,
     append_reader_document,
@@ -104,6 +106,27 @@ async def reader_rename(doc_id: int, request: Request):
         return JSONResponse(result)
     except ReaderIngestError as exc:
         return JSONResponse({"error": exc.message}, status_code=exc.status_code)
+
+
+@router.post("/api/reader/documents/{doc_id}/finished")
+async def reader_set_finished(doc_id: int, request: Request):
+    """{"finished": true} marks the document read without playing it to the end;
+    false marks it unread. Either way the next Play starts from the beginning."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "Expected a JSON object"}, status_code=400)
+    # Strict: bool("false") is True, and this overwrites the saved place.
+    if not isinstance(body, dict) or not isinstance(body.get("finished"), bool):
+        return JSONResponse({"error": "Expected {\"finished\": true|false}"}, status_code=400)
+    with connect_db(request.app.state.db_path) as conn:
+        doc = get_document(conn, doc_id)
+        if not doc:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        result = set_finished(conn, doc_id, body["finished"])
+    if result is None:
+        return JSONResponse({"error": "Only a ready document can be marked"}, status_code=409)
+    return JSONResponse(result)
 
 
 @router.delete("/api/reader/documents/{doc_id}")

@@ -63,6 +63,25 @@ def _backfill_progress(conn: sqlite3.Connection, doc_id: int, speech_file: str |
     return total, progress
 
 
+def set_finished(conn: sqlite3.Connection, doc_id: int, finished: bool) -> dict | None:
+    """Mark a ready document finished (or unread) without listening to the end.
+
+    Both rewind the place to the start, as reading to the end does; only the progress
+    differs. Returns None when the row is missing or not ready, or its speech file is gone.
+    """
+    doc = get_document(conn, doc_id)
+    if not doc or doc["status"] != "ready":
+        return None
+    speech = load_speech_data(doc)
+    if not speech:
+        return None
+    total = sum(len(c["sentences"]) for c in speech.get("chunks") or [])
+    progress = total if finished else 0
+    update_document(conn, doc_id, last_chunk=0, last_sentence=0,
+                    total_sentences=total, progress_sentences=progress)
+    return {"id": doc_id, "total_sentences": total, "progress_sentences": progress}
+
+
 def get_document(conn: sqlite3.Connection, doc_id: int) -> dict | None:
     row = conn.execute(
         """SELECT id, title, source_type, source_path, saved_item_id,

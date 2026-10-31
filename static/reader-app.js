@@ -17,6 +17,7 @@
   const statusFilter = $('status-filter');
   const playerTitle = $('player-title');
   const playerEdit = $('player-edit');
+  const playerFinish = $('player-finish');
   const connEl = $('conn-state');
   const pageEl = $('page');
   const emptyEl = $('empty-state');
@@ -201,6 +202,8 @@
       else if (currentChunk > 0 || currentSentence > 0) text = 'Paused';
       else text = 'Ready';
     }
+    playerFinish.hidden = !(currentDoc && currentDoc.status === 'ready');
+    playerFinish.textContent = finished ? 'Mark unread' : 'Mark finished';
     orb.setState(state);
     statusEl.textContent = text;
     statusEl.dataset.tone = tone;
@@ -901,6 +904,7 @@
     emptyEl.hidden = false;
     playerTitle.textContent = 'Reader';
     playerEdit.hidden = true;
+    playerFinish.hidden = true;
     buildToc(null);
     showProgress(0);
     markCurrentInList();
@@ -1127,6 +1131,7 @@
           <span class="doc-bar" hidden><span></span></span>
         </button>
         <div class="doc-actions">
+          ${doc.status === 'ready' ? finishButton(doc) : ''}
           ${doc.status === 'failed' ? `<button class="icon-btn" data-act="retry" title="Retry" aria-label="Retry ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.7-5.6L20 8.7M20 4v4.7h-4.7M20 12a8 8 0 0 1-13.7 5.6L4 15.3M4 20v-4.7h4.7"/></svg></button>` : ''}
           <button class="icon-btn danger" data-act="delete" title="Delete" aria-label="Delete ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg></button>
         </div>`;
@@ -1154,6 +1159,11 @@
       retryDoc(id);
       return;
     }
+    if (act && act.dataset.act === 'finish') {
+      const p = doc ? progressOf(doc) : null;
+      markFinished(id, !(p && p.done));
+      return;
+    }
     if (act && act.dataset.act === 'delete') {
       if (!confirm(`Delete “${doc ? doc.title : 'this document'}”? This can’t be undone.`)) return;
       await fetch(`/api/reader/documents/${id}`, { method: 'DELETE' });
@@ -1165,6 +1175,61 @@
       if (currentDocId === id && currentDoc && currentDoc.status === 'ready') { closeRail(); return; }
       openDocument(id);
     }
+  });
+
+  function finishButton(doc) {
+    const p = progressOf(doc);
+    const label = p && p.done ? 'Mark unread' : 'Mark finished';
+    const icon = p && p.done
+      ? '<path d="M4 12a8 8 0 1 0 2.3-5.7M4 4v4.7h4.7"/>'
+      : '<path d="M5 12.5l4.5 4.5L19 7.5"/>';
+    return `<button class="icon-btn" data-act="finish" title="${label}" aria-label="${label}: ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${icon}</svg></button>`;
+  }
+
+  // Marks a ready document finished (or unread) without listening to the end. Either
+  // way the place rewinds to the start, as reading to the end does.
+  async function markFinished(id, done) {
+    if (id === currentDocId && isPlaying) {
+      // No place on this stop: it would be saved over the mark. A paced stream saves none of its own.
+      playSeqId++;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_stop' }));
+      clearAudioQueue();
+      isPlaying = false;
+    }
+    let data;
+    try {
+      const resp = await fetch(`/api/reader/documents/${id}/finished`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ finished: done }),
+      });
+      data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || resp.statusText);
+    } catch (e) {
+      setNotice(`Couldn’t mark it ${done ? 'finished' : 'unread'}: ${e.message || e}`, 'error');
+      return;
+    }
+    setDocProgress(id, data.progress_sentences, data.total_sentences);
+    const row = docList.querySelector(`.doc[data-id="${id}"] [data-act="finish"]`);
+    const entry = docs.find((d) => d.id === id);
+    if (row && entry) row.outerHTML = finishButton(entry);
+    if (id === currentDocId && currentDoc) {
+      currentDoc.progress_sentences = data.progress_sentences;
+      currentDoc.last_chunk = 0;
+      currentDoc.last_sentence = 0;
+      currentChunk = firstChunk();
+      currentSentence = 0;
+      finished = done;
+      stopped = false;
+      setNotice('');
+      showProgress(0);
+      markSentence(currentChunk, currentSentence, false);
+      refreshTransport();
+    }
+  }
+
+  playerFinish.addEventListener('click', () => {
+    if (currentDocId) markFinished(currentDocId, !finished);
   });
 
   async function retryDoc(id) {

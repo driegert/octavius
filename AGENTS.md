@@ -769,6 +769,9 @@ Still live:
   blanks included; equal to the total once read to the end, while `last_chunk`/`last_sentence` rewind to 0 so the
   next play starts over). Playback writes them per sentence; `_write_speech` recomputes them on ingest/append/replace;
   rows from before 2026-10-30 are backfilled lazily by `list_documents` (and derived in `GET /documents/{id}`).
+  `POST /api/reader/documents/{id}/finished {"finished": true|false}` (`reader_store.set_finished`, ready documents
+  only, strict bool) marks a document finished or unread without playing it; both rewind the place to the start.
+  `/reader` has a header button and a row action for it; the open document's playback is stopped first.
 - Sections carry `level` (1-3 from `#`/`##`/`###`) for the page's table of contents. Documents converted earlier
   have none (clients treat that as 1); `scripts/reader-backfill-heading-levels [--apply]` restores it where the
   source markdown still exists.
