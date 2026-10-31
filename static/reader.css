@@ -670,6 +670,29 @@ body { overflow: hidden; }
 
 .chat-status { margin: 0; padding: 0 1.2rem 0.4rem; min-height: 1.4em; color: var(--ink-3); font-size: 0.78rem; }
 
+.chat-about {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0.9rem 0.3rem;
+  padding: 0.25rem 0.3rem 0.25rem 0.6rem;
+  border-left: 2px solid var(--violet);
+  color: var(--ink-2);
+  font-size: 0.78rem;
+}
+.chat-about[hidden] { display: none; }
+.chat-about span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-about-clear {
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.3rem;
+}
+.chat-about-clear:hover { color: var(--ink); }
+
 .chat-form {
   display: flex;
   align-items: flex-end;

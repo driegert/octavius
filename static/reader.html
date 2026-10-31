@@ -200,6 +200,10 @@
 
   <div class="chat-log" id="chat-log" aria-live="polite"></div>
   <p class="chat-status" id="chat-status" role="status"></p>
+  <p class="chat-about" id="chat-about" hidden>
+    <span id="chat-about-text"></span>
+    <button type="button" class="chat-about-clear" id="chat-about-clear" aria-label="Ask about the marked sentence instead" title="Ask about the marked sentence instead">×</button>
+  </p>
 
   <form class="chat-form" id="chat-form" autocomplete="off">
     <textarea id="chat-input" rows="1" placeholder="Ask about this document" aria-label="Message" disabled></textarea>

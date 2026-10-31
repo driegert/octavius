@@ -9,6 +9,12 @@ import local_tool_reader
 
 
 class LocalToolReaderTests(unittest.TestCase):
+    def setUp(self):
+        # These tests write their files under the system temp dir; allow it as a source.
+        roots = patch.object(local_tool_reader, "_tool_source_roots", return_value=[tempfile.gettempdir()])
+        roots.start()
+        self.addCleanup(roots.stop)
+
     def test_read_document_requires_database_connection(self):
         # The connection is a precondition for every branch, so it is checked
         # before the path is resolved.
@@ -20,7 +26,35 @@ class LocalToolReaderTests(unittest.TestCase):
         result = asyncio.run(
             local_tool_reader.read_document({"path": "/tmp/missing.pdf"}, session=session)
         )
-        self.assertEqual(result, "Error: file not found: /tmp/missing.pdf")
+        self.assertEqual(result, local_tool_reader.SOURCE_REFUSED)
+
+    def test_model_tools_refuse_files_outside_the_source_folders(self):
+        # A path from an injected instruction must not load: the reader chat can read
+        # a document back and has the open web.
+        session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            hidden = Path(root) / ".config"
+            hidden.mkdir()
+            (hidden / "secrets.env").write_text("x")
+            (Path(outside) / "notes.md").write_text("x")
+            escape = Path(root) / "link.md"
+            escape.symlink_to(Path(outside) / "notes.md")
+            with patch.object(local_tool_reader, "_tool_source_roots", return_value=[root]):
+                for path in (str(hidden / "secrets.env"), str(Path(outside) / "notes.md"), str(escape)):
+                    self.assertIsNone(local_tool_reader.tool_source_path(path), path)
+                    out = asyncio.run(local_tool_reader.read_document({"path": path}, session=session))
+                    self.assertEqual(out, local_tool_reader.SOURCE_REFUSED, path)
+                    out = asyncio.run(local_tool_reader.append_to_reader_document(
+                        {"document_id": 1, "path": path}, session=session))
+                    self.assertEqual(out, local_tool_reader.SOURCE_REFUSED, path)
+                    out = asyncio.run(local_tool_reader.append_to_reader_document(
+                        {"document_id": 1, "path": path, "text": "also text"}, session=session))
+                    self.assertEqual(out, local_tool_reader.SOURCE_REFUSED, path)
+                    out = asyncio.run(local_tool_reader.process_pdf_background({"file_path": path}, session=session))
+                    self.assertEqual(out, local_tool_reader.SOURCE_REFUSED, path)
+                ok = Path(root) / "paper.md"
+                ok.write_text("x")
+                self.assertEqual(local_tool_reader.tool_source_path(str(ok)), ok.resolve())
 
     def test_read_document_rejects_missing_path_and_text(self):
         session = SimpleNamespace(conn=object(), db_path="/tmp/test.db")

@@ -74,7 +74,7 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path to the document (PDF or markdown).",
+                        "description": "File path to the document (PDF or markdown). Only files under the downloads folders, the media spool, the paper library or ~/school_lab, never hidden files, are allowed.",
                     },
                     "text": {
                         "type": "string",

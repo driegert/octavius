@@ -138,6 +138,63 @@ class PiBrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[Earlier in this conversation", prompts[1])
         self.assertEqual(self.manager.starts, 1)
 
+    def _tool_db(self, *calls):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER)")
+        conn.execute("CREATE TABLE tool_calls (message_id INTEGER, tool_name TEXT, server_name TEXT)")
+        for i, (conv, name, server) in enumerate(calls, start=1):
+            conn.execute("INSERT INTO messages VALUES (?, ?)", (i, conv))
+            conn.execute("INSERT INTO tool_calls VALUES (?, ?, ?)", (i, name, server))
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_conversation_read_private(self):
+        launcher = self.cfg.launcher  # no private-data.json beside it: unknown MCP servers count (fail closed)
+        cases = [
+            ([(7, "web_search", "pi"), (7, "mcp__octavius__list_reader_documents", "octavius")], False),
+            ([(7, "mcp__octavius__read_note", "octavius")], True),
+            ([(7, "email_hybrid_search", "evangeline-email")], True),     # native brain
+            ([(7, "read_conversation", "local")], True),
+            ([(7, "mcp__papers__search", "papers")], True),               # config unreadable: fail closed
+            ([(8, "mcp__octavius__read_note", "octavius")], False),       # another conversation
+        ]
+        for calls, want in cases:
+            self.assertEqual(pi_brain.conversation_read_private(self._tool_db(*calls), 7, launcher), want, calls)
+        with tempfile.TemporaryDirectory() as repo:
+            (Path(repo) / "scripts").mkdir()
+            (Path(repo) / "private-data.json").write_text(json.dumps({"privateServers": ["email"]}))
+            fake_launcher = str(Path(repo) / "scripts" / "pi-octavius")
+            self.assertFalse(pi_brain.conversation_read_private(self._tool_db((7, "mcp__papers__search", "papers")), 7, fake_launcher))
+            self.assertTrue(pi_brain.conversation_read_private(self._tool_db((7, "mcp__email__get", "email")), 7, fake_launcher))
+
+    async def test_a_replayed_private_conversation_is_marked_for_the_guard(self):
+        for calls, marked in (([(7, "mcp__email__get", "email")], True), ([(7, "web_search", "pi")], False)):
+            await self.manager.shutdown()
+            self.manager = pi_brain.PiProcessManager(self.cfg)
+            session = _Session(self.manager)
+            session.state.history_session.conn = self._tool_db(*calls)
+            session.state.conversation.add_user("earlier question")
+            session.state.conversation.add_assistant("earlier answer")
+            if os.path.exists(self.log):
+                os.remove(self.log)
+            await self.turn(session, "first")
+            prompt = [c["message"] for c in self.commands() if c["type"] == "prompt"][0]
+            self.assertEqual(pi_brain.TAINT_MARKER in prompt, marked, calls)
+            self.assertIn("Dave: earlier question", prompt)
+
+    async def test_a_reader_chat_turn_carries_no_memory(self):
+        with mock.patch("agent._build_memory_block", mock.AsyncMock(return_value="MEMORY BLOCK")):
+            plain = _Session(self.manager)
+            await self.turn(plain, "hi")
+            doc = _Session(self.manager, conv_id=8)
+            doc.state.doc_chat_id = 3
+            doc.state.doc_chat_position = None
+            await self.turn(doc, "hi")
+        prompts = [c["message"] for c in self.commands() if c["type"] == "prompt"]
+        self.assertIn("MEMORY BLOCK", prompts[0])
+        self.assertNotIn("MEMORY BLOCK", prompts[1])
+
     async def test_round_cap_steers_then_aborts(self):
         session = _Session(self.manager)
         out, _ = await self.turn(session, "LOOP")

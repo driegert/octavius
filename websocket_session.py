@@ -442,7 +442,12 @@ class WebSocketSessionHandler:
             return
         ci, si = data.get("chunk_index"), data.get("sentence_index")
         if isinstance(ci, int) and isinstance(si, int):
-            self.state.doc_chat_position = {"chunk_index": ci, "sentence_index": si}
+            position = {"chunk_index": ci, "sentence_index": si}
+            # A selection: place_context rebuilds its text from the document by index.
+            ec, es = data.get("end_chunk_index"), data.get("end_sentence_index")
+            if isinstance(ec, int) and isinstance(es, int):
+                position.update(end_chunk_index=ec, end_sentence_index=es)
+            self.state.doc_chat_position = position
 
     async def handle_load_conversation(self, data: dict):
         from history import get_conversation_messages

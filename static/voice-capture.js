@@ -15,6 +15,7 @@
     let streaming = false;
     let starting = false;
     let stopWhileStarting = false;
+    let cancelWhileStarting = false;
 
     function flush() {
       if (!chunks.length) return;
@@ -42,6 +43,7 @@
       if (streaming || starting) return false;
       starting = true;
       stopWhileStarting = false;
+      cancelWhileStarting = false;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
@@ -60,6 +62,12 @@
         src.connect(processor);
         processor.connect(audioCtx.destination);
 
+        if (cancelWhileStarting) {
+          // Cancelled while the browser asked for the mic: nothing was said, send nothing.
+          starting = false;
+          teardown();
+          return false;
+        }
         streaming = true;
         chunks = [];
         send({ type: 'stt_start' });
@@ -89,7 +97,7 @@
 
     // Tears down without stt_stop (no utterance to process), or after the server's stt_auto_stop.
     function cancel() {
-      if (starting) stopWhileStarting = true;
+      if (starting) cancelWhileStarting = true;
       if (streaming) teardown();
     }
 

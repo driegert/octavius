@@ -33,6 +33,7 @@ import os
 import re
 import signal
 import time
+from pathlib import Path
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
@@ -231,8 +232,60 @@ def message_text(message: dict) -> str:
     )
 
 
-def build_seed(messages: list[dict]) -> str:
-    """Compact transcript of earlier user/assistant turns for a fresh pi session."""
+# The guard (pi_harness octavius-guard.ts) only sees the tool results in a pi session, so a
+# replayed transcript of a conversation that read private data would start untainted. A
+# seed carrying this marker taints the new session instead. Keep in step with the guard.
+TAINT_MARKER = "[[octavius:private-context]]"
+# Octavius's own tools that return Dave's notes, history or memory (the guard's
+# PRIVATE_OCTAVIUS_TOOLS), and the native brain's private MCP servers.
+PRIVATE_LOCAL_TOOLS = frozenset({
+    "read_note", "edit_note", "commit_edit", "search_conversation_history",
+    "read_conversation", "what_do_you_know", "correct", "forget", "consult_specialist",
+})
+NATIVE_PRIVATE_SERVERS = frozenset({"evangeline-email", "vault-search", "vikunja-tasks"})
+
+
+def _private_pi_servers(launcher: str) -> frozenset[str] | None:
+    """pi_harness's privateServers (private-data.json beside the launcher's repo); None if unreadable."""
+    try:
+        path = Path(launcher).resolve().parent.parent / "private-data.json"
+        servers = json.loads(path.read_text()).get("privateServers")
+        return frozenset(s for s in servers if isinstance(s, str)) if isinstance(servers, list) else None
+    except Exception:
+        return None
+
+
+def conversation_read_private(conn, conv_id: int, launcher: str) -> bool:
+    """Whether any recorded tool call in this conversation returned private data.
+
+    Fails closed: with the guard's config unreadable, any MCP tool but the public
+    Octavius tools counts.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT t.tool_name, t.server_name FROM tool_calls t "
+        "JOIN messages m ON m.id = t.message_id WHERE m.conversation_id = ?",
+        (conv_id,),
+    ).fetchall()
+    private_servers = _private_pi_servers(launcher)
+    for name, server in rows:
+        if server in NATIVE_PRIVATE_SERVERS or name in PRIVATE_LOCAL_TOOLS:
+            return True
+        if name.startswith("mcp__"):
+            pi_server, _, tool = name[len("mcp__"):].partition("__")
+            if pi_server == "octavius":
+                if tool in PRIVATE_LOCAL_TOOLS:
+                    return True
+            elif private_servers is None or pi_server in private_servers:
+                return True
+    return False
+
+
+def build_seed(messages: list[dict], private: bool = False) -> str:
+    """Compact transcript of earlier user/assistant turns for a fresh pi session.
+
+    ``private``: the conversation read private data earlier, so the seed carries
+    TAINT_MARKER and the guard treats the new session as tainted.
+    """
     lines: list[str] = []
     for m in messages:
         role = m.get("role")
@@ -249,7 +302,8 @@ def build_seed(messages: list[dict]) -> str:
     if not lines:
         return ""
     return (
-        "[Earlier in this conversation, restored from history]\n"
+        (f"{TAINT_MARKER} This conversation read Dave's private data earlier.\n" if private else "")
+        + "[Earlier in this conversation, restored from history]\n"
         + "\n".join(lines)
         + "\n[End of earlier conversation]"
     )
@@ -935,24 +989,35 @@ async def stream_pi_turn(
     conversation.trim()
 
     memory = ""
+    in_doc_chat = getattr(state, "doc_chat_id", None) is not None
     try:
-        memory = await _build_memory_block(
-            getattr(history_session, "db_path", None), user_text,
-            first_turn=not prior, current_conv_id=conv_id,
-        )
+        # Not in a Reader chat: its document is outsider text that never taints, so
+        # memory facts beside it would be private data the guard cannot see.
+        if not in_doc_chat:
+            memory = await _build_memory_block(
+                getattr(history_session, "db_path", None), user_text,
+                first_turn=not prior, current_conv_id=conv_id,
+            )
     except Exception:
         log.warning("Memory injection failed; pi turn proceeds without memory", exc_info=True)
 
     proc, fresh = await manager.get(conv_id)
     # A process that has had no turn holds no history, whether this call started it
     # or a warm trigger did (request_warm(start=True) starts processes ahead of turns).
-    seed = build_seed(prior) if proc.turns == 0 else ""
+    seed = ""
+    if proc.turns == 0:
+        try:
+            private = conversation_read_private(history_session.conn, conv_id, manager.cfg.launcher)
+        except Exception:
+            log.warning("Could not check conversation %s for private reads; seeding it as private", conv_id, exc_info=True)
+            private = True
+        seed = build_seed(prior, private=private)
     context = ""
     if getattr(state, "doc_chat_id", None) is not None:
         from local_tool_reader_lookup import place_context
         try:
             context = place_context(history_session.conn, state.doc_chat_id, state.doc_chat_position)
-            state.doc_chat_position = None  # sent per turn while playing; otherwise the saved place
+            state.doc_chat_position = None  # sent per turn by the panel; without one, the saved place
         except Exception:
             log.warning("Reader chat context failed; the turn proceeds without it", exc_info=True)
     message = build_prompt(user_text, _style_directive(source), memory, seed, context)

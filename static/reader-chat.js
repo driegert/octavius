@@ -217,7 +217,8 @@
     tab.disabled = !doc;
     tab.title = doc ? 'Chat about this document (c)' : 'Open a document to chat about it';
     input.disabled = !ready;
-    sendBtn.disabled = !ready || !input.value.trim();
+    // The server drops a turn sent while one is running, so typed text waits in the box.
+    sendBtn.disabled = !ready || busy || !input.value.trim();
     micBtn.disabled = !ready;
     newBtn.disabled = !ready;
     micBtn.classList.toggle('recording', recording);
@@ -381,27 +382,50 @@
 
   // Everything that must happen before a turn: note where Dave is reading (before pausing,
   // since pausing clears the heard place), stop the reading audio, and pick silent or spoken.
+  // "Here" for the next question: Dave's selection, else the marked sentence (read
+  // before pausing, which would otherwise leave it as is anyway).
   function beginTurn(spoken) {
-    const place = window.OctaviusReader.heardPlace();
+    const place = window.OctaviusReader.place();
     window.OctaviusReader.pause();
     audioPlayer.stop();
     send({ type: 'settings', voice: chatVoice(), tts: spoken });
     if (place && place.doc_id != null && place.doc_id === openedDocId) {
-      send({
+      const frame = {
         type: 'doc_chat_position',
         doc_id: place.doc_id,
         chunk_index: place.chunk_index,
         sentence_index: place.sentence_index,
-      });
+      };
+      if (place.end_chunk_index != null) {
+        frame.end_chunk_index = place.end_chunk_index;
+        frame.end_sentence_index = place.end_sentence_index;
+      }
+      send(frame);
     }
   }
 
+  const aboutEl = $('chat-about');
+  const aboutText = $('chat-about-text');
+  function refreshAbout() {
+    const place = window.OctaviusReader ? window.OctaviusReader.place() : {};
+    const sel = place && place.end_chunk_index != null && place.text ? place.text.replace(/\s+/g, ' ').trim() : '';
+    aboutEl.hidden = !sel;
+    aboutText.textContent = sel ? 'About your selection: \u201c' + sel + '\u201d' : '';
+  }
+  document.addEventListener('selectionchange', refreshAbout);
+  $('chat-about-clear').addEventListener('click', () => {
+    window.OctaviusReader.clearSelection();
+    refreshAbout();
+    if (!input.disabled) input.focus();
+  });
+
   function submitText() {
     const text = input.value.trim();
-    if (!text || input.disabled || recording) return;
+    if (!text || input.disabled || recording || busy) return;
     dropAudio = false;
     beginTurn(false);
     if (send({ type: 'text_input', text })) {
+      busy = true;  // before the transcript echo too, so a quick second Enter waits
       input.value = '';
       autosize();
       setStatus('Sending…');

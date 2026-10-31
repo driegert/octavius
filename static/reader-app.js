@@ -530,6 +530,7 @@
 
     playSeqId++;
     const mySeq = playSeqId;
+    lastSelection = null;  // playing moves the place on
     finished = false;
     stopped = false;
     follow = true;
@@ -606,6 +607,7 @@
   }
 
   function seekTo(chunkIdx, sentIdx) {
+    lastSelection = null;  // a click names a new place
     currentChunk = chunkIdx;
     currentSentence = sentIdx;
     finished = false;
@@ -1642,9 +1644,41 @@
       try { cb(); } catch (err) { console.error('onDocChange listener failed:', err); }
     }
   }
+  // The chat's "here": a selection in the document if Dave made one since the place last
+  // moved, else the marked sentence (playing, paused, or clicked while paused; a click
+  // never reaches the server, so the page is the only one that knows it).
+  let lastSelection = null;
+  function sentenceOf(node) {
+    const el = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
+    const s = el && el.closest('.s');
+    return s && sectionsEl.contains(s) ? [Number(s.dataset.c), Number(s.dataset.s)] : null;
+  }
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const range = sel.getRangeAt(0);
+    if (sel.isCollapsed) {
+      // A click inside the document drops the selection; focus moving to the chat box does not.
+      if (sectionsEl.contains(range.startContainer)) lastSelection = null;
+      return;
+    }
+    const a = sentenceOf(range.startContainer);
+    const b = sentenceOf(range.endContainer);
+    if (!a || !b || !currentDocId) return;
+    lastSelection = { doc_id: currentDocId, chunk_index: a[0], sentence_index: a[1],
+                      end_chunk_index: b[0], end_sentence_index: b[1], text: String(sel).slice(0, 200) };
+  });
+  function chatPlace() {
+    if (!currentDocId) return {};
+    if (lastSelection && lastSelection.doc_id === currentDocId) return lastSelection;
+    return { doc_id: currentDocId, chunk_index: currentChunk, sentence_index: currentSentence };
+  }
+
   window.OctaviusReader = {
     currentDoc() { return currentDoc ? { id: currentDoc.id, title: currentDoc.title } : null; },
     heardPlace,
+    place: chatPlace,
+    clearSelection() { lastSelection = null; },
     pause() { if (isPlaying) sendPause(); },
     onDocChange(cb) { if (typeof cb === 'function') docChangeCbs.push(cb); },
   };
