@@ -18,9 +18,9 @@ temp file before `save_upload` ever runs, so the size caps enforced here are
 logical caps applied while copying out of that temp file, not an ingress
 limit — by the time we can reject an oversize file, it has already been
 received once. `routes/media.py` adds a `Content-Length`-based fast reject
-before parsing starts as the only pre-receipt bound; a real ingress guard
-would be a body-size limit on Caddy's `octavius.riegert.xyz` site block
-(needs sudo; not done).
+before parsing starts as the app's only pre-receipt bound; the real ingress
+guard is Caddy's `request_body { max_size 52MB }` in the
+`octavius.riegert.xyz` site block.
 """
 from __future__ import annotations
 

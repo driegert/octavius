@@ -1,0 +1,163 @@
+#!/usr/bin/env -S uv run python
+"""Delete old files from Octavius's media spool directories.
+
+Two directories accumulate media and nothing else ever removes it: the
+Octavius upload dir (`OCTAVIUS_MEDIA_UPLOAD_DIR`, default
+/media/extra_stuff/octavius/client_media/) and the Matrix sidecar's spool
+(/media/extra_stuff/octavius/matrix_media/). The sidecar does not clean its
+own spool (checked 2026-10-30: no retention code in matrix-agent-sidecar), so
+this script manages both. The directory list is `OCTAVIUS_MEDIA_SPOOL_DIRS`
+(colon-separated), else those two defaults; `--dir` overrides it.
+
+Selection: only regular files that sit DIRECTLY inside a spool dir, whose
+mtime is more than `--days` (default 30) old. Symlinks are never followed or
+removed, subdirectories are never entered, and deletion goes through a
+directory fd so nothing outside the dir can be reached. Docproc output that
+lands next to a spooled PDF is a regular file in the same dir, so it ages out
+with it; output that falls back to ~/docproc-output is outside the spool and
+not touched.
+
+Age-based deletion is safe for referenced files: an `attachments` row whose
+file is gone makes `Conversation._rehydrate_image_content` return the text
+placeholder, so a re-attached thread just loses the pixels.
+
+    scripts/octavius-media-gc                 # dry run: report only
+    scripts/octavius-media-gc --apply
+    scripts/octavius-media-gc --days 14 --dir /some/spool
+"""
+
+import argparse
+import os
+import stat
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+DEFAULT_DIRS = [
+    "/media/extra_stuff/octavius/matrix_media",
+    "/media/extra_stuff/octavius/client_media",
+]
+DAY = 86400
+
+
+@dataclass
+class DirReport:
+    path: str
+    scanned: int = 0
+    selected: int = 0
+    selected_bytes: int = 0
+    deleted: int = 0
+    deleted_bytes: int = 0
+    kept_newest_age_days: float | None = None
+    oldest_selected_age_days: float | None = None
+    errors: list[str] = field(default_factory=list)
+
+
+def spool_dirs(cli: list[str] | None) -> list[str]:
+    if cli:
+        return cli
+    env = os.environ.get("OCTAVIUS_MEDIA_SPOOL_DIRS")
+    if env:
+        return [p for p in env.split(":") if p]
+    upload = os.environ.get("OCTAVIUS_MEDIA_UPLOAD_DIR")
+    return [DEFAULT_DIRS[0], upload or DEFAULT_DIRS[1]]
+
+
+def collect(directory: str, cutoff: float, now: float) -> tuple[DirReport, list[tuple[str, int]]]:
+    """Return (report, [(name, size)]) of files to delete. Touches nothing."""
+    rep = DirReport(path=directory)
+    chosen: list[tuple[str, int]] = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError as exc:
+        rep.errors.append(f"cannot read directory: {exc}")
+        return rep, chosen
+    for entry in entries:
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            rep.errors.append(f"stat failed: {exc.__class__.__name__}")
+            continue
+        if not stat.S_ISREG(st.st_mode):  # symlinks, dirs, sockets: skip
+            continue
+        rep.scanned += 1
+        if st.st_mtime < cutoff:
+            chosen.append((entry.name, st.st_size))
+            rep.selected += 1
+            rep.selected_bytes += st.st_size
+            age = (now - st.st_mtime) / DAY
+            if rep.oldest_selected_age_days is None or age > rep.oldest_selected_age_days:
+                rep.oldest_selected_age_days = age
+    return rep, chosen
+
+
+def delete(directory: str, chosen: list[tuple[str, int]], cutoff: float, rep: DirReport) -> None:
+    """Unlink via a directory fd, re-checking each file is still old and regular."""
+    try:
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        rep.errors.append(f"cannot open directory: {exc}")
+        return
+    try:
+        for name, size in chosen:
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff:
+                    continue
+                os.unlink(name, dir_fd=dfd)
+                rep.deleted += 1
+                rep.deleted_bytes += size
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                rep.errors.append(f"unlink failed: {exc.__class__.__name__}")
+    finally:
+        os.close(dfd)
+
+
+def run(dirs: list[str], days: float, apply: bool, now: float | None = None) -> list[DirReport]:
+    now = time.time() if now is None else now
+    cutoff = now - days * DAY
+    reports = []
+    for d in dirs:
+        rep, chosen = collect(d, cutoff, now)
+        if apply and chosen:
+            delete(d, chosen, cutoff, rep)
+        reports.append(rep)
+    return reports
+
+
+def fmt_bytes(n: int) -> str:
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--days", type=float, default=30, help="retention age in days (default 30)")
+    ap.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
+    ap.add_argument("--dir", action="append", help="spool dir (repeatable); overrides env/defaults")
+    args = ap.parse_args(argv)
+    if args.days < 1:
+        ap.error("--days must be at least 1")
+    dirs = spool_dirs(args.dir)
+    reports = run(dirs, args.days, args.apply)
+    mode = "APPLY" if args.apply else "DRY RUN"
+    print(f"octavius-media-gc [{mode}] retention {args.days:g} days")
+    failed = False
+    for r in reports:
+        oldest = (
+            f", oldest selected {r.oldest_selected_age_days:.0f} days"
+            if r.oldest_selected_age_days is not None else ""
+        )
+        done = f", deleted {r.deleted} ({fmt_bytes(r.deleted_bytes)})" if args.apply else ""
+        print(f"  {r.path}: {r.scanned} files, {r.selected} past retention "
+              f"({fmt_bytes(r.selected_bytes)}){oldest}{done}")
+        for e in r.errors:
+            failed = True
+            print(f"    error: {e}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

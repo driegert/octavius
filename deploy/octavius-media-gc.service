@@ -1,0 +1,17 @@
+# Daily retention sweep of Octavius's media spool dirs (client_media/ and the
+# Matrix sidecar's matrix_media/). See scripts/octavius-media-gc.
+#
+# NOT installed or activated by writing this file. To install:
+#   cp deploy/octavius-media-gc.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now octavius-media-gc.timer
+# Dry-run first: scripts/octavius-media-gc
+
+[Unit]
+Description=Delete Octavius media spool files older than 30 days
+RequiresMountsFor=/media/extra_stuff
+ConditionPathIsMountPoint=/media/extra_stuff
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/dave/school_lab/git_repositories/octavius
+ExecStart=/usr/bin/uv run python scripts/octavius-media-gc --apply --days 30

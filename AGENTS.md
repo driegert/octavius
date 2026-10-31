@@ -541,6 +541,7 @@ Core runtime:
 - `main.py` - FastAPI app creation, startup wiring, shared top-level routes, WebSocket entrypoint
 - `db.py` - SQLite connection helpers and short-lived connection context manager
 - `settings.py` - env-backed runtime settings and defaults; also loads `models.json` model routing (`_role_chain` / `_role_single`, precedence: defaults < file < env; the reader's second entry is its fallback, read via `_role_single(..., index=1)`)
+- `scripts/octavius-media-gc` - retention sweep of the media spool dirs (dry run by default); timer units in `deploy/`
 - `scripts/octavius-models` - show / check / apply model routing; `check` probes every endpoint's catalog and auth before `apply` will restart
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
 - `media_uploads.py` - streaming/sanitizing/cap logic for `POST /api/media/upload` (client media, e.g. Android), pure functions plus `save_upload`; FastAPI-free and unit-testable on its own
@@ -809,8 +810,8 @@ with one `file` part, streamed in chunks (never buffered whole) into
 `<12-hex>-<name>` filename. The 20 MB/50 MB caps are logical, not an ingress
 limit — Starlette's parser has already received the whole body into its own
 spooled temp file before `save_upload` sees it — so a `Content-Length`-based
-413 before parsing is the only pre-receipt bound (a real guard needs a Caddy
-body-size limit on `octavius.riegert.xyz`, sudo, not done). The response
+413 before parsing is the only pre-receipt bound (the real guard is Caddy's
+52 MB `request_body` limit on `octavius.riegert.xyz`). The response
 (`path`/`mime`/`filename`/`size_bytes`) is what the client then sends
 verbatim in the existing `image_input`/`file_input` WS frame below, but
 those handlers no longer trust it outright: `path` is resolved against the
@@ -818,8 +819,14 @@ those handlers no longer trust it outright: `path` is resolved against the
 symlinks resolved before the containment check) and `handle_image_input`
 re-stats the file against `IMAGE_MAX_BYTES` rather than trusting
 `size_bytes`; every rejection sends `status: audio_done` too, so a rejected
-frame can't leave a client's turn hanging. Like the Matrix spool, this
-directory is **not garbage-collected yet** — a follow-up.
+frame can't leave a client's turn hanging. Both this
+directory and the Matrix spool (the sidecar does no cleanup of its own) are
+swept by `scripts/octavius-media-gc` (30-day mtime retention, dry run unless
+`--apply`; daily via `deploy/octavius-media-gc.{service,timer}`, not installed
+by default). A re-attached thread whose image was swept just loses the pixels
+(`_rehydrate_image_content` falls back to the text placeholder). The Caddy
+body-size limit exists already: `request_body { max_size 52MB }` in the
+`octavius.riegert.xyz` block of `/etc/caddy/Caddyfile`.
 
 - **Images** (`image_input`): `websocket_session.handle_image_input`
   base64-reads the spool file and builds an OpenAI-style multimodal content

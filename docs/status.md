@@ -702,9 +702,9 @@ fast-413 before parsing starts and now runs `save_upload` inside `request.form()
 with `max_files=2, max_fields=4`, translating Starlette's `MultiPartException`/
 `HTTPException` to a 400 JSON body instead of a 500. Docs now say plainly that the
 size caps are logical, not an ingress limit: Starlette's parser has already received
-the whole body into its own temp file before `save_upload` ever runs; a real ingress
-guard would be a body-size limit on Caddy's `octavius.riegert.xyz` site block (needs
-sudo; not done). Tests: `tests/test_media_upload.py` (34), plus new/updated cases in
+the whole body into its own temp file before `save_upload` ever runs; the real ingress
+guard is Caddy's `request_body { max_size 52MB }` on `octavius.riegert.xyz` (in place,
+confirmed 2026-10-30). Tests: `tests/test_media_upload.py` (34), plus new/updated cases in
 `tests/test_websocket_session.py`.
 
 ## Reader: pasted text (2026-08-10)
