@@ -303,10 +303,12 @@ picks one or the other per turn (`pi_brain.wants_pi`). Image turns, vision
 threads, item chat and file turns stay native. SQLite stays authoritative: a
 fresh or crashed process is seeded with a compact transcript of the in-memory
 `Conversation`. pi has no round cap, so `pi_brain` counts `turn_end`, steers
-at 5 and aborts at `max_tool_rounds`. Vikunja writes are confirmed:
-pi_harness `octavius-guard.ts` raises an RPC `confirm`, Octavius speaks the
-question, sends `confirm_request` + `audio_done`, and Dave's next transcript or
-`text_input` answers it (`_spawn_turn`; opening the mic then is not a barge-in).
+at 5 and aborts at `max_tool_rounds`. Vikunja writes are **not** confirmed (since
+2026-10-31; pi_harness `octavius-guard.ts` instead refuses description replacement
+and over-long writes, and the profile exposes no delete tool). The confirm relay
+stays for any extension that asks: an RPC `confirm` is spoken, sent as
+`confirm_request` + `audio_done`, and Dave's next transcript or `text_input`
+answers it (`_spawn_turn`; opening the mic then is not a barge-in).
 Processes are reaped after `OCTAVIUS_PI_IDLE_REAP_S` (4 h), killed on reset,
 load and shutdown, and re-keyed on `restore_session`. **Cache warming**
 (pi_harness `octavius-warm.ts`, RPC prompt `/warm`): `stt_start`, a new
