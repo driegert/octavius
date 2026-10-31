@@ -255,10 +255,12 @@ def build_seed(messages: list[dict]) -> str:
     )
 
 
-def build_prompt(text: str, style: str, memory: str = "", seed: str = "") -> str:
+def build_prompt(text: str, style: str, memory: str = "", seed: str = "", context: str = "") -> str:
     """The RPC prompt for one turn: per-turn context rides in the user message,
     never in the system prompt, so the cached prefix stays identical."""
     blocks = [style]
+    if context:
+        blocks.append(context)
     if memory:
         blocks.append(memory)
     if seed:
@@ -945,7 +947,15 @@ async def stream_pi_turn(
     # A process that has had no turn holds no history, whether this call started it
     # or a warm trigger did (request_warm(start=True) starts processes ahead of turns).
     seed = build_seed(prior) if proc.turns == 0 else ""
-    message = build_prompt(user_text, _style_directive(source), memory, seed)
+    context = ""
+    if getattr(state, "doc_chat_id", None) is not None:
+        from local_tool_reader_lookup import place_context
+        try:
+            context = place_context(history_session.conn, state.doc_chat_id, state.doc_chat_position)
+            state.doc_chat_position = None  # sent per turn while playing; otherwise the saved place
+        except Exception:
+            log.warning("Reader chat context failed; the turn proceeds without it", exc_info=True)
+    message = build_prompt(user_text, _style_directive(source), memory, seed, context)
 
     async with proc.lock:
         proc.last_used = time.monotonic()

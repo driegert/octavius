@@ -22,6 +22,7 @@ EXPECTED = [
     "list_reader_documents", "append_to_reader_document",
     "search_conversation_history", "read_conversation",
     "remember", "forget", "correct", "what_do_you_know",
+    "reader_document_outline", "read_reader_document", "search_reader_document",
 ]
 
 
@@ -58,9 +59,9 @@ class ToolListTests(unittest.IsolatedAsyncioTestCase):
         self.server = await _server()
         self.addAsyncCleanup(self.server.stop)
 
-    def test_exposed_set_is_the_thirteen(self):
+    def test_exposed_set_is_the_sixteen(self):
         self.assertEqual(sorted(pts.EXPOSED_TOOLS), sorted(EXPECTED))
-        self.assertEqual(len(pts.exposed_specs()), 13)
+        self.assertEqual(len(pts.exposed_specs()), 16)
 
     async def test_list_equals_specs_in_order(self):
         token = self.server.new_token()
@@ -224,7 +225,7 @@ class BindingLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("cancelled", r.content[0].text)
                 self.assertEqual(finished, ["cancelled"])
                 # the server survives: a later call on the same token still answers
-                self.assertEqual(len((await s.list_tools()).tools), 13)
+                self.assertEqual(len((await s.list_tools()).tools), 16)
         self.assertFalse(server._inflight.get(token))
 
     def test_tokens_are_unique_per_process(self):

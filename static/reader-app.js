@@ -716,6 +716,7 @@
   function renderDocument(doc, opts) {
     const preservePosition = !opts || opts.preservePosition !== false;
     currentDoc = doc;
+    notifyDocChange();
     totalSentences = doc.total_sentences || 0;
     playerTitle.textContent = doc.title;
     playerEdit.hidden = !(doc.status === 'ready' || doc.status === 'failed');
@@ -895,6 +896,7 @@
     closeEditBar();
     currentDocId = null;
     currentDoc = null;
+    notifyDocChange();
     totalSentences = 0;
     sentenceEls = new Map();
     markedEl = null;
@@ -1631,6 +1633,21 @@
     } catch (_err) {
     }
   }
+
+  // Hook for the chat panel (reader-chat.js). onDocChange fires on every open, re-render
+  // (title or status changes included) and close; listeners compare ids themselves.
+  const docChangeCbs = [];
+  function notifyDocChange() {
+    for (const cb of docChangeCbs) {
+      try { cb(); } catch (err) { console.error('onDocChange listener failed:', err); }
+    }
+  }
+  window.OctaviusReader = {
+    currentDoc() { return currentDoc ? { id: currentDoc.id, title: currentDoc.title } : null; },
+    heardPlace,
+    pause() { if (isPlaying) sendPause(); },
+    onDocChange(cb) { if (typeof cb === 'function') docChangeCbs.push(cb); },
+  };
 
   const docIdParam = params.get('doc_id');
   if (docIdParam) openDocument(parseInt(docIdParam, 10));

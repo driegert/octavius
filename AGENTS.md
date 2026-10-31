@@ -337,8 +337,8 @@ turn alone to a bigger-window hop (`OCTAVIUS_PI_MODEL_CONTEXTS`), never touching
 current hop (`FailoverState`): new processes start on it, live ones `set_model` before their turn, and
 `OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300) later the next turn tries the primary again. `/health` → `pi_brain.failover`;
 each failover logs at WARNING.
-**Octavius's own tools for pi** (`pi_tools_server.py`): 13 of the local tools (notes, memory,
-conversation history, reader; not `download_file`/`process_pdf`/`check_document_status`) are served to pi
+**Octavius's own tools for pi** (`pi_tools_server.py`): 16 of the local tools (notes, memory,
+conversation history, reader, reader look-ups; not `download_file`/`process_pdf`/`check_document_status`) are served to pi
 as the `octavius` MCP server, dispatched through `tools.call_tool`. It listens on its own socket on
 `127.0.0.1:8032`, never on the FastAPI app (Caddy publishes that), started in `main.py`'s lifespan only
 when the pi brain is on. Each pi process gets a random token in `PI_OCTAVIUS_TOOLS_TOKEN` (not an
@@ -566,6 +566,7 @@ WebSocket message families:
   its own — the heard reports are the place — and marks the document finished only once the last sentence is heard.
   `/reader` always paces; the Android client does not and keeps the old run-ahead behaviour.
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
+- Reader chat (client→server; `/reader`'s chat panel on its own `/ws` connection, otherwise the normal voice/text turn frames): `doc_chat_open {doc_id, new?}` → `doc_chat_opened {doc_id, title, conversation_id, messages}` or `doc_chat_error {doc_id, error}`; `doc_chat_position {doc_id, chunk_index, sentence_index}` (the place Dave was hearing, sent before each turn)
 - Confirmation (server→client, pi brain only): `confirm_request` (`title`, `message`) — the agent is waiting for Dave's next transcript/`text_input` as a yes/no; sent with the spoken question and an `audio_done`
 - Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
 
@@ -610,6 +611,7 @@ Conversation and tool loop:
 - `local_tool_inbox.py` - legacy stash save/read helpers (`save_to_stash` / `list_stash_items` — retired/unwired, no longer registered as tools)
 - `stash_to_obsidian.py` - watermark-based one-way exporter of `saved_items` rows to the vault inbox (run via the `obsidian-stash-export.timer` user unit)
 - `local_tool_reader.py` - local reader handoff (file, and raw text via `read_document(text=...)`) and background PDF-processing helpers
+- `local_tool_reader_lookup.py` - reader chat look-ups over the speech JSON (`reader_document_outline`, `read_reader_document`, `search_reader_document`) and `place_context`, the per-turn note naming the open document and Dave's place
 - `local_tool_documents.py` - `check_document_status` local tool (polls a docproc job by id)
 - `docproc_client.py` - loopback HTTP client for the docproc web queue (submit/poll a PDF conversion job); Octavius never imports the `docproc` package
 
@@ -640,6 +642,8 @@ Frontend:
 - `static/index.css` / `static/reader.css` / `static/inbox.css` - page layouts (desktop-first; the side panel becomes a drawer on phones). `main.py` sends `Cache-Control: no-cache` on the UI pages and `/static`, so browsers revalidate (ETag/304) and no `?v=` cache-busting is needed
 - `static/inbox-app.js` - inbox page: item list with search/filters, item view, item chat panel, keyboard shortcuts; renders untrusted item markdown with raw HTML escaped, non-http(s)/mailto links neutralised and images never loaded
 - `static/reader-app.js` - reader page behavior: document library, reading column with sentence highlight and follow, edit panel, retry flow, keyboard shortcuts, and playback client logic
+- `static/reader-chat.js` - the reader's "Chat" pull tab and side panel: its own `/ws`, opened lazily; `doc_chat_open` on each document change; typed turns silent (`tts:false`), spoken ones voiced in the main page's voice (`octavius-prefs`); pauses reading before a turn; `c` opens it (or focuses its box), as in the Inbox. Talks to `reader-app.js` only through `window.OctaviusReader` (`currentDoc`, `heardPlace`, `pause`, `onDocChange`)
+- `static/voice-capture.js` - `OctaviusVoiceCapture.createCapture`: mic → 16 kHz Float32 PCM frames between `stt_start`/`stt_stop`. Used by the reader chat; `index-app.js` still has its own copy
 - `static/index.html` - main voice UI shell
 - `static/inbox.html` - inbox review UI with inline item chat
 - `static/reader.html` - reader UI with playback controls and polling
@@ -658,6 +662,7 @@ Tests:
 - `tests/test_reader_pacing.py` - paced playback: `ReaderPacer`, the stream waiting on `reader_heard`, finished-when-heard, wiring
 - `tests/test_reader_progress.py` - per-document progress (playback, append/replace, lazy backfill, migration) and heading levels
 - `tests/test_reader_edit.py` - renaming a document: DB + speech JSON title update, missing speech file, validation, any-status rename, route wiring
+- `tests/test_reader_chat.py` - reader chat: look-up tools, `place_context`, `build_prompt`'s context slot, one keyed chat per document (resume, `new`), position scoping
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
 - `tests/test_history_attach.py`
@@ -780,6 +785,7 @@ Still live:
 - Sections carry `level` (1-3 from `#`/`##`/`###`) for the page's table of contents. Documents converted earlier
   have none (clients treat that as 1); `scripts/reader-backfill-heading-levels [--apply]` restores it where the
   source markdown still exists.
+- **Chat about a document** (`/reader`'s chat panel, since 2026-10-31): the panel opens its own `/ws` and sends `doc_chat_open`; the conversation is keyed `reader-doc:<id>` (`source` `reader`), so each document has one chat that resumes; "New chat" renames the key to `reader-doc:<id>:<conv id>`. Turns run on the pi brain with `place_context` in the per-turn prompt (document id and title, plus the sentence Dave was hearing from `doc_chat_position`) and three look-up tools over the speech JSON. Chunks converted since 2026-10-31 carry `source_text` (the chunk's markdown, LaTeX and citations intact), which the look-ups prefer; older documents give the speech text. Reader documents do not taint the pi guard (Dave's choice: scholar and web stay available while chatting about any document). The native brain gets no document context.
 
 Reader storage:
 

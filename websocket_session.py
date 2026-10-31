@@ -157,6 +157,10 @@ class WebSocketSessionState:
     # Set while a pi turn waits on Dave to answer a confirmation (pi_brain); his
     # next transcript or text input resolves it instead of starting a turn.
     pending_confirm: asyncio.Future | None = None
+    # The Reader chat panel: the document this connection's conversation is about, and
+    # the place Dave was hearing when he last asked (doc_chat_position).
+    doc_chat_id: int | None = None
+    doc_chat_position: dict | None = None
 
 
 class WebSocketSessionHandler:
@@ -263,6 +267,8 @@ class WebSocketSessionHandler:
             "item_chat_load": self.handle_item_chat_load,
             "item_chat": self.handle_item_chat,
             "item_chat_reset": self.handle_item_chat_reset,
+            "doc_chat_open": self.handle_doc_chat_open,
+            "doc_chat_position": self.handle_doc_chat_position,
             "stt_start": self.handle_stt_start,
             "stt_stop": self.handle_stt_stop,
             "typing_start": self.handle_typing_start,
@@ -331,11 +337,11 @@ class WebSocketSessionHandler:
             }
         )
 
-    async def handle_reset(self, _data: dict):
-        # Mirror handle_stt_start: a reset must actually kill any in-flight turn, or it
-        # keeps streaming into (and its reply gets recorded under) the fresh conversation
-        # created below. Cancelling BEFORE end_async() also means the interrupted turn's
-        # partial reply is persisted into the conversation it belongs to — the old one.
+    async def _abandon_turn(self) -> None:
+        # Mirror handle_stt_start: switching conversations must actually kill any
+        # in-flight turn, or it keeps streaming into (and its reply gets recorded under)
+        # the next conversation. Cancelling BEFORE end_async() also means the interrupted
+        # turn's partial reply is persisted into the conversation it belongs to.
         turn = self.state.turn_task
         if turn and not turn.done():
             turn.cancel()
@@ -344,11 +350,15 @@ class WebSocketSessionHandler:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                log.debug("In-flight turn ended during reset", exc_info=True)
-        # A reset also abandons any open streaming-STT capture (e.g. the Android client
+                log.debug("In-flight turn ended during a conversation switch", exc_info=True)
+        # It also abandons any open streaming-STT capture (e.g. the Android client
         # tearing down a live mic for New Chat) — don't leave the stream armed.
         self.state.stt_stream.reset()
         self.state.stt_stream.active = False
+
+    async def handle_reset(self, _data: dict):
+        await self._abandon_turn()
+        self.state.doc_chat_id = None
         await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.reset()
@@ -365,6 +375,75 @@ class WebSocketSessionHandler:
         await self.send_json("status", "Conversation reset.")
         log.info("Conversation reset by client")
 
+    async def handle_doc_chat_open(self, data: dict):
+        """Bind this connection to a Reader document's chat (/reader's chat panel).
+
+        One chat per document: the conversation is keyed `reader-doc:<id>` and resumed
+        on every open. `new: true` renames the old key aside (it stays in history under
+        `reader-doc:<id>:<conversation id>`) and starts a fresh one.
+        """
+        from contextlib import closing
+
+        from history import get_conversation_messages
+        from reader_store import get_document
+        try:
+            doc_id = int(data.get("doc_id"))
+        except (TypeError, ValueError):
+            await self.send_payload({"type": "doc_chat_error", "doc_id": data.get("doc_id"), "error": "No document id."})
+            return
+        with closing(self.state.history.connect()) as conn:
+            doc = get_document(conn, doc_id)
+        if not doc:
+            await self.send_payload({"type": "doc_chat_error", "doc_id": doc_id, "error": "Document not found."})
+            return
+        await self._abandon_turn()
+        await self._discard_pi_process()
+        await self.state.history_session.end_async()
+        key = f"reader-doc:{doc_id}"
+        if data.get("new") is True:
+            with closing(self.state.history.connect()) as conn:
+                conn.execute(
+                    "UPDATE conversations SET session_id = session_id || ':' || id WHERE session_id = ?",
+                    (key,),
+                )
+                conn.commit()
+        self.state.history_session = self.state.history.resume_or_start_conversation(
+            key,
+            source="reader",
+            model=settings.llm_chain[0]["model"],
+        )
+        conv_id = self.state.history_session.conv_id
+        msgs = get_conversation_messages(self.state.history_session.conn, conv_id)
+        if msgs:
+            self.state.conversation.load_from_history(msgs)
+        else:
+            self.state.conversation.reset()
+        self.state.doc_chat_id = doc_id
+        self.state.doc_chat_position = None
+        self._request_pi_warm("doc_chat_open", start=True)
+        await self.send_payload(
+            {
+                "type": "doc_chat_opened",
+                "doc_id": doc_id,
+                "title": doc["title"],
+                "conversation_id": conv_id,
+                "messages": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in msgs
+                    if m["role"] in ("user", "assistant") and m.get("content")
+                ],
+            }
+        )
+        log.info("Reader chat for document %d on conversation %d (%d messages)", doc_id, conv_id, len(msgs))
+
+    async def handle_doc_chat_position(self, data: dict):
+        """Where Dave was listening when he asked: the reader chat's "this"."""
+        if self.state.doc_chat_id is None or data.get("doc_id") != self.state.doc_chat_id:
+            return
+        ci, si = data.get("chunk_index"), data.get("sentence_index")
+        if isinstance(ci, int) and isinstance(si, int):
+            self.state.doc_chat_position = {"chunk_index": ci, "sentence_index": si}
+
     async def handle_load_conversation(self, data: dict):
         from history import get_conversation_messages
         conv_id = data.get("conversation_id")
@@ -375,6 +454,7 @@ class WebSocketSessionHandler:
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
+        self.state.doc_chat_id = None
         await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.load_from_history(msgs)

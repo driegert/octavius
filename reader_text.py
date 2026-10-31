@@ -318,6 +318,8 @@ def _build_speech_chunks(raw_chunks: list[dict], converted_texts: list[str], sta
             "heading": raw_chunk["heading"],
             "speech_text": speech_text,
             "sentences": sentences,
+            # The chunk's markdown (LaTeX and citations intact) for the reader chat's look-ups.
+            "source_text": raw_chunk["text"],
         }
         # Heading depth (1-3, from #/##/###) for the reader's table of contents.
         # Documents converted before 2026-10-30 have none; clients treat that as 1.

@@ -52,6 +52,7 @@ EXPOSED_TOOLS = frozenset({
     "remember", "forget", "correct", "what_do_you_know",
     "search_conversation_history", "read_conversation",
     "read_document", "list_reader_documents", "append_to_reader_document",
+    "reader_document_outline", "read_reader_document", "search_reader_document",
 })
 
 _current_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
