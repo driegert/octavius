@@ -289,7 +289,8 @@ Built behind `OCTAVIUS_BRAIN=pi` (default `native`): `pi_brain.py` (RPC process
 per conversation, manager, `stream_pi_turn`), wired into `run_turn`, reset,
 load, restore and shutdown; tests against a scripted fake pi. Not yet done from
 the step-2 list: `/warm` (step 3), and a measured first-*audio* number through
-Phonon, as opposed to first sentence.
+Phonon, as opposed to first sentence. (Both since done: see "Step 3 result" and
+"First audio through Phonon".)
 
 Live, synthetic prompts, lilbuddy 26B, no warming, memory injection off:
 
@@ -379,9 +380,59 @@ Open from step 3:
 - A template warm sends no `Authorization` header (headers are never persisted). That is
   fine for lilbuddy (open); a template warm to an authed failover host (`:8020`) would 401
   until a request from that session supplies one. Matters at step 4.
-- First-*audio* latency through Phonon is still unmeasured, as it was in step 2.
+- ~~First-audio latency through Phonon~~: measured, see "First audio through Phonon".
 - Re-check `/warm` after every pi upgrade: it depends on `before_provider_request`
   chaining, `after_provider_response`, command dispatch in `prompt`, and RPC `setStatus`.
+
+## First audio through Phonon (2026-10-30)
+
+First audio is measured from "turn sent" to the first WAV being ready. That equals the
+first sentence plus the Phonon synth of that sentence, because `run_turn` synthesizes each
+sentence inline as it arrives and then sends it. Setup:
+
+- Both brains were driven directly, with no WebSocket, history DB or live service, and the
+  memory block stubbed. Synth went through `tts.synthesize` (speechify plus the real client),
+  to Phonon 31m at `lilripper:8881`, voice `Imogen`.
+- Native used the real tool schemas for its five servers plus the local tools (24 tools in
+  all). Only `web_search` actually ran; every other tool call was refused.
+- Cold means both lilbuddy slots were overwritten first. Warmed means the cache was filled
+  before the turn. For native that was a priming turn with the same system prompt and tools.
+  For pi it was a `/warm` template warm, finished before the turn.
+- pi's cold column includes pi start-up, because it is a new process.
+- Prompts were synthetic only (arithmetic and trivia, plus one `web_search` lookup), three
+  runs each. Cells show the range and the median.
+
+| Turn | Native cold | Native warmed | pi cold | pi warmed |
+|---|---|---|---|---|
+| Trivia | 8.9–14.6 s (10.6) | 0.9–2.7 s (2.6) | 6.8–17.7 s (11.0)² | 0.7–4.0 s (2.6)¹ ² |
+| `web_search` | 15.2–17.9 s (17.8) | 5.3–8.4 s (6.7) | 7.6–9.9 s (8.9) | 2.2–6.6 s (4.0)² |
+| Phonon share of that | 0.16–0.21 s (4–7-word first sentence) | | 0.24–0.46 s (9–21 words) | |
+
+¹ One more warmed run took 11.9 s. That run did not record token usage. In the rerun, every
+warmed turn prefilled 96–110 tokens with 7,477 cached, so what varies after a warm is the
+model's thinking (and, in one cold run, a second model call), not prefill.
+² Six runs: the first pass plus that rerun.
+
+- **Phonon is not the bottleneck.** It is 2–5 % of a warmed turn's first audio and under 3 %
+  of a cold one. The LLM's prefill and thinking are everything else.
+- **pi's `web_search` turns beat native's**, cold and warm, at about half the time. Native
+  pays a second full round with the 24-tool payload plus its own memory and style folded
+  into the system prompt. pi's second round reuses the cached prefix.
+- On a trivia turn the two brains are level once warm. pi's cold start pays process start
+  (~0.6 s) on top of prefill.
+
+Phonon microbench, 10 sentences of 1–31 words through `tts.synthesize`, three passes:
+
+| Pass | p50 | p90 | max |
+|---|---|---|---|
+| 8 s idle before each request | 0.31 s | 0.38 s | 0.44 s |
+| back-to-back (2 passes) | 0.27–0.28 s | 0.39–0.40 s | 0.44 s |
+
+Synth time is roughly 0.09 s + 0.011 s per word: 0.10 s for one word, 0.15 s for five,
+0.43 s for 31. Idling makes little difference, and there is no cold-start penalty worth
+keeping warm for. A reply's later sentences synthesize while the earlier ones play (a
+5-word sentence is ~3 s of audio against ~0.15 s of synth), so only the first sentence's
+synth reaches the listener. Harness: `scratchpad/step3/first_audio.py` (not in the repo).
 
 ## What Octavius's own tools become
 

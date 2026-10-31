@@ -394,8 +394,9 @@ false`, and `:8020` answers an image prompt.
   remapped to `OCTAVIUS_TTS_FALLBACK_VOICE`. Only list names the server has
   (`GET /v1/audio/voices`): Phonon **400s on unknown voices**, including every
   Kokoro name, and the sentence then plays silent (`TTS failed for chunk`). Per
-  request it is ~0.2 s against Kokoro-GPU's ~0.07 s, but sentences are pipelined, so
-  only the first sentence of a reply pays it. **Rollback:** Kokoro is still up on
+  request it is ~0.09 s + ~0.011 s/word (p50 0.27-0.31 s, p90 0.4 s over 1-31 words,
+  measured 2026-10-30) against Kokoro-GPU's ~0.07 s; later sentences synth while earlier
+  ones play, so only the first sentence of a reply pays it. **Rollback:** Kokoro is still up on
   `lilripper:8880` —
   `cp ~/.config/octavius/env.bak-2026-10-28-pre-phonon ~/.config/octavius/env && systemctl --user restart octavius`
   (the backup predates the Phonon defaults, so after restoring it also set
