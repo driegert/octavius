@@ -50,6 +50,7 @@ MATH_RE = re.compile(
     re.DOTALL,
 )
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_LEFTOVER_LATEX = re.compile(r'\\(?:frac|sum|hat|bar|begin|end|left|right|math[a-z]+|[a-z]*sqrt)\b|^\s*Rewritten:', re.MULTILINE)
 
 MATH_TO_SPEECH_PROMPT = """Rewrite the following text, replacing all LaTeX math expressions with natural spoken English. Keep all surrounding non-math text exactly as-is. Only change the math parts.
 
@@ -62,8 +63,13 @@ Examples:
 - $\\int_0^1 f(x) dx$ becomes "the integral from 0 to 1 of f of x dx"
 - $\\alpha$ becomes "alpha"
 - $p < 0.05$ becomes "p less than 0.05"
+- $x_i$ becomes "x sub i"
+- $\\frac{n(n+1)}{2}$ becomes "n times the quantity n plus 1, all over 2"
+- $|x|^2$ and $\\left| \\sum_t a_t \\right|^2$ become "the absolute value of x, squared" and "the squared magnitude of the sum over t of a sub t"
+- $v_t^{(k)}$ becomes "v sub t, superscript k" (a superscript in parentheses is a label, not a power)
+- A multi-line equation (aligned, & and \\\\) is read as one continuous statement: "... equals ..., which equals ..."
 
-Output ONLY the rewritten text. No preamble, no explanation."""
+Output ONLY the rewritten text, once. Do not repeat the original, do not label your answer, no preamble, no explanation."""
 
 
 # A converted PDF breaks a paragraph at every page boundary, mid-sentence, and a
@@ -232,7 +238,11 @@ async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
                 {"role": "system", "content": MATH_TO_SPEECH_PROMPT},
                 {"role": "user", "content": text},
             ],
-            # Reasoning models burn tokens inside <think> before the rewrite; 2048 could
+            # Thinking off: a rewrite needs no reasoning, and with it on gemma4-12b spent all
+            # 8192 tokens thinking and returned no content (53 s, then the fallback) where
+            # it answers correctly in under a second without (measured 2026-10-31).
+            "chat_template_kwargs": {"enable_thinking": False},
+            # Still room for a model that ignores the switch and thinks anyway; 2048 could
             # truncate mid-think, leaving an UNCLOSED think block that THINK_RE can't strip.
             "max_tokens": 8192,
             "temperature": 0.1,
@@ -246,6 +256,10 @@ async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
             continue
         if result and "<think>" in result:
             log.warning("Reader LLM at %s returned a truncated think block — trying next", url)
+            continue
+        if result and (MATH_RE.search(result) or _LEFTOVER_LATEX.search(result)):
+            # e.g. gemma4-12b echoing an aligned block before its rewrite
+            log.warning("Reader LLM at %s left LaTeX in its rewrite — trying next", url)
             continue
         if result:
             return result

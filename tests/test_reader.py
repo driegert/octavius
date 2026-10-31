@@ -68,6 +68,26 @@ class MathConversionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, strip_latex("$x^2$"))
         self.assertIn("squared", out)
 
+    async def test_rewrite_with_leftover_latex_tries_the_next_endpoint(self):
+        # gemma4-12b once echoed an aligned block, then "Rewritten:", then the rewrite.
+        async def complete(payload, urls=None):
+            if urls[0].startswith("http://primary"):
+                return "$$\\begin{aligned} x^2 \\end{aligned}$$\n\nRewritten:\nx squared"
+            return "x squared"
+
+        out = await self._run(complete, fallback=("http://fallback:2/v1/chat/completions", "fallback-model"))
+        self.assertEqual(out, "x squared")
+
+    async def test_thinking_is_off_for_the_rewrite(self):
+        payloads = []
+
+        async def complete(payload, urls=None):
+            payloads.append(payload)
+            return "x squared"
+
+        await self._run(complete, fallback=None)
+        self.assertEqual(payloads[0]["chat_template_kwargs"], {"enable_thinking": False})
+
 
 class ReaderTests(unittest.TestCase):
     def test_citation_abbreviations_do_not_end_sentences(self):
