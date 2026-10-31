@@ -64,8 +64,62 @@ Examples:
 Output ONLY the rewritten text. No preamble, no explanation."""
 
 
+# A converted PDF breaks a paragraph at every page boundary, mid-sentence, and a
+# figure or table that sat at the top of the next page can land between the two
+# halves. Each half then becomes its own chunk, so the sentence is spoken in two
+# pieces. A paragraph is rejoined to the next prose paragraph when it does not end
+# like a sentence and the next one starts in lower case (or it ended on a comma).
+# Floats found in between (captions, images, tables, page numbers) move after it.
+# Mid-sentence: ends in a word, a comma, or a hyphen (not code's } or ;).
+_OPEN_END = re.compile(r'[A-Za-z0-9,-]$')
+_FLOAT = re.compile(
+    r'^(?:\**_*(?:Fig\.|Figs\.|Figure|Table|Tab\.)\s*\d'   # caption
+    r'|!\['                                               # image
+    r'|\|'                                                # table
+    r'|\d{1,4}$'                                          # page number
+    r'|<[^>]+>\s*(?:</[^>]+>)?$)'                         # bare html, e.g. a page anchor
+)
+_NOT_PROSE = re.compile(r'^(?:#|[-*+•]\s|\d+[.)]\s|\$\$|\\\[|\\begin|```|>|\|)')
+_MAX_FLOATS = 4
+
+
+def _is_prose(para: str) -> bool:
+    para = para.lstrip()
+    return not _NOT_PROSE.match(para) and not _FLOAT.match(para)
+
+
+def join_page_breaks(markdown: str) -> str:
+    paras = [p.rstrip() for p in re.split(r'\n\s*\n', markdown) if p.strip()]
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(paras):
+        para, floats = paras[i], []
+        i += 1
+        # never inside or across a fenced code block
+        fenced = in_fence or "```" in para
+        in_fence ^= para.count("```") % 2 == 1
+        while not fenced and _is_prose(para) and _OPEN_END.search(para) and not HEADING_RE.match(para.rsplit("\n", 1)[-1]):
+            j = i
+            while j < len(paras) and j - i < _MAX_FLOATS and _FLOAT.match(paras[j].lstrip()):
+                j += 1
+            if j == len(paras) or not _is_prose(paras[j]):
+                break
+            nxt = paras[j].lstrip()
+            if "```" in nxt or not (nxt[0].islower() or para.endswith(',')):
+                break
+            # a word hyphenated across the break stays one word
+            para = f"{para}{nxt}" if re.search(r'[a-z]-$', para) else f"{para} {nxt}"
+            floats += paras[i:j]
+            i = j + 1
+        out.append(para)
+        out.extend(floats)
+    return "\n\n".join(out)
+
+
 def split_into_chunks(markdown: str) -> list[dict]:
     """Split markdown into chunks by headings and paragraphs."""
+    markdown = join_page_breaks(markdown)
     chunks = []
     current_heading = None
     current_level = None

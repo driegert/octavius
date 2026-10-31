@@ -762,6 +762,9 @@ Still live:
 - Converts PDF, markdown, and extracted HTML content into speech-oriented JSON.
 - HTML extraction uses trafilatura.
 - Math-heavy paragraphs are sent to the reader LLM; non-math paragraphs are cleaned locally.
+- Before chunking, `reader_text.join_page_breaks` rejoins a paragraph a PDF page break split mid-sentence (it ends
+  in a word, comma or hyphen and the next prose paragraph starts lower case, or it ended on a comma), moving any
+  caption/image/table/page number found between the halves after it. Documents converted before 2026-10-31 keep their splits.
 - Playback is streamed sentence-by-sentence over WebSocket with position sync.
 - Document list auto-polls while any document is still `processing`.
 - Failed reader documents can be retried from the stored source metadata via `POST /api/reader/documents/{id}/retry`.

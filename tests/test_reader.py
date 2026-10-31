@@ -81,6 +81,35 @@ class ReaderTests(unittest.TestCase):
                          ["Shown by Smith et al.", "The next differs."])
         self.assertEqual(split("One. Two! Three? Four."), ["One.", "Two!", "Three?", "Four."])
 
+    def test_page_break_mid_sentence_is_rejoined(self):
+        join = reader_text.join_page_breaks
+        self.assertEqual(join("The spectrum was estimated with the\n\nmultitaper method. Next."),
+                         "The spectrum was estimated with the multitaper method. Next.")
+        # A caption or page number between the halves moves after the sentence.
+        self.assertEqual(
+            join("We fit the model to the\n\n**Fig. 2.** Residuals.\n\n12\n\nsecond half of the data."),
+            "We fit the model to the second half of the data.\n\n**Fig. 2.** Residuals.\n\n12")
+        self.assertEqual(join("A word split across pages, multi-\n\ntaper."), "A word split across pages, multi-taper.")
+        self.assertEqual(join("Ends on a comma,\n\nThomson showed."), "Ends on a comma, Thomson showed.")
+
+    def test_page_break_join_leaves_real_paragraphs_alone(self):
+        join = reader_text.join_page_breaks
+        for md in ("A finished sentence.\n\nlowercase start.",
+                   "An unpunctuated line\n\nThen a capitalised one.",
+                   "## A heading\n\nbody text.",
+                   "Text before\n## Heading\n\nlowercase body.",
+                   "Intro to the list\n\n- item one",
+                   "Leads into an equation\n\n$$x^2$$",
+                   "```\nif (x) {\n\n  y();\n}\n```",
+                   "if (x) {\n\nreturn y;"):
+            with self.subTest(md=md):
+                self.assertEqual(join(md), md)
+
+    def test_split_into_chunks_keeps_a_page_split_sentence_together(self):
+        paras = ["First paragraph.", "Second one.", "Third runs onto the", "next page here.", "Fifth."]
+        chunks = split_into_chunks("\n\n".join(paras))
+        self.assertIn("Third runs onto the next page here.", [c["text"] for c in chunks])
+
 
     def test_clean_for_speech_strips_links_urls_and_citations(self):
         text = "See [paper](https://example.com) and https://x.test [1] (Smith et al., 2024)."
