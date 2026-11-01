@@ -85,7 +85,7 @@
   }
 
   function chatVoice() {
-    return mainPrefs().voice || 'Imogen';
+    return mainPrefs().voice || 'Delia';
   }
 
   function voicePrefs() {

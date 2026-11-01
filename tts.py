@@ -4,7 +4,7 @@ from service_clients import tts_client
 
 # --- Markdown -> speech normalization --------------------------------------
 # The LLM frequently emits light markdown (**bold**, `code`, "1)" lists,
-# [links](url), ## headings). Voxtral/Kokoro receive the `input` string
+# [links](url), ## headings). The TTS engine receives the `input` string
 # verbatim, so stray markup gets verbalized ("asterisk asterisk Important
 # news") or produces undefined pauses. We strip it here, at the single choke
 # point every TTS caller passes through.
@@ -85,8 +85,7 @@ def speechify(text: str) -> str:
 
 
 async def synthesize(text: str, voice: str | None = None) -> bytes:
-    """POST text to TTS. Kokoro voices go direct to Kokoro; all others go
-    through Voxtral-with-Kokoro-fallback via the circuit breaker.
+    """POST text to TTS (Phonon); a voice it lacks is sent as the default.
 
     Markdown is normalized to speakable prose (see `speechify`) before the
     text reaches the engine.

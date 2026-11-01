@@ -418,28 +418,24 @@ file: `~/.config/octavius/models.json.bak-2026-10-31-pre-workhorse`.
     - **Modalities churn too.** Today the text-only hops are `lilripper:8010` `glm-5.3-flash` and workhorse's `gemma4-12b`, which is why neither appears in the vision chain. Read `architecture.input_modalities` before assuming a hop can take images, in either direction.
   - **Keep each endpoint's consumers on one alias.** If two roles on one router name different models, interleaving a document read with a consult thrashes the router between resident models. Today that means workhorse's four consumers (subagent primary, reader primary, summary primary, main hop 3) all name `gemma4-12b` (vLLM serves one model, so it cannot thrash, but keep the rule for router hosts), and lilbuddy's two (main primary, vision primary) both name `gemma4-26b-a4b`.
   - **Failover now spans three hosts.** Every role falls back to lilripper `:8020`; the main chain also has workhorse as a third hop. The remaining hole: lilripper down plus workhorse down leaves consults, reader and summaries with nowhere to go, and lilbuddy plus lilripper down leaves image turns stranded.
-- **TTS**: **Phonon 31m** at `lilripper:8881/v1/audio/speech` (CPU, open, voice
-  `Imogen`) — the live default since 2026-10-28. It is configured **env-only** in
-  `~/.config/octavius/env` (`OCTAVIUS_TTS_FALLBACK_*`, `OCTAVIUS_TTS_VOICE`,
-  `OCTAVIUS_TTS_KOKORO_VOICES`); the code defaults match since 2026-10-30
-  (Phonon, voice `Imogen`, `DEFAULT_KOKORO_VOICES` = Phonon's seven voices). `TTSSettings.voxtral_enabled` is **False**, so every synth call
-  goes straight to the `FALLBACK_*` endpoint, and any voice not in
-  `OCTAVIUS_TTS_KOKORO_VOICES` (misnamed now: "voices passed through unchanged") is
-  remapped to `OCTAVIUS_TTS_FALLBACK_VOICE`. Only list names the server has
-  (`GET /v1/audio/voices`): Phonon **400s on unknown voices**, including every
-  Kokoro name, and the sentence then plays silent (`TTS failed for chunk`). Per
-  request it is ~0.09 s + ~0.011 s/word (p50 0.27-0.31 s, p90 0.4 s over 1-31 words,
-  measured 2026-10-30) against Kokoro-GPU's ~0.07 s; later sentences synth while earlier
-  ones play, so only the first sentence of a reply pays it. **Rollback:** Kokoro is still up on
-  `lilripper:8880` —
-  `cp ~/.config/octavius/env.bak-2026-10-28-pre-phonon ~/.config/octavius/env && systemctl --user restart octavius`
-  (the backup predates the Phonon defaults, so after restoring it also set
-  `OCTAVIUS_TTS_FALLBACK_URL=http://lilripper:8880/v1/audio/speech`,
-  `_FALLBACK_MODEL=kokoro`, `_FALLBACK_VOICE`/`OCTAVIUS_TTS_VOICE=bm_lewis` and
-  `OCTAVIUS_TTS_KOKORO_VOICES` to Kokoro names).
-  Voxtral 4B (`OCTAVIUS_TTS_URL`) is wired but disabled — its inconsistent output
-  levels make it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1`
-  to restore the Voxtral-primary → fallback path (with circuit breaker).
+- **TTS**: **Phonon 31m** at `lilripper:8881/v1/audio/speech` (CPU, open), the only
+  TTS endpoint since 2026-10-31 (Voxtral, disabled since August, was retired from the
+  code then, with its voices and circuit breaker). Env: `OCTAVIUS_TTS_URL`, `_MODEL`,
+  `_VOICE` (the server and reader default, `Imogen`), `_AGENT_VOICE` (the agent's
+  default on `/` until Dave picks one, `Delia`), `_VOICES` (Phonon's seven) and
+  `_FEMALE_VOICES` (`Imogen`, `Delia`); code defaults match `~/.config/octavius/env`.
+  A voice not in `_VOICES` is sent as `_VOICE`: Phonon **400s on unknown voices** and
+  the sentence would play silent (`TTS failed for chunk`), so list only names
+  `GET /v1/audio/voices` returns. **The agent's name follows its voice:** Octavja in a
+  female voice, Octavius in a male one (`TTSSettings.agent_name`; `/api/voices` returns
+  `agent_names`, and `/`'s wordmark, title and placeholder follow the picked voice).
+  Both system prompts (native, and pi_harness's octavius profile) only say it answers
+  to either name. Per request Phonon is ~0.09 s + ~0.011 s/word (p50 0.27-0.31 s, p90
+  0.4 s over 1-31 words, measured 2026-10-30) against Kokoro-GPU's ~0.07 s; later
+  sentences synth while earlier ones play, so only the first sentence of a reply pays
+  it. **Rollback:** Kokoro is still up on `lilripper:8880`: set `OCTAVIUS_TTS_URL` to
+  it, `_MODEL=kokoro`, and `_VOICE`/`_AGENT_VOICE`/`_VOICES`/`_FEMALE_VOICES` to
+  Kokoro names, then restart.
 - **Reader LLM**: `gemma4-12b` at `workhorse:8010/v1/chat/completions` (open; triplestuffed until 2026-10-31), with `qwen3.8-27b` at `lilripper:8020` (**behind auth**; see "Configuration and secrets") as fallback — both since 2026-10-28, replacing the retired `lilripper:8010` 35B. The reader is single-endpoint *per call* but the role's second `models.json` entry is its failover target: `reader_text.py::_llm_convert_math` tries each endpoint in turn before degrading to local `strip_latex`, which is what a dead primary used to do to every math chunk (dollar-stripping, silently). `ReaderSettings.llm_fallback_url/model` read the second entry via `_role_single(..., index=1)`; a half-configured entry raises. It sends `chat_template_kwargs.enable_thinking: false` (since 2026-10-31: with thinking on, gemma4-12b spent all 8192 `max_tokens` reasoning and returned null content after ~53 s on every math chunk, so each one fell through to `:8020`; off, it answers correctly in ~1 s). Note that `LLMChainClient.complete()` merges per-url `params` from the **main** chain, and **both** reader URLs are also main-chain hops (workhorse is hop 3, `:8020` hop 2) — so any `params` set on those main-chain entries silently apply to reader calls too (none today). The primary alias deliberately matches the other workhorse consumers (see "Keep each endpoint's consumers on one alias").
 - **Summary/tag generation**: `workhorse:8010` (`gemma4-12b`; triplestuffed until 2026-10-31) with fallback `lilripper:8020` (`qwen3.8-27b`), since 2026-10-28. The order matters more than the traffic volume suggests: summaries fire at conversation *end*, long after Dave has moved on, so with `:8020` primary a background job could quietly evict a model he had loaded there by hand. Both payloads send `chat_template_kwargs.enable_thinking: false` with `max_tokens` 1024 (summary) / 768 (tags); the 12B honours the switch (0 reasoning chars, verified 2026-10-28) — a model that ignored it could spend the budget thinking and return empty content. `SummaryClient` is **not** an `LLMChainClient`, but it carries a model **per URL** (`summary_model` / `summary_fallback_model`); before 2026-08-26 it sent one model to both URLs, a guaranteed 400 on the fallback once the routers stopped sharing an alias. It attaches `auth_headers` (since 2026-08-08). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:

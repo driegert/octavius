@@ -119,20 +119,17 @@ def _role_single(role: str, key: str, env_var: str, default, index: int = 0):
 class TTSSettings:
     url: str
     model: str
+    # The server's default (the reader's, and any client that sends none).
     voice: str
+    # The agent's default on the main page, until Dave picks one.
+    agent_voice: str
     format: str
     voices: list[str]
-    voxtral_voices: list[str]
-    kokoro_voices: list[str]
-    fallback_url: str
-    fallback_model: str
-    fallback_voice: str
-    # When False (default), Voxtral is never attempted: all synth calls go
-    # straight to the fallback (Phonon), with Voxtral-only voices remapped to the
-    # fallback voice. Voxtral's voice quality is fine, but its inconsistent sound
-    # levels make it unsuitable as the live primary. Set OCTAVIUS_TTS_VOXTRAL_ENABLED=1
-    # to restore the primary→fallback path with circuit breaker.
-    voxtral_enabled: bool = False
+    female_voices: list[str]
+
+    def agent_name(self, voice: str | None) -> str:
+        """The agent is Octavja in a female voice, Octavius otherwise."""
+        return "Octavja" if voice in self.female_voices else "Octavius"
 
 
 # lilbuddy 26B 295k, lilripper :8020 262144, workhorse 64K (see docs/pi-backend-design.md).
@@ -265,37 +262,13 @@ class Settings:
     pi_brain: PiBrainSettings
 
 
-DEFAULT_VOXTRAL_VOICES = [
-    "de_male",
-    "de_female",
-    "neutral_male",
-    "neutral_female",
-    "casual_male",
-    "casual_female",
-    "cheerful_female",
-    "ar_male",
-    "es_female",
-    "es_male",
-    "fr_female",
-    "fr_male",
-    "hi_female",
-    "hi_male",
-    "it_female",
-    "it_male",
-    "nl_female",
-    "nl_male",
-    "pt_female",
-    "pt_male",
-]
-
-# Despite the name (kept to match OCTAVIUS_TTS_KOKORO_VOICES), these are the
-# voices passed through unchanged to the fallback endpoint; any other voice is
-# remapped to fallback_voice. Defaults are Phonon 31m's voices (the live TTS
-# since 2026-10-28). Phonon 400s on unknown names, so list only what
-# GET /v1/audio/voices returns.
-DEFAULT_KOKORO_VOICES = [
+# Phonon 31m's voices (the TTS since 2026-10-28). Phonon 400s on unknown names,
+# so list only what GET /v1/audio/voices returns; any other voice is sent as the
+# default. The female ones make the agent Octavja (TTSSettings.agent_name).
+DEFAULT_TTS_VOICES = [
     "Imogen", "Delia", "Hugh", "Edwin", "Spencer", "Teddy", "Sir Bramwell",
 ]
+DEFAULT_TTS_FEMALE_VOICES = ["Imogen", "Delia"]
 
 
 DEFAULT_TOOL_LABELS = {
@@ -538,8 +511,9 @@ _RAW_SYSTEM_PROMPT = """You are Octavius, Dave's personal voice assistant. You r
 entirely on Dave's homelab — no cloud, no external APIs, everything local and private.
 
 Your personality: competent, efficient, and dry. You get things done with minimal
-fuss and the occasional understated wit. Think Jarvis, but self-hosted. You know
-your name is Octavius and you're not shy about it.
+fuss and the occasional understated wit. Think Jarvis, but self-hosted. You go by
+two names, Octavius and Octavja, and Dave may use either; both are you (speech
+recognition may write Octavja as "Octavia").
 
 You have access to tools:
 - Web search (Google) for GENERAL web lookups ONLY — news, recipes,
@@ -726,21 +700,14 @@ def load_settings() -> Settings:
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
         ],
     )
-    voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
-    kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
-    voxtral_enabled = _env_str("OCTAVIUS_TTS_VOXTRAL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
     tts = TTSSettings(
-        url=_env_str("OCTAVIUS_TTS_URL", "http://lilripper:8030/v1/audio/speech"),
-        model=_env_str("OCTAVIUS_TTS_MODEL", "voxtral-4b-tts"),
+        url=_env_str("OCTAVIUS_TTS_URL", "http://lilripper:8881/v1/audio/speech"),
+        model=_env_str("OCTAVIUS_TTS_MODEL", "phonon-31m-en"),
         voice=_env_str("OCTAVIUS_TTS_VOICE", "Imogen"),
+        agent_voice=_env_str("OCTAVIUS_TTS_AGENT_VOICE", "Delia"),
         format=_env_str("OCTAVIUS_TTS_FORMAT", "wav"),
-        voices=voxtral_voices + kokoro_voices,
-        voxtral_voices=voxtral_voices,
-        kokoro_voices=kokoro_voices,
-        fallback_url=_env_str("OCTAVIUS_TTS_FALLBACK_URL", "http://lilripper:8881/v1/audio/speech"),
-        fallback_model=_env_str("OCTAVIUS_TTS_FALLBACK_MODEL", "phonon-31m-en"),
-        fallback_voice=_env_str("OCTAVIUS_TTS_FALLBACK_VOICE", "Imogen"),
-        voxtral_enabled=voxtral_enabled,
+        voices=_env_json("OCTAVIUS_TTS_VOICES", DEFAULT_TTS_VOICES),
+        female_voices=_env_json("OCTAVIUS_TTS_FEMALE_VOICES", DEFAULT_TTS_FEMALE_VOICES),
     )
     # The code-default failover applies only when models.json says nothing about
     # the reader. A file that lists a single reader entry means "no fallback".

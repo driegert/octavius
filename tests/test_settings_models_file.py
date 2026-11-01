@@ -95,13 +95,17 @@ class ModelsFileTests(unittest.TestCase):
             if var.startswith("OCTAVIUS_TTS_"):
                 os.environ.pop(var)
         _, st = self._load()
-        self.assertEqual(st.tts.fallback_url, "http://lilripper:8881/v1/audio/speech")
-        self.assertEqual(st.tts.fallback_model, "phonon-31m-en")
-        self.assertEqual(st.tts.fallback_voice, "Imogen")
+        self.assertEqual(st.tts.url, "http://lilripper:8881/v1/audio/speech")
+        self.assertEqual(st.tts.model, "phonon-31m-en")
         self.assertEqual(st.tts.voice, "Imogen")
-        self.assertIn(st.tts.voice, st.tts.kokoro_voices)
-        self.assertIn(st.tts.fallback_voice, st.tts.kokoro_voices)
-        self.assertFalse(st.tts.voxtral_enabled)
+        self.assertEqual(st.tts.agent_voice, "Delia")
+        self.assertIn(st.tts.voice, st.tts.voices)
+        self.assertIn(st.tts.agent_voice, st.tts.voices)
+        self.assertTrue(set(st.tts.female_voices) <= set(st.tts.voices))
+        self.assertEqual(st.tts.agent_name("Delia"), "Octavja")
+        self.assertEqual(st.tts.agent_name("Imogen"), "Octavja")
+        self.assertEqual(st.tts.agent_name("Hugh"), "Octavius")
+        self.assertEqual(st.tts.agent_name(None), "Octavius")
 
     def test_file_overrides_code_defaults(self):
         _, st = self._load({"roles": {"main": [{"url": "http://h:1/v1", "model": "m"}]}})

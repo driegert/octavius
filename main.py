@@ -213,10 +213,8 @@ async def voices():
     return JSONResponse({
         "voices": settings.tts.voices,
         "default": settings.tts.voice,
-        "voices_by_engine": {
-            "voxtral": settings.tts.voxtral_voices,
-            "kokoro": settings.tts.kokoro_voices,
-        },
+        "agent_default": settings.tts.agent_voice,
+        "agent_names": {v: settings.tts.agent_name(v) for v in settings.tts.voices},
     })
 
 

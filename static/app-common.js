@@ -125,6 +125,7 @@
     const {
       currentVoice,
       fallbackVoice = 'Imogen',
+      agent = false, // the agent's voice (main page), not the reader's
       onLoaded,
     } = options || {};
 
@@ -139,22 +140,9 @@
     }
 
     selectEl.innerHTML = '';
-    const byEngine = data.voices_by_engine || null;
-    if (byEngine) {
-      const engineLabels = { kokoro: 'Kokoro (fast, reliable)', voxtral: 'Voxtral (expressive)' };
-      for (const engine of ['kokoro', 'voxtral']) {
-        const voices = byEngine[engine] || [];
-        if (!voices.length) continue;
-        const group = document.createElement('optgroup');
-        group.label = engineLabels[engine] || engine;
-        for (const voice of voices) group.appendChild(makeOption(voice));
-        selectEl.appendChild(group);
-      }
-    } else {
-      for (const voice of data.voices || []) selectEl.appendChild(makeOption(voice));
-    }
+    for (const voice of data.voices || []) selectEl.appendChild(makeOption(voice));
 
-    let resolvedVoice = data.default || fallbackVoice;
+    let resolvedVoice = (agent && data.agent_default) || data.default || fallbackVoice;
     if (currentVoice && (data.voices || []).includes(currentVoice)) {
       resolvedVoice = currentVoice;
     }

@@ -184,6 +184,16 @@ class MainTests(unittest.TestCase):
         self.assertEqual(again.status_code, 304)
         self.assertNotIn("cache-control", health.headers)
 
+    def test_voices_name_the_agent_by_voice(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                data = client.get("/api/voices").json()
+        self.assertNotIn("voices_by_engine", data)
+        self.assertEqual(data["agent_default"], "Delia")
+        self.assertEqual(data["agent_names"]["Delia"], "Octavja")
+        self.assertEqual(data["agent_names"]["Hugh"], "Octavius")
+        self.assertEqual(set(data["agent_names"]), set(data["voices"]))
+
     def test_ui_pages_carry_content_security_policy(self):
         with _isolated_app(_FakeMCPManager):
             with TestClient(main.app) as client:

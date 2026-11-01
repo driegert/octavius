@@ -59,7 +59,7 @@
   let acceptPartials = false; // true from stt_start until that capture's transcript
   let dropAudio = false; // after barge-in, ignore stale audio until the next transcript
 
-  let currentVoice = 'de_male';
+  let currentVoice = null; // from prefs at boot, else the server's agent default
   let sttEnabled = true;
   let ttsEnabled = true;
   let talkMode = 'hold';
@@ -503,7 +503,7 @@
   function sendSettings() {
     send({
       type: 'settings',
-      voice: currentVoice,
+      ...(currentVoice ? { voice: currentVoice } : {}),
       tts: ttsEnabled,
       proactive_speak: proactiveSpeak,
     });
@@ -1131,23 +1131,40 @@
     updateInputMode();
   });
 
-  OctaviusApp.loadVoices(voiceSelect, {
-    currentVoice,
-    onLoaded(_data, resolvedVoice) {
-      currentVoice = resolvedVoice;
-      applyVoicePrefs(currentVoice);
-      sendSettings();
-    },
-  }).catch(() => {
-    const opt = document.createElement('option');
-    opt.value = 'Imogen';
-    opt.textContent = 'Imogen';
-    voiceSelect.appendChild(opt);
-  });
+  // The agent is Octavja in a female voice, Octavius in a male one.
+  let agentNames = {};
+  const wordmark = document.querySelector('.wordmark');
+
+  function applyAgentName() {
+    const name = agentNames[currentVoice] || 'Octavius';
+    if (wordmark) wordmark.textContent = name;
+    document.title = name;
+    textInput.placeholder = `Write to ${name}`;
+  }
+
+  function loadVoiceList() {
+    OctaviusApp.loadVoices(voiceSelect, {
+      currentVoice,
+      agent: true,
+      onLoaded(data, resolvedVoice) {
+        agentNames = data.agent_names || {};
+        currentVoice = resolvedVoice;
+        applyVoicePrefs(currentVoice);
+        applyAgentName();
+        sendSettings();
+      },
+    }).catch(() => {
+      const opt = document.createElement('option');
+      opt.value = currentVoice || 'Delia';
+      opt.textContent = opt.value;
+      voiceSelect.appendChild(opt);
+    });
+  }
 
   voiceSelect.addEventListener('change', () => {
     currentVoice = voiceSelect.value;
     applyVoicePrefs(currentVoice);
+    applyAgentName();
     sendSettings();
     persistCurrent();
   });
@@ -1207,6 +1224,7 @@
     proactiveSpeakCb.checked = proactiveSpeak;
   }
   applyVoicePrefs(currentVoice);
+  loadVoiceList();
   updateInputMode();
   setStatus('Connecting…');
 

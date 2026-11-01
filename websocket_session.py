@@ -142,7 +142,7 @@ class WebSocketSessionState:
     mcp_manager: object
     subagent_dispatcher: object
     conversation: Conversation = field(default_factory=Conversation)
-    voice: str = settings.tts.voice
+    voice: str = settings.tts.agent_voice
     tts_enabled: bool = True
     reader_task: asyncio.Task | None = None
     reader_seq: int | None = None
