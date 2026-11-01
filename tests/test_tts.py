@@ -17,6 +17,35 @@ class SpeechifyTests(unittest.TestCase):
         for text in ("a 2x2 matrix", "1920x1080", "address 0x1F", "the x axis", "4.6 x 2"):
             self.assertEqual(speechify(text), text)
 
+    def test_dash_ranges_are_read_with_to(self):
+        cases = {
+            "2– 8%": "2 to 8%",
+            "rose 2–8% last year": "rose 2 to 8% last year",
+            "2 – 8": "2 to 8",
+            "1990–2000": "1990 to 2000",
+            "pp. 12–15": "pp. 12 to 15",
+            "2.5—3.5 kg": "2.5 to 3.5 kg",
+            "2–3x faster": "2 to 3 times faster",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(speechify(text), expected)
+
+    def test_hyphen_ranges_only_where_unambiguous(self):
+        cases = {
+            "a 5-10% drop": "a 5 to 10% drop",
+            "5 - 10%": "5 to 10%",
+            "see pp. 12-15": "see pp. 12 to 15",
+            "from 1990-2000": "from 1990 to 2000",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(speechify(text), expected)
+
+    def test_hyphens_that_are_not_ranges_are_kept(self):
+        for text in ("COVID-19", "x-1", "-5", "from -3 to 4", "2026-10-31", "1-800-555",
+                     "1-800-555-1234", "5 - 3 = 2", "-2-8%", "v1.2-3%", "2020-2021-2022",
+                     "ages 3-5", "1990-95", "temp –5"):
+            self.assertEqual(speechify(text), text)
+
     def test_dotted_initialisms_lose_their_dots(self):
         self.assertEqual(speechify("published by U.S."), "published by US.")
         self.assertEqual(speechify("by U.S. state governors"), "by US state governors")

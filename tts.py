@@ -38,6 +38,20 @@ _ET_AL = re.compile(r'\b(et al)\.', re.IGNORECASE)
 # the number ("2x2" and "1920x1080" already read as "2 by 2"; "0x1F" is untouched).
 _MULTIPLIER = re.compile(r'(\d(?:[\d,]*\d)?(?:\.\d+)?)[x\u00d7](?!\w|\.\d)')
 _INITIALISM = re.compile(r'\b(?:[A-Z]\.){2,}(?=[\s,;:)]|$)')
+# Number ranges: Phonon reads "2–8%" and "2– 8%" as "two eight percent". An en or em dash
+# between digits is always a range ("2–8%", "2 – 8", "1990–2000", "pp. 12–15"), spaced or not.
+# A plain hyphen is only a range where nothing else is likely: before a percent sign
+# ("5-10%"), after a page marker ("pp. 12-15"), or between two years ("1990-2000"). Not in
+# general, because it is also subtraction ("5 - 3"), a sign ("-5"), a name ("COVID-19"),
+# an ISO date ("2026-10-31") or a phone/ID chain ("1-800-555"); a hyphen or word on
+# either side of the pair rules it out.
+_DASH_RANGE = re.compile(r'(\d)[ \t]*[–—][ \t]*(?=\d)')
+_NUM = r'\d+(?:\.\d+)?'
+_HYPHEN_RANGE = re.compile(
+    rf'(?<![\w.\-−])({_NUM})(?: - |-)(?=(?:{_NUM})%)'                  # 5-10%, 5 - 10%
+    r'|(?<=\bpp\.)( ?\d+)-(?=\d+(?![\w\-]))'                                # pp. 12-15
+    r'|(?<![\w.\-])((?:1[5-9]|20)\d\d)-(?=(?:1[5-9]|20)\d\d(?![\w\-]))'      # 1990-2000
+)
 
 
 def _undot(m: re.Match) -> str:
@@ -63,6 +77,8 @@ def speechify(text: str) -> str:
     cleaned = _MD_LIST.sub('', cleaned)        # only line-leading markers (real lists)
     cleaned = _ET_AL.sub(r'\1', cleaned)
     cleaned = _MULTIPLIER.sub(r'\1 times', cleaned)
+    cleaned = _DASH_RANGE.sub(r'\1 to ', cleaned)
+    cleaned = _HYPHEN_RANGE.sub(lambda m: next(g for g in m.groups() if g) + ' to ', cleaned)
     cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()
