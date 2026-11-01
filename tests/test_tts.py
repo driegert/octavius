@@ -10,6 +10,13 @@ class SpeechifyTests(unittest.TestCase):
         self.assertEqual(speechify("Thomson et al."), "Thomson et al")
         self.assertEqual(speechify("pet al. fetal."), "pet al. fetal.")
 
+    def test_multiplier_x_is_read_as_times(self):
+        self.assertEqual(speechify("a 4.6x speedup"), "a 4.6 times speedup")
+        self.assertEqual(speechify("It is 10x faster, about 1,000x."), "It is 10 times faster, about 1,000 times.")
+        self.assertEqual(speechify("roughly 3×"), "roughly 3 times")
+        for text in ("a 2x2 matrix", "1920x1080", "address 0x1F", "the x axis", "4.6 x 2"):
+            self.assertEqual(speechify(text), text)
+
     def test_dotted_initialisms_lose_their_dots(self):
         self.assertEqual(speechify("published by U.S."), "published by US.")
         self.assertEqual(speechify("by U.S. state governors"), "by US state governors")

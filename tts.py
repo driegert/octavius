@@ -34,6 +34,9 @@ _WS = re.compile(r'[ \t]{2,}')
 _ET_AL = re.compile(r'\b(et al)\.', re.IGNORECASE)
 # Dotted initialisms (U.S., U.K.): Phonon garbles one that ends the text ("published
 # by U.S." came back as "by you later state" with extra babble) and reads "US" cleanly.
+# A multiplier: Phonon reads "4.6x" as "4.6 back" and "10x" as "10 bikes". Only an x that ends
+# the number ("2x2" and "1920x1080" already read as "2 by 2"; "0x1F" is untouched).
+_MULTIPLIER = re.compile(r'(\d(?:[\d,]*\d)?(?:\.\d+)?)[x\u00d7](?!\w|\.\d)')
 _INITIALISM = re.compile(r'\b(?:[A-Z]\.){2,}(?=[\s,;:)]|$)')
 
 
@@ -59,6 +62,7 @@ def speechify(text: str) -> str:
     cleaned = _MD_HEADING.sub('', cleaned)
     cleaned = _MD_LIST.sub('', cleaned)        # only line-leading markers (real lists)
     cleaned = _ET_AL.sub(r'\1', cleaned)
+    cleaned = _MULTIPLIER.sub(r'\1 times', cleaned)
     cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()
