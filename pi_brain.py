@@ -164,6 +164,9 @@ def classify_provider_error(message: str) -> str:
 PROGRESS_EVENTS = frozenset({"message_start", "message_update", "message_end", "turn_start", "turn_end"})
 
 
+PREFERRED = -1  # hop index of a Reader chat's chosen model (not in the shared chain)
+
+
 def _larger_context_hop(manager: "PiProcessManager", failed: int, tried: set) -> int | None:
     """The first untried hop whose configured window is bigger than the failed hop's."""
     contexts = getattr(manager.cfg, "model_contexts", None) or {}
@@ -364,6 +367,9 @@ class PiRpcProcess:
         self.on_kill = None
         # The provider/model id this process's session is on (failover hop).
         self.model: str | None = None
+        # pi thinking level now set, and the one the process started with (read on first change).
+        self.thinking: str | None = None
+        self.default_thinking: str | None = None
 
     @property
     def alive(self) -> bool:
@@ -473,6 +479,20 @@ class PiRpcProcess:
         if not resp.get("success"):
             raise HopFailure("client_error", f"set_model {model}: {resp.get('error')}")
         self.model = model
+
+    async def use_thinking(self, level: str | None) -> None:
+        """Set pi's thinking level; None restores the level the process started with."""
+        if self.default_thinking is None:
+            resp = await self.command("get_state", timeout=COMMAND_TIMEOUT_S)
+            self.default_thinking = (resp.get("data") or {}).get("thinkingLevel") or "medium"
+            self.thinking = self.thinking or self.default_thinking
+        target = level or self.default_thinking
+        if self.thinking == target:
+            return
+        resp = await self.command("set_thinking_level", timeout=COMMAND_TIMEOUT_S, level=target)
+        if not resp.get("success"):
+            raise HopFailure("client_error", f"set_thinking_level {target}: {resp.get('error')}")
+        self.thinking = target
 
     def stderr_tail(self) -> str:
         return " | ".join(self._stderr_tail)
@@ -645,6 +665,9 @@ class PiProcessManager:
     # pi_tools_server.PiToolsServer when running (main.py's lifespan sets it).
     tools_server: object = None
     failover: FailoverState = field(init=False)
+    # conversation id → (model, thinking level or None): a Reader chat's chosen model, tried
+    # before the shared chain (stream_pi_turn) and warmed instead of the current hop.
+    preferred: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.failover = FailoverState(
@@ -756,7 +779,7 @@ class PiProcessManager:
                     self.warm_stats.skipped += 1
                     return
                 proc, _ = await self.get(conv_id)
-            await self._send_warm(proc, reason)
+            await self._send_warm(proc, reason, conv_id=conv_id)
         except Exception as exc:
             self.warm_stats.note_error(f"{reason}: {exc}")
             log.warning("pi warm (%s) failed: %s", reason, exc)
@@ -783,17 +806,20 @@ class PiProcessManager:
             log.warning("pi warm (%s) failed: %s", reason, exc)
             return False
 
-    async def _send_warm(self, proc: PiRpcProcess, reason: str, wait: bool = False) -> str | None:
+    async def _send_warm(self, proc: PiRpcProcess, reason: str, wait: bool = False,
+                         conv_id: int | None = None) -> str | None:
         if proc.lock.locked():
             # A turn is running: its own request is warming the slot.
             self.warm_stats.skipped += 1
             return None
         # Warm the model the next turn will use: after a failover (or the return to the
         # primary) an idle process may still be on another hop.
+        model, thinking = self.preferred.get(conv_id) or (self.failover.model(), None)
         try:
-            await proc.use_model(self.failover.model())
+            await proc.use_model(model)
+            await proc.use_thinking(thinking)
         except Exception as exc:
-            log.warning("pi: could not switch to the current hop before warming: %s", exc)
+            log.warning("pi: could not switch to %s before warming: %s", model, exc)
         fut: asyncio.Future | None = None
         if wait:
             fut = asyncio.get_running_loop().create_future()
@@ -850,7 +876,16 @@ class PiProcessManager:
                     return
         self._recovery = asyncio.create_task(loop())
 
+    def prefer(self, conv_id: int, model: str | None, thinking: str | None = None) -> None:
+        """Have ``conv_id``'s turns try ``model`` first (None: the shared chain only)."""
+        if model:
+            self.preferred[conv_id] = (model, thinking)
+        else:
+            self.preferred.pop(conv_id, None)
+
     def rekey(self, old: int, new: int) -> None:
+        if old in self.preferred:
+            self.preferred[new] = self.preferred.pop(old)
         if old == new or old not in self.processes:
             return
         proc = self.processes.pop(old)
@@ -860,6 +895,7 @@ class PiProcessManager:
             asyncio.create_task(stale.kill())
 
     async def discard(self, conv_id: int | None) -> None:
+        self.preferred.pop(conv_id, None)
         proc = self.processes.pop(conv_id, None) if conv_id is not None else None
         if proc is not None:
             await proc.kill()
@@ -1032,7 +1068,10 @@ async def stream_pi_turn(
         tool_args: dict[str, dict] = {}
         started = time.monotonic()
         unbind_tools = manager.bind_tools(proc, session)
-        hop_idx = manager.failover.current()
+        # A Reader chat tries Dave's chosen model first (PREFERRED); a failure there moves the
+        # turn onto the shared chain without counting against the shared hop.
+        preferred = manager.preferred.get(conv_id) if getattr(state, "doc_chat_id", None) is not None else None
+        hop_idx = PREFERRED if preferred else manager.failover.current()
         tools_ran = False  # a tool has executed: its result is in pi's session, never re-run it
         prompt_sent = False
         deadline = started + settings.pi_brain.turn_timeout_s
@@ -1059,14 +1098,17 @@ async def stream_pi_turn(
 
         try:
             while True:  # one pass per model hop
-                hop = manager.failover.hops[hop_idx]
+                hop = preferred[0] if hop_idx == PREFERRED else manager.failover.hops[hop_idx]
                 tried.add(hop_idx)
+                state.pi_hop = hop  # what run_turn records and the Reader chat shows
                 generation = manager.failover.generation
                 settled = True  # nothing is running until a prompt is on its way
                 provider_error: str | None = None
                 try:
                     if getattr(proc, "model", hop) != hop:
                         await proc.use_model(hop)
+                    if hop_idx == PREFERRED or getattr(proc, "thinking", None) is not None:
+                        await proc.use_thinking(preferred[1] if hop_idx == PREFERRED else None)
                     if prompt_sent:
                         # pi's session already holds Dave's message (and any tool results);
                         # RPC has no "continue", so a short note stands in for it.
@@ -1198,7 +1240,9 @@ async def stream_pi_turn(
                         # Text was already spoken, so the turn ends on it; but the hop broke, and
                         # the next conversation should hear about that before it hits it too.
                         kind = classify_provider_error(provider_error)
-                        if kind == "context_overflow":
+                        if hop_idx == PREFERRED:
+                            log.warning("pi: %s (Reader chat choice) broke after answering: %s", hop, provider_error[:200])
+                        elif kind == "context_overflow":
                             manager.failover.note_local(hop_idx, kind, provider_error)
                         else:
                             manager.failover.fail(hop_idx, kind, provider_error, generation)
@@ -1218,6 +1262,13 @@ async def stream_pi_turn(
                             await manager.discard(conv_id)
                             raise PiTurnError(f"pi would not stop after {hop} failed: {failure}") from failure
                         settled = True
+                    if hop_idx == PREFERRED:
+                        log.warning("pi: %s (Reader chat choice) failed (%s: %s); trying the shared chain",
+                                    hop, failure.kind, failure.reason[:200])
+                        hop_idx = manager.failover.current()
+                        if status_callback:
+                            await status_callback("Trying another model...")
+                        continue
                     if failure.kind == "empty_output":
                         # Also about the request (the token budget), not the hop's health.
                         manager.failover.note_local(hop_idx, failure.kind, failure.reason)

@@ -142,6 +142,17 @@ DEFAULT_PI_MODEL_CONTEXTS = {
     "wh-vllm/gemma4-12b": 65536,
 }
 
+# Models Dave can pick in /reader's chat panel; the first is the default. `thinking` is a pi
+# thinking level, or null for the level the process starts with. The 12B without thinking
+# answers a document question in ~1-2 s where the 26B thinks for 8-17 s (measured
+# 2026-10-31), and the document anchors it; the others are there for questions that matter.
+DEFAULT_PI_READER_MODELS = [
+    {"id": "gemma4-12b", "label": "Gemma4 12B (fast)", "model": "wh-vllm/gemma4-12b", "thinking": "off"},
+    {"id": "gemma4-26b", "label": "Gemma4 26B-A4B", "model": "lb-unified/gemma4-26b-a4b", "thinking": None},
+    {"id": "qwen3.8-27b", "label": "Qwen3.8 27B", "model": "lrv-p01/qwen3.8-27b", "thinking": None},
+    {"id": "glm-5.3-flash", "label": "GLM-5.3 Flash", "model": "lr-p23/glm-5.3-flash", "thinking": None},
+]
+
 
 @dataclass(frozen=True)
 class PiBrainSettings:
@@ -180,6 +191,8 @@ class PiBrainSettings:
     # Context window (tokens) per hop, for moving a context-overflow turn to a bigger one.
     # A hop missing here is never chosen as the bigger one.
     model_contexts: dict = field(default_factory=lambda: dict(DEFAULT_PI_MODEL_CONTEXTS))
+    # /reader chat's model menu (DEFAULT_PI_READER_MODELS); OCTAVIUS_PI_READER_MODELS overrides.
+    reader_models: list = field(default_factory=lambda: [dict(m) for m in DEFAULT_PI_READER_MODELS])
     # Loopback MCP server exposing Octavius's own tools to pi (pi_tools_server.py).
     tools_port: int = 8032
 
@@ -859,6 +872,7 @@ def load_settings() -> Settings:
             first_output_timeout_s=_env_float("OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S", 60.0),
             tool_timeout_s=_env_float("OCTAVIUS_PI_TOOL_TIMEOUT_S", 120.0),
             model_contexts=_env_json("OCTAVIUS_PI_MODEL_CONTEXTS", dict(DEFAULT_PI_MODEL_CONTEXTS)),
+            reader_models=_env_json("OCTAVIUS_PI_READER_MODELS", [dict(m) for m in DEFAULT_PI_READER_MODELS]),
         ),
     )
 

@@ -668,6 +668,28 @@ body { overflow: hidden; }
 }
 @keyframes chat-pulse { 50% { opacity: 0.15; } }
 
+.chat-model-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 1.2rem;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 0.78rem;
+}
+.chat-model-row[hidden] { display: none; }
+.chat-model-row select {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.2rem 0.4rem;
+  font: inherit;
+}
+.chat-by { margin: 0.35rem 0 0; color: var(--ink-3); font-size: 0.72rem; }
+
 .chat-status { margin: 0; padding: 0 1.2rem 0.4rem; min-height: 1.4em; color: var(--ink-3); font-size: 0.78rem; }
 
 .chat-about {

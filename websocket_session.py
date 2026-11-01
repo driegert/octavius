@@ -33,6 +33,14 @@ log = logging.getLogger(__name__)
 _ITEM_CHAT_MAX_CHARS = 6000
 
 
+def reader_model_label(model: str) -> str:
+    """The Reader chat menu's label for a pi model id, or the id itself."""
+    for m in settings.pi_brain.reader_models:
+        if m.get("model") == model:
+            return m.get("label") or model
+    return model
+
+
 def build_item_chat_context(item: dict, item_id: int) -> str:
     # The saved_items stack is retiring and this legacy "chat about a saved item"
     # flow no longer has a fetch tool, so inline the (capped) content directly.
@@ -161,6 +169,8 @@ class WebSocketSessionState:
     # the place Dave was hearing when he last asked (doc_chat_position).
     doc_chat_id: int | None = None
     doc_chat_position: dict | None = None
+    # The pi model the current turn's attempt is on (pi_brain sets it); None before one starts.
+    pi_hop: str | None = None
 
 
 class WebSocketSessionHandler:
@@ -269,6 +279,7 @@ class WebSocketSessionHandler:
             "item_chat_reset": self.handle_item_chat_reset,
             "doc_chat_open": self.handle_doc_chat_open,
             "doc_chat_position": self.handle_doc_chat_position,
+            "doc_chat_model": self.handle_doc_chat_model,
             "stt_start": self.handle_stt_start,
             "stt_stop": self.handle_stt_stop,
             "typing_start": self.handle_typing_start,
@@ -420,6 +431,7 @@ class WebSocketSessionHandler:
             self.state.conversation.reset()
         self.state.doc_chat_id = doc_id
         self.state.doc_chat_position = None
+        choice = self._choose_reader_model(data.get("model"))
         self._request_pi_warm("doc_chat_open", start=True)
         await self.send_payload(
             {
@@ -432,9 +444,33 @@ class WebSocketSessionHandler:
                     for m in msgs
                     if m["role"] in ("user", "assistant") and m.get("content")
                 ],
+                "models": [{"id": m["id"], "label": m.get("label") or m["id"]} for m in settings.pi_brain.reader_models],
+                "model": choice["id"] if choice else None,
             }
         )
         log.info("Reader chat for document %d on conversation %d (%d messages)", doc_id, conv_id, len(msgs))
+
+    def _choose_reader_model(self, model_id) -> dict | None:
+        """Point this Reader chat's turns at a menu model (unknown or missing: the default)."""
+        models = settings.pi_brain.reader_models
+        if not models:
+            return None
+        choice = next((m for m in models if m.get("id") == model_id), models[0])
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is not None and self.state.history_session is not None:
+            pi_brain.prefer(self.state.history_session.conv_id, choice["model"], choice.get("thinking"))
+        return choice
+
+    async def handle_doc_chat_model(self, data: dict):
+        """Dave picked another model in the Reader chat's menu."""
+        if self.state.doc_chat_id is None:
+            return
+        choice = self._choose_reader_model(data.get("model"))
+        if choice is None:
+            return
+        self._request_pi_warm("doc_chat_model")
+        await self.send_payload({"type": "doc_chat_model", "doc_id": self.state.doc_chat_id, "model": choice["id"]})
+        log.info("Reader chat for document %d now on %s", self.state.doc_chat_id, choice["model"])
 
     async def handle_doc_chat_position(self, data: dict):
         """Where Dave was listening when he asked: the reader chat's "this"."""
@@ -1235,6 +1271,7 @@ class WebSocketSessionHandler:
                 await self.send_json("status", text)
 
             full_reply_parts = []
+            self.state.pi_hop = None
             # commit_reply_so_far (pi's confirm question) sends and clears these mid-turn.
             self._turn_reply = (full_reply_parts, turn_model)
             first_sentence = True
@@ -1268,6 +1305,8 @@ class WebSocketSessionHandler:
                             if first_sentence:
                                 await self.send_json("status", "Speaking...")
                                 first_sentence = False
+                                if use_pi and self.state.pi_hop:
+                                    turn_model = f"pi:{self.state.pi_hop}"
                                 log.info(
                                     "First sentence after %.2fs (%s, %s)",
                                     time.monotonic() - turn_start, source, turn_model,
@@ -1296,7 +1335,12 @@ class WebSocketSessionHandler:
                 # On the happy path, send the response and persist it. On the
                 # error path, agent_error is set and we skip these — the
                 # history record was already written above.
+                if use_pi and self.state.pi_hop:
+                    turn_model = f"pi:{self.state.pi_hop}"  # the model that actually answered
                 if full_reply and agent_error is None:
+                    if use_pi and self.state.doc_chat_id is not None and self.state.pi_hop:
+                        await self.send_payload({"type": "doc_chat_answered_by", "model": self.state.pi_hop,
+                                                 "label": reader_model_label(self.state.pi_hop)})
                     await self.send_json("response", full_reply)
                     if self.state.history_session:
                         latency_ms = int((time.monotonic() - turn_start) * 1000)

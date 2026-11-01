@@ -510,6 +510,58 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c("Request timed out."), "timeout")
         self.assertEqual(c("something odd"), "bad_response")
 
+    # --- a Reader chat's chosen model ------------------------------------------------
+
+    def _reader_session(self, model="glm/flash", thinking="off"):
+        session = _Session(self.manager)
+        session.state.doc_chat_id = 3
+        session.state.doc_chat_position = None
+        self.manager.prefer(session.state.history_session.conv_id, model, thinking)
+        return session
+
+    def _cmds(self, type_):
+        return [{k: v for k, v in r.items() if k != "id"} for r in self.records(type_)]
+
+    async def test_a_reader_chat_runs_on_its_chosen_model_and_thinking(self):
+        text, _, session = await self.turn("hi", session=self._reader_session())
+        self.assertEqual(text, "Hello there. How are you?")
+        self.assertEqual(self.runs(), [("glm/flash", "hi")])
+        self.assertIn({"type": "set_model", "provider": "glm", "modelId": "flash"}, self._cmds("set_model"))
+        self.assertIn({"type": "set_thinking_level", "level": "off"}, self._cmds("set_thinking_level"))
+        self.assertEqual(session.state.pi_hop, "glm/flash")
+
+    async def test_a_failed_choice_falls_to_the_shared_chain_without_moving_it(self):
+        self.fail(**{"glm/flash": "error:500: down"})
+        text, statuses, session = await self.turn("hi", session=self._reader_session())
+        self.assertEqual(text, f"Resumed on {PRIMARY}. All good.")
+        self.assertIn("Trying another model...", statuses)
+        self.assertEqual(self.runs(), [("glm/flash", "hi"), (PRIMARY, "RESUME")])
+        health = self.manager.failover.health()
+        self.assertEqual(health["current"], PRIMARY)  # the shared hop is untouched
+        self.assertEqual(health["failovers"], 0)
+        # Thinking goes back to the level the process started with for the shared hop.
+        self.assertEqual(self._cmds("set_thinking_level")[-1], {"type": "set_thinking_level", "level": "medium"})
+        self.assertEqual(session.state.pi_hop, PRIMARY)
+
+    async def test_the_choice_applies_only_while_in_a_reader_chat(self):
+        session = self._reader_session()
+        session.state.doc_chat_id = None  # e.g. the conversation loaded on the main page
+        await self.turn("hi", session=session)
+        self.assertEqual(self.runs(), [(PRIMARY, "hi")])
+        self.assertEqual(self._cmds("set_thinking_level"), [])
+
+    async def test_a_reader_chat_warms_its_chosen_model(self):
+        session = self._reader_session(model=HOP3, thinking="off")
+        conv = session.state.history_session.conv_id
+        await self.manager._warm_conversation(conv, start=True, reason="doc_chat_open")
+        order = [r["type"] if r["type"] != "prompt" else r.get("message") for r in self.records()
+                 if r["type"] in ("set_model", "set_thinking_level", "prompt")]
+        self.assertEqual(order[-1], "/warm")
+        self.assertIn({"type": "set_model", "provider": "wh-vllm", "modelId": "gemma4-12b"}, self._cmds("set_model"))
+        self.assertIn({"type": "set_thinking_level", "level": "off"}, self._cmds("set_thinking_level"))
+        await self.manager.discard(conv)
+        self.assertNotIn(conv, self.manager.preferred)
+
     # --- each failure class moves the turn to the next hop --------------------------
 
     async def _fails_over(self, primary_fault, kind, hang=False):

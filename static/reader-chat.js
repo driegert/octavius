@@ -6,6 +6,10 @@
   const closeBtn = $('chat-close');
   const newBtn = $('chat-new');
   const docEl = $('chat-doc');
+  const modelRow = $('chat-model-row');
+  const modelSel = $('chat-model');
+  const MODEL_KEY = 'octavius-reader-chat-model';
+  let answeredBy = '';  // the model behind the reply being committed (doc_chat_answered_by)
   const logEl = $('chat-log');
   const statusEl = $('chat-status');
   const form = $('chat-form');
@@ -188,6 +192,13 @@
     const el = streamingEl || addTurn('assistant');
     el.classList.remove('pending', 'streaming');
     el.innerHTML = renderMarkdown(text);
+    if (answeredBy) {
+      const by = document.createElement('p');
+      by.className = 'chat-by';
+      by.textContent = '— ' + answeredBy;
+      el.appendChild(by);
+      answeredBy = '';
+    }
     streamingEl = null;
     streamingText = '';
     scrollToEnd();
@@ -221,6 +232,7 @@
     sendBtn.disabled = !ready || busy || !input.value.trim();
     micBtn.disabled = !ready;
     newBtn.disabled = !ready;
+    modelSel.disabled = !ready || busy;
     micBtn.classList.toggle('recording', recording);
     micBtn.setAttribute('aria-pressed', recording ? 'true' : 'false');
     micBtn.setAttribute('aria-label', recording ? 'Stop recording' : 'Speak your question');
@@ -262,6 +274,29 @@
     return true;
   }
 
+  // ---------- Model menu ----------
+
+  function savedModel() {
+    try { return localStorage.getItem(MODEL_KEY) || ''; } catch (_err) { return ''; }
+  }
+
+  function fillModels(models, current) {
+    if (!Array.isArray(models) || !models.length) { modelRow.hidden = true; return; }
+    modelSel.replaceChildren(...models.map((m) => {
+      const opt = document.createElement('option');
+      opt.value = String(m.id);
+      opt.textContent = String(m.label || m.id);
+      return opt;
+    }));
+    if (current) modelSel.value = current;
+    modelRow.hidden = false;
+  }
+
+  modelSel.addEventListener('change', () => {
+    try { localStorage.setItem(MODEL_KEY, modelSel.value); } catch (_err) {}
+    send({ type: 'doc_chat_model', model: modelSel.value });
+  });
+
   function sendDocOpen(fresh) {
     const doc = window.OctaviusReader && window.OctaviusReader.currentDoc();
     if (!doc) return;
@@ -272,6 +307,8 @@
     docEl.textContent = doc.title || '';
     const msg = { type: 'doc_chat_open', doc_id: doc.id };
     if (fresh) msg.new = true;
+    const model = savedModel();
+    if (model) msg.model = model;
     send(msg);
     refreshUi();
   }
@@ -338,9 +375,16 @@
         loading = false;
         docEl.textContent = msg.title || docEl.textContent;
         renderMessages(msg.messages);
+        fillModels(msg.models, msg.model);
         setStatus('');
         refreshUi();
         if (open && !input.disabled && !recording) input.focus();
+        break;
+      case 'doc_chat_model':
+        if (msg.doc_id === openedDocId && msg.model) modelSel.value = msg.model;
+        break;
+      case 'doc_chat_answered_by':
+        answeredBy = String(msg.label || msg.model || '');
         break;
       case 'doc_chat_error':
         if (msg.doc_id != null && msg.doc_id !== openedDocId) return;

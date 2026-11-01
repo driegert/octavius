@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 import history
@@ -239,6 +240,36 @@ class DocChatOpenTests(unittest.TestCase):
             self.assertEqual(key, f"reader-doc:{self.doc_id}:{first['conversation_id']}")
             source = self.fx.conn.execute("SELECT source FROM conversations WHERE id = ?", (fresh["conversation_id"],)).fetchone()[0]
             self.assertEqual(source, "reader")
+
+        asyncio.run(run())
+
+    def test_model_menu_and_choice(self):
+        async def run():
+            h = self._handler()
+            prefs = []
+            h.ws.app.state.pi_brain = SimpleNamespace(
+                prefer=lambda conv, model, thinking=None: prefs.append((conv, model, thinking)),
+                request_warm=lambda *a, **k: None, discard=mock.AsyncMock())
+            await h.handle_doc_chat_open({"doc_id": self.doc_id, "model": "no-such-model"})
+            opened = self._last(h, "doc_chat_opened")
+            self.assertEqual([m["id"] for m in opened["models"]], ["gemma4-12b", "gemma4-26b", "qwen3.8-27b", "glm-5.3-flash"])
+            self.assertEqual(opened["model"], "gemma4-12b")  # unknown: the default
+            conv = opened["conversation_id"]
+            self.assertEqual(prefs[-1], (conv, "wh-vllm/gemma4-12b", "off"))
+            await h.handle_doc_chat_model({"model": "qwen3.8-27b"})
+            self.assertEqual(self._last(h, "doc_chat_model")["model"], "qwen3.8-27b")
+            self.assertEqual(prefs[-1], (conv, "lrv-p01/qwen3.8-27b", None))
+            # Remembered choice on open.
+            await h.handle_doc_chat_open({"doc_id": self.doc_id, "model": "glm-5.3-flash"})
+            self.assertEqual(self._last(h, "doc_chat_opened")["model"], "glm-5.3-flash")
+
+        asyncio.run(run())
+
+    def test_model_change_outside_a_reader_chat_is_ignored(self):
+        async def run():
+            h = self._handler()
+            await h.handle_doc_chat_model({"model": "qwen3.8-27b"})
+            self.assertFalse([m for m in h.ws.sent if m.get("type") == "doc_chat_model"])
 
         asyncio.run(run())
 
