@@ -150,9 +150,12 @@ async def ingest_document_task(
     markdown: str,
     title: str,
     original_md_path: str | None = None,
+    source_dir: str | None = None,
 ):
     with connect_db(Path(db_path)) as conn:
-        await ingest_document(conn, doc_id, markdown, title, original_md_path=original_md_path)
+        await ingest_document(
+            conn, doc_id, markdown, title, original_md_path=original_md_path, source_dir=source_dir
+        )
 
 
 async def ingest_pdf_document(
@@ -345,6 +348,8 @@ async def start_file_ingest(
 
     raw = read_text_file(file_path)
     markdown = raw
+    # relative image links in a markdown file resolve against its own folder
+    source_dir = str(file_path.resolve().parent)
     if is_likely_html(raw):
         markdown = extract_article_text(raw, reader_ingest_error_type)
         if not markdown:
@@ -353,7 +358,7 @@ async def start_file_ingest(
 
     with connect_db(db_path) as conn:
         doc_id = create_document(conn, title, "markdown", source_path=path)
-    asyncio.create_task(ingest_document_task(db_path, doc_id, markdown, title))
+    asyncio.create_task(ingest_document_task(db_path, doc_id, markdown, title, source_dir=source_dir))
     return {"id": doc_id, "status": "processing"}
 
 

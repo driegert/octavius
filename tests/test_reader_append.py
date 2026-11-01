@@ -73,7 +73,7 @@ def _fake_settings(directory: str):
     return SimpleNamespace(reader=SimpleNamespace(directory=directory))
 
 
-async def _identity_convert(chunks):
+async def _identity_convert(chunks, base_dir=None):
     """Stand-in for the math-conversion pass: speech text == chunk text."""
     return [c["text"] for c in chunks]
 

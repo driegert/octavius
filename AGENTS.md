@@ -661,6 +661,7 @@ Tests:
 - `tests/test_reader_append.py` - appending to an existing document: incremental chunk append, position preservation, `replace`, retry folding appendices, status rules, tool/route wiring
 - `tests/test_reader_pacing.py` - paced playback: `ReaderPacer`, the stream waiting on `reader_heard`, finished-when-heard, wiring
 - `tests/test_reader_progress.py` - per-document progress (playback, append/replace, lazy backfill, migration) and heading levels
+- `tests/test_reader_figures.py` - tables and figures: caption parsing, caption kept with its float, overview/description calls, failover and degradation
 - `tests/test_reader_edit.py` - renaming a document: DB + speech JSON title update, missing speech file, validation, any-status rename, route wiring
 - `tests/test_reader_chat.py` - reader chat: look-up tools, `place_context`, `build_prompt`'s context slot, one keyed chat per document (resume, `new`), position scoping
 - `tests/test_document_sources.py`
@@ -775,6 +776,17 @@ Still live:
 - Playback is streamed sentence-by-sentence over WebSocket with position sync.
 - Document list auto-polls while any document is still `processing`.
 - Failed reader documents can be retried from the stored source metadata via `POST /api/reader/documents/{id}/retry`.
+- Tables and figures (since 2026-10-31, `reader_text.py`): a markdown table is spoken as its caption ("Table 2:
+  ...", from the adjacent `Table N`/`Tab. N` paragraph, or a caption line directly above it) plus one sentence of
+  overview from the reader LLM (same endpoints/failover as math, thinking off; it answers `NONE` when the caption
+  suffices). No caption: "A table." + overview; every endpoint down: caption only, or "A table with N rows.". An
+  image `![...](...)` is never read as its filename: it is spoken as its `Figure N`/`Fig. N` caption plus a 1-2
+  sentence description from the **vision chain** when the file resolves (absolute, or relative to the source
+  markdown's folder: `source_dir` / `original_md_path`'s parent; image types only, at most 4 MB; remote URLs are
+  never fetched). No file or a vision failure: caption only; neither: silence. The caption paragraph is consumed
+  (`group_floats` keeps it in its float's chunk) and is not read twice. `source_text` keeps the raw table and link.
+  Documents converted earlier keep their old speech until retried. **Converted PDFs get captions only**: docproc's
+  markdown carries no image links (see `docs/HANDOFF-docproc-images.md`).
 - Reading progress: `reader_documents.total_sentences` / `progress_sentences` (sentences before the saved place,
   blanks included; equal to the total once read to the end, while `last_chunk`/`last_sentence` rewind to 0 so the
   next play starts over). Playback writes them per sentence; `_write_speech` recomputes them on ingest/append/replace;
