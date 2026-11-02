@@ -166,6 +166,26 @@ class LookupToolTests(unittest.TestCase):
         back = dict(sel, end_chunk_index=0, end_sentence_index=0)
         self.assertIn("He is at chunk 1, sentence 1", lookup.place_context(self.fx.conn, self.doc_id, back))
 
+    def test_place_context_adds_matches_from_elsewhere_for_the_question(self):
+        ctx = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 0, "sentence_index": 0},
+                                   question="Which sequences do they use?")
+        self.assertIn("Elsewhere in the document", ctx)
+        self.assertIn("§2:\n<document_excerpt>We use Slepian sequences", ctx)
+        self.assertTrue(ctx.endswith(lookup.CITE_RULE))
+        # Only question words: nothing to search for.
+        bare = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 0, "sentence_index": 0},
+                                    question="What about the rest of it?")
+        self.assertNotIn("Elsewhere in the document", bare)
+        # A chunk already in the passage is not repeated.
+        near = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 1, "sentence_index": 0},
+                                    question="Slepian sequences")
+        self.assertNotIn("Elsewhere in the document", near)
+
+    def test_place_context_gives_the_outline_and_forbids_unsearched_absence(self):
+        ctx = lookup.place_context(self.fx.conn, self.doc_id, None)
+        self.assertIn("Its sections: §0 Introduction; §2 Methods", ctx)
+        self.assertIn("Never say the document doesn't mention", ctx)
+
     def test_place_context_falls_back_to_the_saved_place(self):
         # Paused: the browser sends no place, but pausing saved it.
         update_document(self.fx.conn, self.doc_id, last_chunk=2, last_sentence=0)

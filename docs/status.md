@@ -929,6 +929,14 @@ Likely refactor targets, in rough priority order:
 
 6. Transcription/dictation mode (Dave, 2026-07-12): capture speech (Android app first), transcribe, and save the transcript to the `saved_items` stash — deliberately NOT the vault. No agent turn, no TTS. Revives the stash write path for non-note payloads; needs a WS message or REST route for STT-to-stash (the unwired `save_to_stash` helper in `local_tool_inbox.py` is a starting point). App-side sketch in `../octavius-android/docs/HANDOFF.md` NEXT WORK #3.
 
+7. Reader chat: a per-document hybrid search (Dave, 2026-11-01; deferred). Today the
+   chat's pre-turn search and `search_reader_document` are word matching with light
+   stemming and a small synonym list (`local_tool_reader_lookup._rank`), which misses
+   paraphrase. Idea: when the chat panel opens, embed the document's chunks (bge-m3) into
+   a throwaway in-memory index and fuse it with the word ranking; for one document it is
+   near-instant. Only worth it above a size threshold (a 50-line note no; a 50-page PDF
+   yes). Not via `hybrid-corpus`, which is for persistent corpora.
+
 ## Planned: `deep_research` domain via headless pi (2026-08-08)
 
 Dave raised replacing the in-process subagent loop with `pi --mode json -p --no-session`

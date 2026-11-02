@@ -221,8 +221,18 @@ def tool_label(pi_tool_name: str) -> str:
 
 
 def split_sentences(text: str) -> list[str]:
-    parts = [p.strip() for p in SENTENCE_END.split(text.strip())]
-    return [p + " " for p in parts[:-1] if p] + ([parts[-1]] if parts and parts[-1] else [])
+    """Sentences for the voice, each carrying the break that followed it.
+
+    The reply is these joined back together, so a line break after a full stop
+    (between list items or paragraphs) must survive; anything else is one space.
+    """
+    pieces = re.split(r"(?<=[.!?])(\s+)", text.strip())
+    out = []
+    for sentence, gap in zip(pieces[::2], pieces[1::2] + [""]):
+        sentence = sentence.strip()
+        if sentence:
+            out.append(sentence + (("\n" * min(gap.count("\n"), 2)) if "\n" in gap else " " if gap else ""))
+    return out
 
 
 def message_text(message: dict) -> str:
@@ -1052,7 +1062,11 @@ async def stream_pi_turn(
     if getattr(state, "doc_chat_id", None) is not None:
         from local_tool_reader_lookup import place_context
         try:
-            context = place_context(history_session.conn, state.doc_chat_id, state.doc_chat_position)
+            # A follow-up ("what about the rest of it?") names little: search with the one before too.
+            earlier = next((m.get("content") for m in reversed(prior) if m.get("role") == "user"
+                            and isinstance(m.get("content"), str)), "")
+            context = place_context(history_session.conn, state.doc_chat_id, state.doc_chat_position,
+                                    question=f"{user_text}\n{earlier}")
             state.doc_chat_position = None  # sent per turn by the panel; without one, the saved place
         except Exception:
             log.warning("Reader chat context failed; the turn proceeds without it", exc_info=True)

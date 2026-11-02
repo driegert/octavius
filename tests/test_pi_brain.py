@@ -105,6 +105,13 @@ class PiBrainTests(unittest.IsolatedAsyncioTestCase):
             out.append(s)
         return out, statuses
 
+    def test_split_sentences_keeps_line_breaks(self):
+        # Joined back into the reply: a list or paragraph break after a full stop must survive.
+        text = "Two points:\n\n* First [§2]. More.\n* Second.\n\nLast."
+        parts = pi_brain.split_sentences(text)
+        self.assertEqual("".join(parts), text)
+        self.assertEqual(parts[1], "More.\n")
+
     async def test_plain_turn_yields_sentences_and_records_conversation(self):
         session = _Session(self.manager)
         out, _ = await self.turn(session, "hi")
