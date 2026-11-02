@@ -107,6 +107,11 @@ class SpeechifyTests(unittest.TestCase):
         self.assertEqual(speechify("call foo_bar_baz please"), "call foo_bar_baz please")
         self.assertEqual(speechify("compute 3 * 4 exactly"), "compute 3 * 4 exactly")
 
+    def test_reader_chat_citations_are_silent(self):
+        self.assertEqual(speechify("They compare three classes [§14]."), "They compare three classes.")
+        self.assertEqual(speechify("Both [§3, §7] agree [§2–5]."), "Both agree.")
+        self.assertEqual(speechify("Under § 4 of the act [1]."), "Under § 4 of the act [1].")
+
     def test_idempotent(self):
         s = "**Bold** and `code` and [link](http://x.test)\n- one\n- two"
         once = speechify(s)

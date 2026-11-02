@@ -57,15 +57,15 @@ class LookupToolTests(unittest.TestCase):
     def test_outline_lists_sections_with_their_chunk(self):
         out = lookup.reader_document_outline({"document_id": self.doc_id}, self.fx.session())
         self.assertIn("3 chunks, 4 sentences", out)
-        self.assertIn("[0] Introduction", out)
-        self.assertIn("  [2] Methods", out)  # level 2 is indented
+        self.assertIn("[§0] Introduction", out)
+        self.assertIn("  [§2] Methods", out)  # level 2 is indented
 
     def test_read_prefers_source_text_and_carries_the_section(self):
         out = lookup.read_reader_document({"document_id": self.doc_id, "start_chunk": 0, "end_chunk": 1}, self.fx.session())
         self.assertIn("(Thomson, 1982)", out)  # citation kept in source_text
-        self.assertIn("[chunk 1] (section: Introduction)", out)  # heading carries forward
+        self.assertIn("[§1] (section: Introduction)", out)  # heading carries forward
         self.assertIn("averages K eigenspectra", out)  # no source_text: speech text
-        self.assertIn("continues at chunk 2", out)
+        self.assertIn("continues at chunk §2", out)
 
     def test_read_rejects_out_of_range(self):
         out = lookup.read_reader_document({"document_id": self.doc_id, "start_chunk": 9}, self.fx.session())
@@ -73,7 +73,7 @@ class LookupToolTests(unittest.TestCase):
 
     def test_search_ranks_by_distinct_terms(self):
         out = lookup.search_reader_document({"document_id": self.doc_id, "query": "Slepian sequences"}, self.fx.session())
-        self.assertIn("[chunk 2]", out)
+        self.assertIn("[§2]", out)
         self.assertIn("2/2 terms", out)
         self.assertIn("No chunk", lookup.search_reader_document({"document_id": self.doc_id, "query": "wavelets"}, self.fx.session()))
 
@@ -138,11 +138,18 @@ class LookupToolTests(unittest.TestCase):
         self.assertIn("not the limit of what you may read", ctx)
         self.assertIn("explore the whole document", ctx)
 
+    def test_place_context_asks_for_paragraph_citations(self):
+        ctx = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 1, "sentence_index": 0})
+        self.assertTrue(ctx.endswith(lookup.CITE_RULE))  # last, just before his message
+        self.assertIn("The paragraph he is in (§1):", ctx)
+        sel = {"chunk_index": 1, "sentence_index": 1, "end_chunk_index": 2, "end_sentence_index": 0}
+        self.assertIn("The selected passage (§1 to §2):", lookup.place_context(self.fx.conn, self.doc_id, sel))
+
     def test_place_context_gives_the_paragraphs_around_the_place(self):
         ctx = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 1, "sentence_index": 0})
-        self.assertIn("The paragraph before:\n<document_excerpt>Tapers reduce leakage (Thomson, 1982).", ctx)
+        self.assertIn("The paragraph before (§0):\n<document_excerpt>Tapers reduce leakage (Thomson, 1982).", ctx)
         self.assertIn("The sentence he is at:\n<document_excerpt>The estimate averages K eigenspectra.</document_excerpt>", ctx)
-        self.assertIn("The paragraph after:\n<document_excerpt>We use Slepian sequences", ctx)
+        self.assertIn("The paragraph after (§2):\n<document_excerpt>We use Slepian sequences", ctx)
         first = lookup.place_context(self.fx.conn, self.doc_id, {"chunk_index": 0, "sentence_index": 0})
         self.assertNotIn("The paragraph before", first)
 
@@ -153,7 +160,7 @@ class LookupToolTests(unittest.TestCase):
         self.assertIn("selected a passage, chunk 1 sentence 1 to chunk 2 sentence 0", ctx)
         self.assertIn("<document_excerpt>It is consistent. We use Slepian sequences.</document_excerpt>", ctx)
         self.assertNotIn("ignored", ctx)
-        self.assertIn("The paragraph before:\n<document_excerpt>Tapers", ctx)
+        self.assertIn("The paragraph before (§0):\n<document_excerpt>Tapers", ctx)
         self.assertNotIn("The paragraph after", ctx)  # the selection ends in the last chunk
         # A backwards or out-of-range end falls back to the start sentence.
         back = dict(sel, end_chunk_index=0, end_sentence_index=0)

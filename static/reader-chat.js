@@ -74,6 +74,32 @@
     return OctaviusApp.escapeHtml(text || '').replace(/\n/g, '<br>');
   }
 
+  // ---------- Citations ----------
+  // The model cites paragraphs as [§14], [§3, §7] or [§2–5] (local_tool_reader_lookup.py).
+  // Each number becomes a link that shows that paragraph without moving the place.
+
+  const CITE = /\[§([^[\]]{0,40})\]/g;
+
+  function citeLink(n) {
+    const known = window.OctaviusReader && window.OctaviusReader.hasChunk(n);
+    const title = known ? `Show paragraph ${n}` : 'Not a paragraph of this document';
+    return `<button type="button" class="cite${known ? '' : ' cite-missing'}" data-chunk="${n}" title="${title}"${known ? '' : ' disabled'}>§${n}</button>`;
+  }
+
+  // On rendered HTML: the document text never reaches here, only the model's reply,
+  // already escaped by marked; the tag's contents are digits by the time they are used.
+  function linkCitations(html) {
+    return html.replace(CITE, (whole, inner) => {
+      const nums = (inner.match(/\d+/g) || []).map(Number);
+      if (!nums.length || !/^[\s§\d,–\-and]*$/.test(inner)) return whole;
+      return '<span class="cites">' + nums.map(citeLink).join('') + '</span>';
+    });
+  }
+
+  function renderReply(text) {
+    return linkCitations(renderMarkdown(text));
+  }
+
   // ---------- Preferences (the main page's voice, not the reader's) ----------
 
   function mainPrefs() {
@@ -139,7 +165,7 @@
     clearLog();
     for (const m of messages || []) {
       if (m.role === 'user') addTurn('user').textContent = m.content;
-      else if (m.role === 'assistant') addTurn('assistant').innerHTML = renderMarkdown(m.content);
+      else if (m.role === 'assistant') addTurn('assistant').innerHTML = renderReply(m.content);
     }
     if (!logEl.children.length) {
       showNote('Ask about this document. Type, or tap the mic and speak.');
@@ -183,7 +209,7 @@
     streamingEl.classList.remove('pending');
     streamingEl.classList.add('streaming');
     streamingText += text;
-    streamingEl.innerHTML = renderMarkdown(streamingText);
+    streamingEl.innerHTML = renderReply(streamingText);
     scrollToEnd();
   }
 
@@ -191,7 +217,7 @@
     dropEmptyNote();
     const el = streamingEl || addTurn('assistant');
     el.classList.remove('pending', 'streaming');
-    el.innerHTML = renderMarkdown(text);
+    el.innerHTML = renderReply(text);
     if (answeredBy) {
       const by = document.createElement('p');
       by.className = 'chat-by';
@@ -239,6 +265,14 @@
     micBtn.title = recording ? 'Stop recording' : 'Speak your question';
     if (!recording) micBtn.style.setProperty('--level', '0');
   }
+
+  logEl.addEventListener('click', (event) => {
+    const cite = event.target.closest('button.cite');
+    if (!cite || cite.disabled || !window.OctaviusReader) return;
+    if (!window.OctaviusReader.peek(Number(cite.dataset.chunk))) return;
+    // On a phone the panel covers the page: get out of the way (it reopens with the tab).
+    if (window.matchMedia('(max-width: 860px)').matches) setOpen(false, false);
+  });
 
   function setOpen(next, remember) {
     open = next;

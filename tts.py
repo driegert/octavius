@@ -29,6 +29,8 @@ _MD_LIST = re.compile(r'^[ \t]*(?:[-*+]|\d+[.)])\s+', re.MULTILINE)  # -, *, 1.,
 _MD_ORPHAN_BOLD = re.compile(r'\*{2,}')
 _MD_ORPHAN_EMPH = re.compile(r'(?<!\S)\*(?=\S)|(?<=\S)\*(?!\S)')
 _WS = re.compile(r'[ \t]{2,}')
+# A Reader chat citation, "[§14]" or "[§3, §7]": a link in the panel, silence when spoken.
+_CITE = re.compile(r'\s*\[§[^\[\]]{0,40}\]')
 # "et al." in citations: the engine reads the period as a sentence end and pauses
 # mid-sentence. Only the text sent to TTS changes; the document keeps the period.
 _ET_AL = re.compile(r'\b(et al)\.', re.IGNORECASE)
@@ -66,7 +68,8 @@ def speechify(text: str) -> str:
     """
     if not text:
         return text
-    cleaned = _MD_IMAGE.sub(r'\1', text)
+    cleaned = _CITE.sub('', text)
+    cleaned = _MD_IMAGE.sub(r'\1', cleaned)
     cleaned = _MD_LINK.sub(r'\1', cleaned)
     cleaned = _MD_BOLD.sub(r'\2', cleaned)     # bold before italic: ** contains *
     cleaned = _MD_ITALIC.sub(r'\2', cleaned)

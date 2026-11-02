@@ -4,6 +4,10 @@ They read the speech JSON, so chunk and sentence indices are the same ones playb
 and `reader_position` use. Documents converted since 2026-10-31 keep each chunk's
 source markdown (`source_text`: LaTeX and citations intact); older ones fall back to
 the speech text, which has citations stripped and math spelled out.
+
+Paragraphs (chunks) are labelled §N, N being the chunk index, everywhere the model
+sees them, so it can cite them as [§N] and the chat panel can link each citation to
+its paragraph on the page (static/reader-chat.js; tts.speechify drops them when spoken).
 """
 
 from __future__ import annotations
@@ -80,11 +84,11 @@ def reader_document_outline(args: dict, session=None, _mcp_manager=None, ws_sess
     chunks = speech["chunks"]
     sentences = sum(len(c.get("sentences") or []) for c in chunks)
     lines = [f"#{doc['id']} {doc['title']}: {len(chunks)} chunks, {sentences} sentences.",
-             "Sections (first chunk index, heading):"]
+             "Sections (first paragraph, heading):"]
     for chunk in chunks:
         if chunk.get("heading"):
             indent = "  " * (max(chunk.get("level") or 1, 1) - 1)
-            lines.append(f"{indent}[{chunk['index']}] {chunk['heading']}")
+            lines.append(f"{indent}[§{chunk['index']}] {chunk['heading']}")
     if len(lines) == 2:
         lines.append("(no headings; read it by chunk index, 0 to %d)" % (len(chunks) - 1))
     out = "\n".join(lines)
@@ -111,7 +115,7 @@ def read_reader_document(args: dict, session=None, _mcp_manager=None, ws_session
     used = 0
     last = start - 1
     for i in range(start, end + 1):
-        block = f"[chunk {i}] (section: {sections[i] or 'none'})\n{_chunk_text(chunks[i])}"
+        block = f"[§{i}] (section: {sections[i] or 'none'})\n{_chunk_text(chunks[i])}"
         if parts and used + len(block) > READ_CHARS:
             break
         if not parts and len(block) > READ_CHARS:
@@ -121,8 +125,8 @@ def read_reader_document(args: dict, session=None, _mcp_manager=None, ws_session
         last = i
     out = "\n\n".join(parts)
     if last < len(chunks) - 1:
-        out += f"\n\n(continues at chunk {last + 1} of {len(chunks) - 1})"
-    return out
+        out += f"\n\n(continues at chunk §{last + 1} of §{len(chunks) - 1})"
+    return out + "\n" + CITE_REMINDER
 
 
 def search_reader_document(args: dict, session=None, _mcp_manager=None, ws_session=None) -> str:
@@ -152,8 +156,8 @@ def search_reader_document(args: dict, session=None, _mcp_manager=None, ws_sessi
     lines = [f"Best matches in #{doc['id']} (read more with read_reader_document):"]
     for distinct, _hits, _neg, i, text in scored[:limit]:
         snippet = text if len(text) <= SEARCH_SNIPPET else text[:SEARCH_SNIPPET] + " …"
-        lines.append(f"[chunk {i}] (section: {sections[i] or 'none'}; {distinct}/{len(terms)} terms)\n{snippet}")
-    return "\n\n".join(lines)
+        lines.append(f"[§{i}] (section: {sections[i] or 'none'}; {distinct}/{len(terms)} terms)\n{snippet}")
+    return "\n\n".join(lines) + "\n" + CITE_REMINDER
 
 
 def _excerpt(label: str, text: str, limit: int) -> str:
@@ -174,6 +178,16 @@ def _span_text(chunks: list[dict], start: tuple[int, int], end: tuple[int, int])
         hi = end[1] if ci == end[0] else len(sentences) - 1
         parts.extend(sentences[lo:hi + 1])
     return " ".join(p for p in parts if p.strip())
+
+
+CITE_RULE = (
+    "Citations (required): the document's parts are numbered §N (chunk N; the look-ups take N as "
+    "start_chunk). End every sentence that states something from the document with the part it comes "
+    "from, as [§N], e.g. \"The response has three classes [§14].\" Cite only parts you have read, "
+    "above or through a look-up, and the exact one: Dave clicks a citation to read that part. "
+    "Never cite web or scholar results this way."
+)
+CITE_REMINDER = "(Cite what you use from this as [§N].)"
 
 
 def place_context(conn, doc_id: int, position: dict | None) -> str:
@@ -205,12 +219,15 @@ def place_context(conn, doc_id: int, position: dict | None) -> str:
     ]
     if position is None and (doc.get("last_chunk") or doc.get("last_sentence")):
         position = {"chunk_index": doc["last_chunk"], "sentence_index": doc["last_sentence"]}
+    if chunks_all:
+        lines.append(CITE_RULE)
     if not speech or not position:
         return "\n".join(lines)
     chunks = speech.get("chunks") or []
     start = (position.get("chunk_index"), position.get("sentence_index"))
     if not _valid(chunks, *start):
         return "\n".join(lines)
+    lines.pop()  # the rule goes last, after the passage
     end = (position.get("end_chunk_index"), position.get("end_sentence_index"))
     selected = _valid(chunks, *end) and end >= start
     if not selected:
@@ -218,15 +235,17 @@ def place_context(conn, doc_id: int, position: dict | None) -> str:
     section = _sections(chunks)[start[0]]
     where = f" (section \"{_quoted(section, TITLE_CHARS)}\")" if section else ""
     if start[0] > 0:
-        lines.append(_excerpt("The paragraph before", _chunk_text(chunks[start[0] - 1]), NEIGHBOUR_CHARS))
+        lines.append(_excerpt(f"The paragraph before (§{start[0] - 1})", _chunk_text(chunks[start[0] - 1]), NEIGHBOUR_CHARS))
     if selected:
         lines.append(f"He has selected a passage, chunk {start[0]} sentence {start[1]} to chunk {end[0]} "
                      f"sentence {end[1]}{where}.")
-        lines.append(_excerpt("The selected passage", _span_text(chunks, start, end), SELECTION_CHARS))
+        span = f"§{start[0]}" if start[0] == end[0] else f"§{start[0]} to §{end[0]}"
+        lines.append(_excerpt(f"The selected passage ({span})", _span_text(chunks, start, end), SELECTION_CHARS))
     else:
         lines.append(f"He is at chunk {start[0]}, sentence {start[1]}{where}.")
-        lines.append(_excerpt("The paragraph he is in", " ".join(chunks[start[0]].get("sentences") or []), PARAGRAPH_CHARS))
+        lines.append(_excerpt(f"The paragraph he is in (§{start[0]})", " ".join(chunks[start[0]].get("sentences") or []), PARAGRAPH_CHARS))
         lines.append(_excerpt("The sentence he is at", chunks[start[0]]["sentences"][start[1]], EXCERPT_CHARS))
     if end[0] + 1 < len(chunks):
-        lines.append(_excerpt("The paragraph after", _chunk_text(chunks[end[0] + 1]), NEIGHBOUR_CHARS))
+        lines.append(_excerpt(f"The paragraph after (§{end[0] + 1})", _chunk_text(chunks[end[0] + 1]), NEIGHBOUR_CHARS))
+    lines.append(CITE_RULE)
     return "\n".join(lines)

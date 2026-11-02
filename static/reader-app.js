@@ -1676,6 +1676,31 @@
     return { doc_id: currentDocId, chunk_index: currentChunk, sentence_index: currentSentence };
   }
 
+  // A chat citation: show that paragraph without moving the place (playing or not).
+  // "Back to the current sentence" returns, as after scrolling away by hand.
+  let peekTimer = null;
+  function chunkEl(chunkIdx) {
+    const sec = (currentDoc && currentDoc.sections || []).find((x) => x.index === chunkIdx);
+    if (!sec) return null;
+    for (let i = 0; i < (sec.sentence_count || 0); i++) {
+      const el = sentenceEls.get(chunkIdx + ':' + i);
+      if (el) return el.closest('.sec');
+    }
+    return sectionsEl.querySelector(`.sec-head[data-c="${chunkIdx}"]`)?.closest('.sec') || null;
+  }
+  function peek(chunkIdx) {
+    const el = chunkEl(chunkIdx);
+    if (!el) return false;
+    follow = false;
+    followBtn.hidden = !markedEl;
+    sectionsEl.querySelectorAll('.sec.cited').forEach((x) => x.classList.remove('cited'));
+    el.classList.add('cited');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(() => el.classList.remove('cited'), 4000);
+    return true;
+  }
+
   window.OctaviusReader = {
     currentDoc() { return currentDoc ? { id: currentDoc.id, title: currentDoc.title } : null; },
     heardPlace,
@@ -1683,6 +1708,8 @@
     clearSelection() { lastSelection = null; },
     pause() { if (isPlaying) sendPause(); },
     onDocChange(cb) { if (typeof cb === 'function') docChangeCbs.push(cb); },
+    hasChunk(chunkIdx) { return !!chunkEl(chunkIdx); },
+    peek,
   };
 
   const docIdParam = params.get('doc_id');
