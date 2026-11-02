@@ -83,12 +83,17 @@ async def stream_reader_audio(
     voice: str | None = None,
     seq: int = 0,
     pacer: ReaderPacer | None = None,
+    save_place: bool = True,
 ):
     """Stream TTS audio for a document over WebSocket.
 
     With a `pacer`, the saved place comes from the client's `reader_heard` reports
     (see `save_heard_position`) and the stream writes no position of its own,
     except the finished mark once the last sentence has been heard.
+
+    With `save_place=False` (a download: the client caches the audio without playing
+    it) the stream writes nothing to the document: no per-sentence place, no finished
+    mark and rewind on completion, no run-ahead place on cancel. Frames are unchanged.
     """
     current_chunk_index = chunk_index
     current_sentence_index = sentence_index
@@ -142,7 +147,7 @@ async def stream_reader_audio(
                         "sentence_text": sentence,
                     }))
 
-                    if not pacer:
+                    if save_place and not pacer:
                         update_document(conn, doc_id, last_chunk=current_chunk_index,
                                         last_sentence=current_sentence_index, progress_sentences=sentence_global)
 
@@ -157,11 +162,12 @@ async def stream_reader_audio(
                 await pacer.wait_until(last_sent, ahead=0)
 
             # Read to the end: the next play starts over, but the list shows it finished.
-            update_document(conn, doc_id, last_chunk=0, last_sentence=0, progress_sentences=total_sentences)
+            if save_place:
+                update_document(conn, doc_id, last_chunk=0, last_sentence=0, progress_sentences=total_sentences)
             await ws.send_text(json.dumps({"type": "reader_audio_done", "seq": seq}))
 
         except asyncio.CancelledError:
-            if not pacer:
+            if save_place and not pacer:
                 update_document(conn, doc_id, last_chunk=current_chunk_index, last_sentence=current_sentence_index,
                                 progress_sentences=sentences_before(chunks, current_chunk_index, current_sentence_index))
             log.info(

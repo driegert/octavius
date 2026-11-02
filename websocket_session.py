@@ -846,7 +846,10 @@ class WebSocketSessionHandler:
     async def handle_reader_play(self, data: dict):
         await self.cancel_reader_task()
         self.state.reader_seq = data.get("seq", 0)
-        self.state.reader_pacer = ReaderPacer(self.state.reader_seq) if data.get("paced") is True else None
+        # `download` (strict, like `paced`): the client caches the audio without playing it, so the
+        # stream must not touch the reading place. No pacer either: nothing would send reader_heard.
+        download = data.get("download") is True
+        self.state.reader_pacer = ReaderPacer(self.state.reader_seq) if data.get("paced") is True and not download else None
         self.state.reader_task = asyncio.create_task(
             stream_reader_audio(
                 self.ws,
@@ -857,6 +860,7 @@ class WebSocketSessionHandler:
                 voice=data.get("voice", self.state.voice),
                 seq=data.get("seq", 0),
                 pacer=self.state.reader_pacer,
+                save_place=not download,
             )
         )
 

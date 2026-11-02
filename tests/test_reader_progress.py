@@ -170,6 +170,70 @@ class ProgressDuringPlaybackTests(unittest.TestCase):
         self.assertEqual(self._play(_WS(stop_after_audio=1), chunk_index=2), (2, 0, None, 4))
 
 
+class DownloadStreamTests(unittest.TestCase):
+    """save_place=False (reader_play download:true): the stream must not touch the place."""
+
+    async def _no_tts(self, *_a, **_k):
+        return b"wav"
+
+    @staticmethod
+    def _seed_progress(db_path):
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE reader_documents SET total_sentences = 5, progress_sentences = 2 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+    def _play(self, ws):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp, last_chunk=1, last_sentence=0)
+            self._seed_progress(db_path)
+            before = _row(db_path)
+            with patch.object(reader_playback, "synthesize", self._no_tts):
+                try:
+                    asyncio.run(reader_playback.stream_reader_audio(ws, 1, db_path, save_place=False))
+                except asyncio.CancelledError:
+                    pass
+            return before, _row(db_path)
+
+    def test_completed_download_leaves_place_and_progress_alone(self):
+        ws = _WS()
+        before, after = self._play(ws)
+        self.assertEqual(before, (1, 0, 5, 2))
+        self.assertEqual(after, before)
+        self.assertEqual(ws.frames[-1]["type"], "reader_audio_done")
+        self.assertEqual(ws.audio, 4)
+        self.assertEqual(sum(f["type"] == "reader_position" for f in ws.frames), 4)
+
+    def test_cancelled_download_leaves_place_and_progress_alone(self):
+        before, after = self._play(_WS(stop_after_audio=3))
+        self.assertEqual(after, before)
+
+    def test_bare_pause_after_a_cancelled_download_saves_nothing(self):
+        from types import SimpleNamespace
+        from tests.test_websocket_session import _FakeWS
+        from websocket_session import WebSocketSessionHandler
+
+        class _BytesWS(_FakeWS):
+            async def send_bytes(self, _data):
+                await asyncio.sleep(10)  # stream stays mid-document until the pause cancels it
+
+        async def run(db_path):
+            handler = WebSocketSessionHandler(_BytesWS())
+            handler.state.history = SimpleNamespace(db_path=db_path)
+            with patch.object(reader_playback, "synthesize", self._no_tts):
+                await handler.handle_reader_play({"doc_id": 1, "seq": 1, "download": True, "paced": True})
+                self.assertIsNone(handler.state.reader_pacer)
+                await asyncio.sleep(0.05)
+                await handler.handle_reader_pause({})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp, last_chunk=1, last_sentence=0)
+            self._seed_progress(db_path)
+            before = _row(db_path)
+            asyncio.run(run(db_path))
+            self.assertEqual(_row(db_path), before)
+
+
 class HeardPositionTests(unittest.TestCase):
     def test_client_place_replaces_the_streamed_one(self):
         with tempfile.TemporaryDirectory() as tmp:
