@@ -55,6 +55,22 @@ _HYPHEN_RANGE = re.compile(
     r'|(?<![\w.\-])((?:1[5-9]|20)\d\d)-(?=(?:1[5-9]|20)\d\d(?![\w\-]))'      # 1990-2000
 )
 
+# Hyphens between words: Phonon reads some as "dash", depending on the words around
+# them ("document-level" as "document dash level", "domain-adaptive" only in a long
+# sentence). Joined by a hyphen or an unspaced en/em dash, the words are read as two;
+# a hanging hyphen ("domain- and task-specific") is dropped. Letters on both sides
+# only: "COVID-19", "1-800" and ranges are left to the rules above.
+_WORD_HYPHEN = re.compile(r'(?<=[A-Za-z])[-–—](?=[A-Za-z])')
+_HANGING_HYPHEN = re.compile(r'(?<=[A-Za-z])-(?=\s+(?:and|or|to|nor)\b)')
+# Decimals: in a long sentence Phonon loses the point ("57.7%" read as "57. 7%" or
+# "57 pus 7%"). Spelled out, the way it is said: "57 point 7", fraction digits one by
+# one ("0.05" is "0 point 0 5"). Not money ("$3.50"), versions ("v1.2", "1.2.3").
+_DECIMAL = re.compile(r'(?<![\w.$£€])(\d+)\.(\d+)(?![\d.]*\.\d)')
+
+
+def _say_decimal(m: re.Match) -> str:
+    return f"{m.group(1)} point {' '.join(m.group(2))}"
+
 
 def _undot(m: re.Match) -> str:
     return m.group(0).replace('.', '') + ('.' if m.end() == len(m.string) else '')
@@ -82,6 +98,9 @@ def speechify(text: str) -> str:
     cleaned = _MULTIPLIER.sub(r'\1 times', cleaned)
     cleaned = _DASH_RANGE.sub(r'\1 to ', cleaned)
     cleaned = _HYPHEN_RANGE.sub(lambda m: next(g for g in m.groups() if g) + ' to ', cleaned)
+    cleaned = _HANGING_HYPHEN.sub('', cleaned)
+    cleaned = _WORD_HYPHEN.sub(' ', cleaned)
+    cleaned = _DECIMAL.sub(_say_decimal, cleaned)
     cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()

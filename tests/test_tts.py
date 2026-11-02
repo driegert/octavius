@@ -11,10 +11,11 @@ class SpeechifyTests(unittest.TestCase):
         self.assertEqual(speechify("pet al. fetal."), "pet al. fetal.")
 
     def test_multiplier_x_is_read_as_times(self):
-        self.assertEqual(speechify("a 4.6x speedup"), "a 4.6 times speedup")
+        self.assertEqual(speechify("a 4.6x speedup"), "a 4 point 6 times speedup")
         self.assertEqual(speechify("It is 10x faster, about 1,000x."), "It is 10 times faster, about 1,000 times.")
         self.assertEqual(speechify("roughly 3×"), "roughly 3 times")
-        for text in ("a 2x2 matrix", "1920x1080", "address 0x1F", "the x axis", "4.6 x 2"):
+        self.assertEqual(speechify("4.6 x 2"), "4 point 6 x 2")  # a spaced x is not "times"
+        for text in ("a 2x2 matrix", "1920x1080", "address 0x1F", "the x axis"):
             self.assertEqual(speechify(text), text)
 
     def test_dash_ranges_are_read_with_to(self):
@@ -24,7 +25,7 @@ class SpeechifyTests(unittest.TestCase):
             "2 – 8": "2 to 8",
             "1990–2000": "1990 to 2000",
             "pp. 12–15": "pp. 12 to 15",
-            "2.5—3.5 kg": "2.5 to 3.5 kg",
+            "2.5—3.5 kg": "2 point 5 to 3 point 5 kg",
             "2–3x faster": "2 to 3 times faster",
         }
         for text, expected in cases.items():
@@ -106,6 +107,21 @@ class SpeechifyTests(unittest.TestCase):
         # Snake_case identifiers and lone asterisks (e.g. multiplication) must survive.
         self.assertEqual(speechify("call foo_bar_baz please"), "call foo_bar_baz please")
         self.assertEqual(speechify("compute 3 * 4 exactly"), "compute 3 * 4 exactly")
+
+    def test_words_joined_by_a_hyphen_are_read_as_two(self):
+        # Phonon said "document dash level" and "domain dash and" (docs/pronunciation.md).
+        self.assertEqual(speechify("document-level sentiment"), "document level sentiment")
+        self.assertEqual(speechify("domain- and task-specific"), "domain and task specific")
+        self.assertEqual(speechify("aspect–sentiment pairs"), "aspect sentiment pairs")
+        for kept in ("COVID-19", "1-800-555", "a - b", "-5 degrees", "well -- no"):
+            self.assertEqual(speechify(kept), kept)
+
+    def test_decimals_are_read_with_point(self):
+        # In a long sentence Phonon read "57.7%" as "57. 7%".
+        self.assertEqual(speechify("in our data: 57.7% of the 241,309"), "in our data: 57 point 7% of the 241,309")
+        self.assertEqual(speechify("at the 0.05 level"), "at the 0 point 0 5 level")
+        for kept in ("costs $3.50", "version 1.2.3", "v1.2 shipped", "in 2020. 5 people", "241,309 reviews"):
+            self.assertEqual(speechify(kept), kept)
 
     def test_reader_chat_citations_are_silent(self):
         self.assertEqual(speechify("They compare three classes [§14]."), "They compare three classes.")

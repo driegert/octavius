@@ -26,5 +26,7 @@ voice changes; documents and replies keep their original text.
 | published by U.S. | "by you later state", garbled | "US" | `_INITIALISM` (2026-10-31) |
 | 4.6x speedup, 10x faster | "4.6 back", "10 bikes" | "4.6 times", "10 times" | `_MULTIPLIER` (2026-10-31); "2x2" and "1920x1080" already read as "by" |
 | 2– 8%, 2–8% | "two eight percent" | "2 to 8%" | `_DASH_RANGE`, `_HYPHEN_RANGE` (2026-10-31); en/em dash between numbers always; a hyphen only in "5-10%", "pp. 12-15", "1990-2000" (not dates, "COVID-19", "1-800-555", subtraction) |
+| document-level sentiment; domain- and task-specific; domain-adaptive; aspect–sentiment | "document dash level", "domain dash and"; only in some sentences | "document level", "domain and task specific" | `_WORD_HYPHEN`, `_HANGING_HYPHEN` (2026-11-01); a hyphen or unspaced en/em dash between letters is read as a space, a hanging hyphen before "and"/"or"/"to" is dropped. Phonon is deterministic but reads the hyphen differently by context, which is the "sometimes"; "COVID-19" and number ranges untouched |
+| 57.7% of the 241,309 (in a long sentence) | "fifty-seven, seven percent" | "57 point 7%" | `_DECIMAL` (2026-11-01); fine in a short sentence, lost the point in a long one in three of four voices tested. Fraction digits one by one ("0 point 0 5"); not money ("$3.50") or versions ("v1.2", "1.2.3"). "4.6x" is now "4 point 6 times" |
 
 Reader-only fixes (sentence splitting, page breaks) live in `reader_text.py`, not here.
