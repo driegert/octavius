@@ -1066,7 +1066,7 @@ async def stream_pi_turn(
             earlier = next((m.get("content") for m in reversed(prior) if m.get("role") == "user"
                             and isinstance(m.get("content"), str)), "")
             context = place_context(history_session.conn, state.doc_chat_id, state.doc_chat_position,
-                                    question=f"{user_text}\n{earlier}")
+                                    question=user_text, earlier=earlier)
             state.doc_chat_position = None  # sent per turn by the panel; without one, the saved place
         except Exception:
             log.warning("Reader chat context failed; the turn proceeds without it", exc_info=True)

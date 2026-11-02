@@ -181,6 +181,22 @@ class LookupToolTests(unittest.TestCase):
                                     question="Slepian sequences")
         self.assertNotIn("Elsewhere in the document", near)
 
+    def test_this_message_outranks_the_previous_one(self):
+        chunks = [
+            {"speech_text": "Introduction."},
+            {"speech_text": "Incomes at or below household income limits (HILs)."},
+            *[{"speech_text": f"Provincial Reformed counts, table {n}."} for n in range(4)],
+            {"speech_text": "Provincial Reformed RGI counts within HILs."},
+        ]
+        ranked = [m[3] for m in lookup._rank_for_question(chunks, "What does HIL stand for?",
+                                                          'What is "Provincial Reformed" ?')]
+        # Both HIL chunks first (the one naming Provincial Reformed too wins the tie), then nothing else.
+        self.assertEqual(ranked, [6, 1])
+        # A follow-up with no words of its own searches with the previous message.
+        follow = lookup._rank_for_question(chunks, "And the rest of it?", "What are HILs?")
+        self.assertEqual([m[3] for m in follow], [1, 6])  # a tie: the earlier chunk first
+        self.assertEqual(lookup._rank_for_question(chunks, "Tell me more", ""), [])
+
     def test_place_context_gives_the_outline_and_forbids_unsearched_absence(self):
         ctx = lookup.place_context(self.fx.conn, self.doc_id, None)
         self.assertIn("Its sections: §0 Introduction; §2 Methods", ctx)

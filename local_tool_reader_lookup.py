@@ -37,6 +37,7 @@ how i if in into is it its just like many may me might more most much must my no
 only or other our ours out over own please rest same say says said she should so some such tell than that
 the their theirs them then there these they this those through to too under until up us very was we were
 what when where which while who whom why will with would you your yours paper document proposal article
+stand stands mean means meaning
 """.split())
 
 
@@ -250,7 +251,25 @@ def _question_terms(question: str) -> set[str]:
     return {w for w in _WORD.findall(question.lower()) if w not in _STOPWORDS and (len(w) > 2 or w.isdigit())}
 
 
-def place_context(conn, doc_id: int, position: dict | None, question: str = "") -> str:
+def _rank_for_question(chunks: list[dict], question: str, earlier: str) -> list[tuple]:
+    """_rank by this message's words; the previous message's only break ties.
+
+    Counting both alike let a follow-up's leftovers bury the answer: "What does HIL stand
+    for?" after a question about "Provincial Reformed" ranked four chunks naming that
+    program above the one defining "household income limits (HILs)" (2026-11-02). A
+    message with no words of its own ("and the rest of it?") searches with the previous.
+    """
+    terms = _question_terms(question)
+    extra = _question_terms(earlier) - terms
+    if not terms:
+        terms, extra = extra, set()
+    if not terms:
+        return []
+    tie = {m[3]: m[0] for m in _rank(chunks, extra)} if extra else {}
+    return sorted(_rank(chunks, terms), key=lambda m: (m[0], tie.get(m[3], 0), m[1], m[2]), reverse=True)
+
+
+def place_context(conn, doc_id: int, position: dict | None, question: str = "", earlier: str = "") -> str:
     """The per-turn note that tells the model which document is open and where Dave is.
 
     `position` is what the panel sent: the marked sentence (playing, paused or clicked),
@@ -258,8 +277,8 @@ def place_context(conn, doc_id: int, position: dict | None, question: str = "") 
     place the reader saved. The text is rebuilt here from the document by index, with
     the paragraph (chunk) before and after, never taken from the browser.
 
-    `question` (his message, and the one before for a follow-up) is searched for
-    before the turn, and the best chunks outside the passage are added: a model
+    `question` (his message; `earlier`, the one before, breaks ties and stands in for a
+    follow-up with no words of its own) is searched for before the turn, and the best chunks outside the passage are added: a model
     without thinking answers from the passage rather than searching (2026-11-01, a
     question whose answer sat 6 to 12 chunks away from his place).
     """
@@ -314,13 +333,11 @@ def place_context(conn, doc_id: int, position: dict | None, question: str = "") 
         if end[0] + 1 < len(chunks):
             lines.append(_excerpt(f"The paragraph after (§{end[0] + 1})", _chunk_text(chunks[end[0] + 1]), NEIGHBOUR_CHARS))
         shown = set(range(max(start[0] - 1, 0), end[0] + 2))
-    terms = _question_terms(question)
-    if terms:
-        matches = [m for m in _rank(chunks, terms) if m[3] not in shown][:MATCH_COUNT]
-        if matches:
-            lines.append("Elsewhere in the document, the chunks that best match the words of his question (a "
-                         "word search, so check they answer it, and search further if they don't settle it):")
-            for _distinct, _hits, _neg, i, text in matches:
-                lines.append(_excerpt(f"§{i}", text, MATCH_CHARS))
+    matches = [m for m in _rank_for_question(chunks, question, earlier) if m[3] not in shown][:MATCH_COUNT]
+    if matches:
+        lines.append("Elsewhere in the document, the chunks that best match the words of his question (a "
+                     "word search, so check they answer it, and search further if they don't settle it):")
+        for _distinct, _hits, _neg, i, text in matches:
+            lines.append(_excerpt(f"§{i}", text, MATCH_CHARS))
     lines.append(CITE_RULE)
     return "\n".join(lines)
