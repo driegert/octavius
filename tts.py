@@ -67,6 +67,19 @@ _HANGING_HYPHEN = re.compile(r'(?<=[A-Za-z])-(?=\s+(?:and|or|to|nor)\b)')
 # one ("0.05" is "0 point 0 5"). Not money ("$3.50"), versions ("v1.2", "1.2.3").
 _DECIMAL = re.compile(r'(?<![\w.$£€])(\d+)\.(\d+)(?![\d.]*\.\d)')
 
+# "housing" (and "rousing", "arousing"): Phonon reads it as "hue-zing" whenever it is
+# capitalised or starts a sentence ("Public Housing" -> "Public Husing", "Ontario Housing
+# Corporation" -> "Ontario Hues Incorporation", "Housing is..." -> "Husing is..."); only
+# lower case mid-sentence is right, and lower-casing cannot fix a sentence start. Respelled
+# "howzing", it is heard as "housing" in every position and voice tested (2026-11-02).
+# "Rehousing", "Houses", "House" read fine and are left alone.
+_OUSING = re.compile(r'\b(h|r|ar)(ousing)(s?)\b', re.IGNORECASE)
+
+
+def _respell_ousing(m: re.Match) -> str:
+    # Keep only the first letter's case: all-caps "HOWZING" is heard as "pausing".
+    return m.group(1)[0] + m.group(1)[1:].lower() + 'owzing' + m.group(3).lower()
+
 
 def _say_decimal(m: re.Match) -> str:
     return f"{m.group(1)} point {' '.join(m.group(2))}"
@@ -101,6 +114,7 @@ def speechify(text: str) -> str:
     cleaned = _HANGING_HYPHEN.sub('', cleaned)
     cleaned = _WORD_HYPHEN.sub(' ', cleaned)
     cleaned = _DECIMAL.sub(_say_decimal, cleaned)
+    cleaned = _OUSING.sub(_respell_ousing, cleaned)
     cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()

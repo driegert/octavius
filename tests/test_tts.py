@@ -116,6 +116,18 @@ class SpeechifyTests(unittest.TestCase):
         for kept in ("COVID-19", "1-800-555", "a - b", "-5 degrees", "well -- no"):
             self.assertEqual(speechify(kept), kept)
 
+    def test_housing_is_respelled(self):
+        self.assertEqual(
+            speechify("including Public Housing and Rent Supplement."),
+            "including Public Howzing and Rent Supplement.",
+        )
+        self.assertEqual(speechify("Housing is expensive; rental housings too."),
+                         "Howzing is expensive; rental howzings too.")
+        self.assertEqual(speechify("A Rousing speech, arousing interest"), "A Rowzing speech, arowzing interest")
+        self.assertEqual(speechify("HOUSING"), "Howzing")  # "HOWZING" is heard as "pausing"
+        # These read fine, and "rehousing"/"mousing" are left alone.
+        self.assertEqual(speechify("Houses, rehousing, mousing"), "Houses, rehousing, mousing")
+
     def test_decimals_are_read_with_point(self):
         # In a long sentence Phonon read "57.7%" as "57. 7%".
         self.assertEqual(speechify("in our data: 57.7% of the 241,309"), "in our data: 57 point 7% of the 241,309")
