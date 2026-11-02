@@ -194,6 +194,15 @@ class MainTests(unittest.TestCase):
         self.assertEqual(data["agent_names"]["Hugh"], "Octavius")
         self.assertEqual(set(data["agent_names"]), set(data["voices"]))
 
+    def test_chat_models_menu_starts_with_auto(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                data = client.get("/api/chat-models").json()
+        self.assertEqual(data["default"], "auto")
+        self.assertEqual(data["models"][0], {"id": "auto", "label": "Auto"})
+        self.assertIn("qwen3.8-27b", [m["id"] for m in data["models"]])
+        self.assertIsInstance(data["enabled"], bool)
+
     def test_ui_pages_carry_content_security_policy(self):
         with _isolated_app(_FakeMCPManager):
             with TestClient(main.app) as client:

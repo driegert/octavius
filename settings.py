@@ -150,6 +150,16 @@ DEFAULT_PI_READER_MODELS = [
     {"id": "glm-5.3-flash", "label": "GLM-5.3 Flash", "model": "lr-p23/glm-5.3-flash", "thinking": None},
 ]
 
+# Models Dave can pick for the agent's own conversations (`chat_model` WS frame,
+# GET /api/chat-models); the first is the default. "auto" (model null) is the shared
+# failover chain with the process's own thinking level: Dave turned thinking off on the
+# agent once (2026-08-26) and reverted it two days later over answer quality, so the
+# default must not be the Reader menu's thinking-off 12B.
+DEFAULT_PI_CHAT_MODELS = [
+    {"id": "auto", "label": "Auto", "model": None, "thinking": None},
+    *DEFAULT_PI_READER_MODELS,
+]
+
 
 @dataclass(frozen=True)
 class PiBrainSettings:
@@ -190,6 +200,8 @@ class PiBrainSettings:
     model_contexts: dict = field(default_factory=lambda: dict(DEFAULT_PI_MODEL_CONTEXTS))
     # /reader chat's model menu (DEFAULT_PI_READER_MODELS); OCTAVIUS_PI_READER_MODELS overrides.
     reader_models: list = field(default_factory=lambda: [dict(m) for m in DEFAULT_PI_READER_MODELS])
+    # The agent's model menu (DEFAULT_PI_CHAT_MODELS); OCTAVIUS_PI_CHAT_MODELS overrides.
+    chat_models: list = field(default_factory=lambda: [dict(m) for m in DEFAULT_PI_CHAT_MODELS])
     # Loopback MCP server exposing Octavius's own tools to pi (pi_tools_server.py).
     tools_port: int = 8032
 
@@ -840,6 +852,7 @@ def load_settings() -> Settings:
             tool_timeout_s=_env_float("OCTAVIUS_PI_TOOL_TIMEOUT_S", 120.0),
             model_contexts=_env_json("OCTAVIUS_PI_MODEL_CONTEXTS", dict(DEFAULT_PI_MODEL_CONTEXTS)),
             reader_models=_env_json("OCTAVIUS_PI_READER_MODELS", [dict(m) for m in DEFAULT_PI_READER_MODELS]),
+            chat_models=_env_json("OCTAVIUS_PI_CHAT_MODELS", [dict(m) for m in DEFAULT_PI_CHAT_MODELS]),
         ),
     )
 

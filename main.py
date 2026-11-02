@@ -22,7 +22,7 @@ from reader_store import fail_stale_processing_documents
 from service_clients import embedding_client, llm_client
 from subagent_dispatcher import SubagentDispatcher
 import tools as local_tools
-from websocket_session import handle_websocket_session
+from websocket_session import chat_models_payload, handle_websocket_session
 
 logging.basicConfig(
     level=logging.INFO,
@@ -216,6 +216,12 @@ async def voices():
         "agent_default": settings.tts.agent_voice,
         "agent_names": {v: settings.tts.agent_name(v) for v in settings.tts.voices},
     })
+
+
+@app.get("/api/chat-models")
+async def chat_models():
+    """The agent's model menu; a client sends its pick as a `chat_model` WS frame."""
+    return JSONResponse(chat_models_payload())
 
 
 @app.websocket("/ws")

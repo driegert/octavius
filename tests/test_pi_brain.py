@@ -550,9 +550,15 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._cmds("set_thinking_level")[-1], {"type": "set_thinking_level", "level": "medium"})
         self.assertEqual(session.state.pi_hop, PRIMARY)
 
-    async def test_the_choice_applies_only_while_in_a_reader_chat(self):
+    async def test_an_agent_conversation_runs_on_its_chosen_model(self):
         session = self._reader_session()
-        session.state.doc_chat_id = None  # e.g. the conversation loaded on the main page
+        session.state.doc_chat_id = None  # the agent's menu (chat_model), not a Reader chat
+        await self.turn("hi", session=session)
+        self.assertEqual(self.runs(), [("glm/flash", "hi")])
+        self.assertIn({"type": "set_thinking_level", "level": "off"}, self._cmds("set_thinking_level"))
+
+    async def test_no_choice_means_the_shared_chain(self):
+        session = _Session(self.manager)
         await self.turn("hi", session=session)
         self.assertEqual(self.runs(), [(PRIMARY, "hi")])
         self.assertEqual(self._cmds("set_thinking_level"), [])

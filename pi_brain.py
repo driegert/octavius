@@ -164,7 +164,7 @@ def classify_provider_error(message: str) -> str:
 PROGRESS_EVENTS = frozenset({"message_start", "message_update", "message_end", "turn_start", "turn_end"})
 
 
-PREFERRED = -1  # hop index of a Reader chat's chosen model (not in the shared chain)
+PREFERRED = -1  # hop index of a conversation's chosen model (not in the shared chain)
 
 
 def _larger_context_hop(manager: "PiProcessManager", failed: int, tried: set) -> int | None:
@@ -675,7 +675,7 @@ class PiProcessManager:
     # pi_tools_server.PiToolsServer when running (main.py's lifespan sets it).
     tools_server: object = None
     failover: FailoverState = field(init=False)
-    # conversation id → (model, thinking level or None): a Reader chat's chosen model, tried
+    # conversation id → (model, thinking level or None): a Reader chat's or agent menu's chosen model, tried
     # before the shared chain (stream_pi_turn) and warmed instead of the current hop.
     preferred: dict = field(default_factory=dict)
 
@@ -1082,9 +1082,10 @@ async def stream_pi_turn(
         tool_args: dict[str, dict] = {}
         started = time.monotonic()
         unbind_tools = manager.bind_tools(proc, session)
-        # A Reader chat tries Dave's chosen model first (PREFERRED); a failure there moves the
-        # turn onto the shared chain without counting against the shared hop.
-        preferred = manager.preferred.get(conv_id) if getattr(state, "doc_chat_id", None) is not None else None
+        # A conversation with a chosen model (a Reader chat's doc_chat_model, the agent's
+        # chat_model) tries it first (PREFERRED); a failure there moves the turn onto the
+        # shared chain without counting against the shared hop.
+        preferred = manager.preferred.get(conv_id)
         hop_idx = PREFERRED if preferred else manager.failover.current()
         tools_ran = False  # a tool has executed: its result is in pi's session, never re-run it
         prompt_sent = False
@@ -1114,7 +1115,7 @@ async def stream_pi_turn(
             while True:  # one pass per model hop
                 hop = preferred[0] if hop_idx == PREFERRED else manager.failover.hops[hop_idx]
                 tried.add(hop_idx)
-                state.pi_hop = hop  # what run_turn records and the Reader chat shows
+                state.pi_hop = hop  # what run_turn records and answered_by / doc_chat_answered_by show
                 generation = manager.failover.generation
                 settled = True  # nothing is running until a prompt is on its way
                 provider_error: str | None = None
@@ -1255,7 +1256,7 @@ async def stream_pi_turn(
                         # the next conversation should hear about that before it hits it too.
                         kind = classify_provider_error(provider_error)
                         if hop_idx == PREFERRED:
-                            log.warning("pi: %s (Reader chat choice) broke after answering: %s", hop, provider_error[:200])
+                            log.warning("pi: %s (chosen model) broke after answering: %s", hop, provider_error[:200])
                         elif kind == "context_overflow":
                             manager.failover.note_local(hop_idx, kind, provider_error)
                         else:
@@ -1277,7 +1278,7 @@ async def stream_pi_turn(
                             raise PiTurnError(f"pi would not stop after {hop} failed: {failure}") from failure
                         settled = True
                     if hop_idx == PREFERRED:
-                        log.warning("pi: %s (Reader chat choice) failed (%s: %s); trying the shared chain",
+                        log.warning("pi: %s (chosen model) failed (%s: %s); trying the shared chain",
                                     hop, failure.kind, failure.reason[:200])
                         hop_idx = manager.failover.current()
                         if status_callback:

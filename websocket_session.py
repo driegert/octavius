@@ -41,6 +41,31 @@ def reader_model_label(model: str) -> str:
     return model
 
 
+def chat_model_label(model: str) -> str:
+    """The agent menu's label for a pi model id (then the Reader menu's), or the id itself."""
+    for m in settings.pi_brain.chat_models:
+        if m.get("model") and m.get("model") == model:
+            return m.get("label") or model
+    return reader_model_label(model)
+
+
+def chat_model_choice(model_id) -> dict:
+    """The agent menu entry for ``model_id``; unknown or missing: the first (default)."""
+    models = settings.pi_brain.chat_models or [{"id": "auto", "label": "Auto", "model": None}]
+    return next((m for m in models if m.get("id") == model_id), models[0])
+
+
+def chat_models_payload() -> dict:
+    """The agent's model menu, for GET /api/chat-models and the `chat_model` ack."""
+    models = settings.pi_brain.chat_models or [{"id": "auto", "label": "Auto", "model": None}]
+    return {
+        "models": [{"id": m["id"], "label": m.get("label") or m["id"]} for m in models],
+        "default": models[0]["id"],
+        # The menu only does anything on the pi brain; the native loop has one chain.
+        "enabled": settings.pi_brain.enabled,
+    }
+
+
 def build_item_chat_context(item: dict, item_id: int) -> str:
     # The saved_items stack is retiring and this legacy "chat about a saved item"
     # flow no longer has a fetch tool, so inline the (capped) content directly.
@@ -171,6 +196,9 @@ class WebSocketSessionState:
     doc_chat_position: dict | None = None
     # The pi model the current turn's attempt is on (pi_brain sets it); None before one starts.
     pi_hop: str | None = None
+    # The agent model Dave picked (`chat_model`, a chat_models menu id). None: the client has
+    # never sent one, and its conversations behave exactly as before the menu existed.
+    chat_model: str | None = None
 
 
 class WebSocketSessionHandler:
@@ -280,6 +308,7 @@ class WebSocketSessionHandler:
             "doc_chat_open": self.handle_doc_chat_open,
             "doc_chat_position": self.handle_doc_chat_position,
             "doc_chat_model": self.handle_doc_chat_model,
+            "chat_model": self.handle_chat_model,
             "stt_start": self.handle_stt_start,
             "stt_stop": self.handle_stt_stop,
             "typing_start": self.handle_typing_start,
@@ -307,6 +336,7 @@ class WebSocketSessionHandler:
             pi_brain = getattr(self.ws.app.state, "pi_brain", None)
             if pi_brain is not None:
                 pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
+                self._apply_chat_model()
                 # A live re-attached process has history the slot may have lost.
                 self._request_pi_warm("restore_session")
             await self.send_payload(
@@ -377,6 +407,7 @@ class WebSocketSessionHandler:
             source="voice",
             model=settings.llm_chain[0]["model"],
         )
+        self._apply_chat_model()
         await self.send_payload(
             {
                 "type": "session_id",
@@ -472,6 +503,42 @@ class WebSocketSessionHandler:
         await self.send_payload({"type": "doc_chat_model", "doc_id": self.state.doc_chat_id, "model": choice["id"]})
         log.info("Reader chat for document %d now on %s", self.state.doc_chat_id, choice["model"])
 
+    def _apply_chat_model(self) -> None:
+        """Point the current agent conversation's pi turns at Dave's chosen model.
+
+        `prefer` is keyed by conversation id, and the id changes on reset, load, restore
+        and delegation pulls, so this runs after each of those and again before every pi
+        turn. A Reader chat keeps its own choice (doc_chat_model); a client that never
+        sent `chat_model` is left alone.
+        """
+        if self.state.chat_model is None or self.state.doc_chat_id is not None:
+            return
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is None or self.state.history_session is None:
+            return
+        choice = chat_model_choice(self.state.chat_model)
+        pi_brain.prefer(self.state.history_session.conv_id, choice.get("model"), choice.get("thinking"))
+
+    async def handle_chat_model(self, data: dict):
+        """Dave picked a model for the agent (`{"type": "chat_model", "model": <menu id>}`).
+
+        The choice belongs to the connection, not the conversation: it carries over New
+        chat, loading a past conversation and reconnect-restore. The ack names what is
+        now in effect (an unknown id falls back to the default) and repeats the menu.
+        """
+        choice = chat_model_choice(data.get("model"))
+        self.state.chat_model = choice["id"]
+        self._apply_chat_model()
+        if self.state.doc_chat_id is None and settings.pi_brain.enabled:
+            self._request_pi_warm("chat_model")
+        await self.send_payload({
+            "type": "chat_model",
+            "model": choice["id"],
+            "label": choice.get("label") or choice["id"],
+            **chat_models_payload(),
+        })
+        log.info("Agent model set to %s (%s)", choice["id"], choice.get("model") or "shared chain")
+
     async def handle_doc_chat_position(self, data: dict):
         """Where Dave was listening when he asked: the reader chat's "this"."""
         if self.state.doc_chat_id is None or data.get("doc_id") != self.state.doc_chat_id:
@@ -503,6 +570,7 @@ class WebSocketSessionHandler:
             source="voice",
             model=settings.llm_chain[0]["model"],
         )
+        self._apply_chat_model()  # before the warm, so it warms the chosen model
         # The loaded thread runs on a new process; start it now and warm the template.
         self._request_pi_warm("load_conversation", start=True)
         history_pairs = [
@@ -1277,6 +1345,7 @@ class WebSocketSessionHandler:
             first_sentence = True
             agent_error: Exception | None = None
             if use_pi:
+                self._apply_chat_model()
                 stream = stream_pi_turn(self, user_text, source=source, status_callback=status_cb)
             else:
                 stream = stream_agent_turn(
@@ -1341,6 +1410,10 @@ class WebSocketSessionHandler:
                     if use_pi and self.state.doc_chat_id is not None and self.state.pi_hop:
                         await self.send_payload({"type": "doc_chat_answered_by", "model": self.state.pi_hop,
                                                  "label": reader_model_label(self.state.pi_hop)})
+                    elif use_pi and self.state.chat_model is not None and self.state.pi_hop:
+                        # Only for clients using the menu, so others see no new frame type.
+                        await self.send_payload({"type": "answered_by", "model": self.state.pi_hop,
+                                                 "label": chat_model_label(self.state.pi_hop)})
                     await self.send_json("response", full_reply)
                     if self.state.history_session:
                         latency_ms = int((time.monotonic() - turn_start) * 1000)
