@@ -1367,9 +1367,11 @@
   });
 
   // Ctrl/Cmd+Enter submits.
-  pasteInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pasteSubmit.click();
-  });
+  for (const field of [pasteInput, pasteTitle]) {
+    field.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pasteSubmit.click();
+    });
+  }
 
   // ---------- Edit panel: rename / append / replace ----------
 
