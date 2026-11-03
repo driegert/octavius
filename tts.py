@@ -66,6 +66,11 @@ _HANGING_HYPHEN = re.compile(r'(?<=[A-Za-z])-(?=\s+(?:and|or|to|nor)\b)')
 # "57 pus 7%"). Spelled out, the way it is said: "57 point 7", fraction digits one by
 # one ("0.05" is "0 point 0 5"). Not money ("$3.50"), versions ("v1.2", "1.2.3").
 _DECIMAL = re.compile(r'(?<![\w.$£€])(\d+)\.(\d+)(?![\d.]*\.\d)')
+# A quarter before a year: Phonon reads the year in "Q1 2019" digit by digit ("Q one two
+# zero one nine"), and a comma ("Q1, 2019") does not help; "Q1 of 2019" reads the year
+# normally (measured 2026-11-03: the year took 0.8-1.3 s after "Q1", 0.4-0.6 s as plain
+# "in 2019" or "Q1 of 2019", three voices). "2019 Q1" already reads fine.
+_QUARTER_YEAR = re.compile(r'\b(Q[1-4]),?[ \t]+((?:19|20)\d\d)\b(?!\.\d)')
 
 # "housing" (and "rousing", "arousing"): Phonon reads it as "hue-zing" whenever it is
 # capitalised or starts a sentence ("Public Housing" -> "Public Husing", "Ontario Housing
@@ -114,6 +119,7 @@ def speechify(text: str) -> str:
     cleaned = _HANGING_HYPHEN.sub('', cleaned)
     cleaned = _WORD_HYPHEN.sub(' ', cleaned)
     cleaned = _DECIMAL.sub(_say_decimal, cleaned)
+    cleaned = _QUARTER_YEAR.sub(r'\1 of \2', cleaned)
     cleaned = _OUSING.sub(_respell_ousing, cleaned)
     cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()

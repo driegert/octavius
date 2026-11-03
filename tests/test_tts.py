@@ -128,6 +128,15 @@ class SpeechifyTests(unittest.TestCase):
         # These read fine, and "rehousing"/"mousing" are left alone.
         self.assertEqual(speechify("Houses, rehousing, mousing"), "Houses, rehousing, mousing")
 
+    def test_quarter_before_a_year_gets_of(self):
+        # Phonon read "Q1 2019" as "Q one two zero one nine".
+        self.assertEqual(speechify("quarters from Q1 2019 to Q2 2026, with no gaps"),
+                         "quarters from Q1 of 2019 to Q2 of 2026, with no gaps")
+        self.assertEqual(speechify("Q4, 2025 was weak."), "Q4 of 2025 was weak.")
+        # Already fine, or not a quarter and a year: left alone.
+        for text in ("2023 Q3", "in Q3.", "Q3 of 2023", "Q5 2019", "Q1 20 units", "SQ1 2019"):
+            self.assertEqual(speechify(text), text)
+
     def test_decimals_are_read_with_point(self):
         # In a long sentence Phonon read "57.7%" as "57. 7%".
         self.assertEqual(speechify("in our data: 57.7% of the 241,309"), "in our data: 57 point 7% of the 241,309")
