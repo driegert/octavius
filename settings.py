@@ -749,7 +749,7 @@ def load_settings() -> Settings:
         "OCTAVIUS_MEDIA_UPLOAD_DIR", "/media/extra_stuff/octavius/client_media/"
     )
     return Settings(
-        stt_url=_env_str("OCTAVIUS_STT_URL", "http://triplestuffed:8552/api/transcribe"),
+        stt_url=_env_str("OCTAVIUS_STT_URL", "http://127.0.0.1:8502/api/transcribe"),
         llm_chain=llm_chain,
         subagent_llm_chain=subagent_llm_chain,
         vision_llm_chain=vision_llm_chain,
