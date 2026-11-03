@@ -372,7 +372,7 @@ Two traps the prompt now names, both of which cost real turns:
 
 External services currently expected:
 
-- **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
+- **STT**: faster-whisper on **triplestuffed** (this host; moved from lilripper 2026-11-03), large-v3, int8_float16, CUDA. The server listens on `127.0.0.1:8502` and Caddy exposes it at `triplestuffed:8552`. The service sets `OCTAVIUS_STT_URL=http://127.0.0.1:8502/api/transcribe` in `~/.config/octavius/env`; the code default (`triplestuffed:8552`) is the address that works from any host.
 **Routing below is what `models.json` loads as of 2026-10-28.** The code defaults in
 `settings.py` (and `.env.example`) match it (updated 2026-10-30), so a missing or
 unreadable `models.json` falls back to the same routing — `scripts/octavius-models show`
