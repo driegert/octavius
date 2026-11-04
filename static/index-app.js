@@ -15,6 +15,8 @@
   const emptyHint = $('empty-hint');
   const convTitle = $('conv-title');
   const voiceSelect = $('voice-select');
+  const modelSelect = $('model-select');
+  const modelPicker = $('model-picker');
   const speedSlider = $('speed-slider');
   const speedValue = $('speed-value');
   const trimCb = $('trim-cb');
@@ -60,6 +62,8 @@
   let dropAudio = false; // after barge-in, ignore stale audio until the next transcript
 
   let currentVoice = null; // from prefs at boot, else the server's agent default
+  let chatModel = null; // agent model menu id Dave picked; null: never picked (server default)
+  let answeredBy = ''; // label of the model behind the reply about to be committed (answered_by)
   let sttEnabled = true;
   let ttsEnabled = true;
   let talkMode = 'hold';
@@ -312,10 +316,36 @@
     scrollToEnd();
   }
 
+  // "— Qwen3.8 27B" under a reply. Flagged when a model Dave picked was not the one
+  // that answered (it failed and the turn moved to the shared chain).
+  function addAnsweredBy(el, label) {
+    if (!label) return;
+    const by = document.createElement('p');
+    by.className = 'answered-by';
+    by.textContent = '— ' + label;
+    el.appendChild(by);
+  }
+
+  function pickedModelLabel() {
+    if (modelPicker.hidden || !chatModel) return '';
+    const opt = modelSelect.selectedOptions[0];
+    // The first entry is the shared chain ("Auto"): any model may answer it.
+    return opt && modelSelect.selectedIndex > 0 ? opt.textContent : '';
+  }
+
   function commitAssistant(text) {
     const el = streamingEl || addTurn('assistant', true);
     el.classList.remove('pending', 'streaming');
     el.innerHTML = renderMarkdown(text);
+    if (answeredBy) {
+      addAnsweredBy(el, answeredBy);
+      const picked = pickedModelLabel();
+      if (picked && picked !== answeredBy) {
+        el.lastChild.classList.add('fallback');
+        el.lastChild.textContent += ` (${picked} failed)`;
+      }
+      answeredBy = '';
+    }
     streamingEl = null;
     streamingText = '';
     scrollToEnd();
@@ -323,6 +353,7 @@
 
   function settlePending() {
     // Turn ended without a reply (error, empty, cancelled): drop the caret.
+    answeredBy = '';
     if (streamingEl) {
       if (!streamingText) {
         streamingEl.remove();
@@ -347,7 +378,9 @@
       if (message.role === 'user') {
         addTurn('user', false).textContent = message.content;
       } else if (message.role === 'assistant') {
-        addTurn('assistant', false).innerHTML = renderMarkdown(message.content);
+        const el = addTurn('assistant', false);
+        el.innerHTML = renderMarkdown(message.content);
+        addAnsweredBy(el, message.answered_by);
       }
     }
     syncEmpty();
@@ -568,6 +601,10 @@
         setStatus('Ready');
         reconnectDelay = 1000;
         sendSettings();
+        // The model choice belongs to the connection, so re-send it after every reconnect.
+        // Sent even when never picked (null = the server's default): it is also what
+        // turns on the per-reply `answered_by` caption.
+        send({ type: 'chat_model', model: chatModel });
         if (currentConversationId) {
           send({ type: 'restore_session', conversation_id: currentConversationId });
         }
@@ -641,6 +678,16 @@
             setTimeout(() => { if (phase === 'idle' && !sttStreaming) setStatus('Ready'); }, 2000);
             break;
           }
+          case 'chat_model':
+            // The ack names what is in effect (an unknown id falls back to the default).
+            if (msg.model) {
+              chatModel = msg.model;
+              modelSelect.value = msg.model;
+            }
+            break;
+          case 'answered_by':
+            answeredBy = String(msg.label || msg.model || '');
+            break;
           case 'confirm_request':
             showConfirm(msg);
             break;
@@ -1161,6 +1208,36 @@
     });
   }
 
+  // Agent model menu (pi brain only; hidden when the server runs the native loop).
+  async function loadModelList() {
+    let data;
+    try {
+      const response = await fetch('/api/chat-models');
+      data = await response.json();
+    } catch (_err) {
+      return;
+    }
+    const models = (data && data.models) || [];
+    if (!data.enabled || models.length < 2) return;
+    modelSelect.replaceChildren(...models.map((m) => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.label || m.id;
+      return opt;
+    }));
+    if (!chatModel || !models.some((m) => m.id === chatModel)) chatModel = null;
+    modelSelect.value = chatModel || data.default;
+    modelPicker.hidden = false;
+  }
+
+  modelSelect.addEventListener('change', () => {
+    chatModel = modelSelect.value;
+    send({ type: 'chat_model', model: chatModel });
+    const prefs = loadPrefs();
+    prefs.chatModel = chatModel;
+    savePrefs(prefs);
+  });
+
   voiceSelect.addEventListener('change', () => {
     currentVoice = voiceSelect.value;
     applyVoicePrefs(currentVoice);
@@ -1212,6 +1289,7 @@
 
   const prefs = loadPrefs();
   if (prefs.voice) currentVoice = prefs.voice;
+  if (typeof prefs.chatModel === 'string') chatModel = prefs.chatModel;
   if (prefs.sttEnabled !== undefined) sttEnabled = prefs.sttEnabled;
   if (prefs.ttsEnabled !== undefined) ttsEnabled = prefs.ttsEnabled;
   if (prefs.talkMode) {
@@ -1225,6 +1303,7 @@
   }
   applyVoicePrefs(currentVoice);
   loadVoiceList();
+  loadModelList();
   updateInputMode();
   setStatus('Connecting…');
 

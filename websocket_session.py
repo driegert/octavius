@@ -573,11 +573,18 @@ class WebSocketSessionHandler:
         self._apply_chat_model()  # before the warm, so it warms the chosen model
         # The loaded thread runs on a new process; start it now and warm the template.
         self._request_pi_warm("load_conversation", start=True)
-        history_pairs = [
-            {"role": message["role"], "content": message["content"]}
-            for message in msgs
-            if message["role"] in ("user", "assistant") and message.get("content")
-        ]
+        history_pairs = []
+        for message in msgs:
+            if message["role"] not in ("user", "assistant") or not message.get("content"):
+                continue
+            pair = {"role": message["role"], "content": message["content"]}
+            # pi turns record the model that actually answered as "pi:<model>"; native
+            # turns record the chain's first model whether or not it answered, so only
+            # pi turns get a caption.
+            model = message.get("model") or ""
+            if message["role"] == "assistant" and model.startswith("pi:") and model[3:]:
+                pair["answered_by"] = chat_model_label(model[3:])
+            history_pairs.append(pair)
         await self.send_payload(
             {
                 "type": "conversation_loaded",

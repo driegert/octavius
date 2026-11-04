@@ -49,11 +49,6 @@
 
     <section class="rail-pane" id="pane-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <div class="field">
-        <label class="field-label" for="voice-select">Voice</label>
-        <select id="voice-select"></select>
-      </div>
-
-      <div class="field">
         <div class="field-row">
           <label class="field-label" for="speed-slider">Speaking speed</label>
           <output id="speed-value" for="speed-slider">1.4x</output>
@@ -102,6 +97,16 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
       </button>
       <h1 class="stage-title" id="conv-title">New conversation</h1>
+      <div class="pickers">
+        <label class="picker" id="model-picker" hidden title="Which model answers">
+          <span class="picker-label">Model</span>
+          <select id="model-select" aria-label="Model"></select>
+        </label>
+        <label class="picker" title="The voice that speaks replies">
+          <span class="picker-label">Voice</span>
+          <select id="voice-select" aria-label="Voice"></select>
+        </label>
+      </div>
       <span class="conn" id="conn-state" data-state="connecting">Connecting</span>
     </header>
 

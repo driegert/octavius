@@ -165,6 +165,31 @@ class WebSocketSessionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_handle_load_conversation_captions_pi_replies_only(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+            handler.state.history_session = _FakeHistorySession(conv_id=1)
+
+            with patch(
+                "history.get_conversation_messages",
+                return_value=[
+                    {"role": "user", "content": "q1", "model": None},
+                    {"role": "assistant", "content": "a1", "model": "pi:lrv-p01/qwen3.8-27b"},
+                    {"role": "assistant", "content": "a2", "model": "gemma4-26b-a4b"},
+                ],
+            ), patch("websocket_session.chat_model_label", side_effect=lambda m: f"L({m})"):
+                await handler.handle_load_conversation({"conversation_id": 42})
+
+            loaded = [json.loads(t) for t in ws.sent if '"conversation_loaded"' in t][-1]
+            self.assertEqual(loaded["messages"], [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1", "answered_by": "L(lrv-p01/qwen3.8-27b)"},
+                {"role": "assistant", "content": "a2"},
+            ])
+
+        asyncio.run(run())
+
     def test_handle_item_chat_load_updates_saved_pointer_for_existing_chat(self):
         async def run():
             handler = WebSocketSessionHandler(_FakeWS())
