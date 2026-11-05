@@ -113,7 +113,7 @@ UI_CSP = "; ".join([
     "default-src 'self'",
     "script-src 'self'",  # marked is vendored in static/vendor/, so no CDN is trusted
     "style-src 'self' https://fonts.googleapis.com",
-    "font-src https://fonts.gstatic.com",
+    "font-src 'self' https://fonts.gstatic.com",  # 'self': KaTeX's fonts, vendored with it
     "img-src 'self' data: blob:",
     "media-src 'self' blob:",
     "connect-src 'self'",

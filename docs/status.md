@@ -937,6 +937,14 @@ Likely refactor targets, in rough priority order:
    near-instant. Only worth it above a size threshold (a 50-line note no; a 50-page PDF
    yes). Not via `hybrid-corpus`, which is for persistent corpora.
 
+8. Reader Original view (shipped 2026-11-04; see AGENTS.md "Document Reader") — open
+   edges, none urgent: figures show as `[Figure: caption]` because docproc's markdown
+   carries no image links (`docs/HANDOFF-docproc-images.md`); the 12 documents converted
+   before 2026-10-31 have no `source_text` and show only the reading text until retried
+   (Dave chose to leave them); playback highlights the whole chunk in Original view
+   (Dave's call, revisit if it reads badly); and a click inside math picks its sentence by
+   relative position, so it can land one sentence off.
+
 ## Planned: `deep_research` domain via headless pi (2026-08-08)
 
 Dave raised replacing the in-process subagent loop with `pi --mode json -p --no-session`

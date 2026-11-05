@@ -5,7 +5,7 @@ body { overflow: hidden; }
 
 .shell {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: var(--rail-w, 320px) minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
 }
@@ -13,6 +13,7 @@ body { overflow: hidden; }
 /* ---------------- Rail ---------------- */
 
 .rail {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -255,6 +256,47 @@ body { overflow: hidden; }
 .stage-head .btn { padding: 0.3rem 0.8rem; font-size: 0.8rem; }
 .stage-head .btn[hidden] { display: none; }
 
+.view-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.view-seg[hidden] { display: none; }
+.view-seg button {
+  padding: 0.28rem 0.75rem;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.view-seg button[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); }
+.view-seg button:hover { color: var(--ink); }
+
+/* ---- Panel resize handles (wide screens) ---- */
+
+.resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 5;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+#rail-resizer { right: -4px; }
+#chat-resizer { left: -4px; }
+.resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.resizer:hover::after, .resizer:focus-visible::after, body.resizing .resizer::after { background: rgba(185, 166, 255, 0.45); }
+.resizer:focus-visible { outline: none; }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing .shell { transition: none; }
+
 /* Edit panel */
 .edit-wrap { padding: 0 2rem; }
 .edit-wrap[hidden] { display: none; }
@@ -368,6 +410,70 @@ body { overflow: hidden; }
 .s.active { color: #fff; background: rgba(185, 166, 255, 0.18); box-shadow: 0 0 0 3px rgba(185, 166, 255, 0.18); }
 .s.read { color: var(--ink-3); }
 
+/* ---- Original view: the chunk's markdown, tables and math rendered ---- */
+
+.sec { position: relative; }
+.sec-orig { display: none; }
+.sec.orig > .sec-body { display: none; }
+.sec.orig > .sec-orig { display: block; }
+.sec-orig {
+  margin: 0 -0.6rem;
+  padding: 0.1rem 0.6rem;
+  border-radius: 6px;
+  font-family: var(--font-voice);
+  font-size: 1.19rem;
+  line-height: 1.7;
+  color: var(--ink-2);
+  font-optical-sizing: auto;
+  overflow-wrap: break-word;
+  transition: background 0.25s, box-shadow 0.25s;
+}
+.sec-orig { cursor: pointer; }
+.sec-orig > :first-child { margin-top: 0; }
+.sec-orig > :last-child { margin-bottom: 0; }
+.sec-orig p { margin: 0 0 0.8em; }
+.sec-orig strong { color: var(--ink); font-weight: 500; }
+.sec-orig a { color: var(--violet); }
+.sec-orig code { font-size: 0.85em; }
+.sec-orig ul, .sec-orig ol { margin: 0 0 0.8em; padding-left: 1.4em; }
+.sec-orig blockquote { margin: 0 0 0.8em; padding-left: 0.9em; border-left: 2px solid var(--line); color: var(--ink-3); }
+.sec-orig h1, .sec-orig h2, .sec-orig h3, .sec-orig h4 {
+  margin: 1em 0 0.5em; font-family: var(--font-ui); font-size: 0.95rem; font-weight: 600; color: var(--ink);
+}
+.sec-orig .katex { font-size: 1.05em; color: var(--ink); }
+.sec-orig .katex-display { margin: 0.7em 0; overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }
+.orig-table { margin: 0 0 0.9em; overflow-x: auto; }
+.sec-orig table { border-collapse: collapse; font-family: var(--font-ui); font-size: 0.86rem; line-height: 1.45; }
+.sec-orig th, .sec-orig td { padding: 0.35rem 0.7rem; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; }
+.sec-orig th { color: var(--ink); font-weight: 600; border-bottom-color: var(--line); }
+.orig-figure { color: var(--ink-3); font-style: italic; }
+.orig-math-raw { font-family: ui-monospace, monospace; font-size: 0.85em; color: var(--ink-3); }
+
+/* The place, chunk-wide (the sentence itself is hidden in this view). */
+.sec.orig.here > .sec-orig { box-shadow: inset 2px 0 0 rgba(185, 166, 255, 0.55); }
+.sec.orig.playing > .sec-orig { background: rgba(185, 166, 255, 0.09); box-shadow: inset 2px 0 0 var(--violet); }
+
+/* Per-chunk switch between the two views: top right, just above the chunk's text (in
+   the heading row or the gap above), at its static position so no offsets are guessed. */
+.sec-flip {
+  position: absolute;
+  right: 0;
+  margin-top: -1.45rem;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-3);
+  font-family: var(--font-ui);
+  font-size: 0.68rem;
+  font-weight: 500;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+}
+.sec:hover > .sec-flip, .sec-flip:focus-visible { opacity: 1; }
+.sec-flip:hover { color: var(--ink); }
+
 .follow {
   position: absolute;
   left: 50%;
@@ -457,6 +563,8 @@ body { overflow: hidden; }
 
 @media (max-width: 860px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
+  .resizer { display: none; }
+  .sec-flip { opacity: 0.75; }
   .only-narrow { display: inline-flex; }
   .rail {
     position: fixed;

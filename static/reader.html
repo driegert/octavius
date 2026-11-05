@@ -12,8 +12,10 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&family=Spline+Sans:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/static/octavius.css">
+<link rel="stylesheet" href="/static/vendor/katex-0.16.22/katex.min.css" integrity="sha384-5TcZemv2l/9On385z///+d7MSYlvIEw9FuZTIdZ14vJLqWphw7e7ZPuOiCHJcFCP">
 <link rel="stylesheet" href="/static/reader.css">
 <script src="/static/vendor/marked-15.0.12.min.js" integrity="sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+"></script>
+<script src="/static/vendor/katex-0.16.22/katex.min.js" integrity="sha384-cMkvdD8LoxVzGF/RPUKAcvmm49FQ0oxwDF3BGKtDXcEc+T1b2N+teh/OJfpU0jr6"></script>
 <script src="/static/app-common.js"></script>
 </head>
 <body>
@@ -80,6 +82,8 @@
       <ul class="toc-tree" id="toc-tree" role="tree"></ul>
     </nav>
 
+    <div class="resizer" id="rail-resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel" title="Drag to resize; double-click to reset" tabindex="0"></div>
+
     <footer class="rail-foot">
       <a class="rail-link" href="/">Talk</a>
       <a class="rail-link" href="/inbox">Inbox</a>
@@ -95,6 +99,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
       </button>
       <h1 class="stage-title" id="player-title">Reader</h1>
+      <div class="view-seg" id="view-seg" role="group" aria-label="Show the text as" title="Original or reading text (V)" hidden>
+        <button type="button" data-view="original" aria-pressed="true">Original</button>
+        <button type="button" data-view="reading" aria-pressed="false">Reading</button>
+      </div>
       <button class="btn" id="player-edit" hidden>Edit</button>
       <button class="btn" id="player-finish" hidden>Mark finished</button>
       <span class="conn" id="conn-state" data-state="connecting">Connecting</span>
@@ -187,6 +195,7 @@
 </button>
 
 <aside class="chat" id="chat-panel" aria-label="Chat about this document" hidden>
+  <div class="resizer" id="chat-resizer" role="separator" aria-orientation="vertical" aria-label="Resize the chat panel" title="Drag to resize; double-click to reset" tabindex="0"></div>
   <header class="chat-head">
     <div class="chat-titles">
       <h2 class="chat-title">Chat</h2>
@@ -223,6 +232,7 @@
 <script src="/static/index-audio.js"></script>
 <script src="/static/voice-capture.js"></script>
 <script src="/static/index-orb.js"></script>
+<script src="/static/reader-original.js"></script>
 <script src="/static/reader-app.js"></script>
 <script src="/static/reader-chat.js"></script>
 </body>

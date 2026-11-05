@@ -29,7 +29,8 @@ SPEECH = {
     "total_sentences": 5,
     "chunks": [
         {"index": 0, "heading": "Intro", "level": 1, "speech_text": "", "sentences": ["One.", "Two."]},
-        {"index": 1, "heading": "Detail", "level": 2, "speech_text": "", "sentences": ["Three.", ""]},
+        {"index": 1, "heading": "Detail", "level": 2, "speech_text": "", "sentences": ["Three.", ""],
+         "source_text": "Three: $x^2$."},
         {"index": 2, "heading": None, "speech_text": "", "sentences": ["Five."]},
     ],
 }
@@ -268,6 +269,17 @@ class DocumentRouteLevelTests(unittest.TestCase):
         self.assertEqual([s.get("level") for s in doc["sections"]], [1, 2, None])
         self.assertEqual(doc["progress_sentences"], 4)  # derived from the saved place when the row predates it
         self.assertEqual(doc["total_sentences"], 5)
+
+    def test_sections_carry_source_text_only_when_stored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _db_with_doc(tmp)
+            app = FastAPI()
+            app.include_router(reader_api.router)
+            app.state.db_path = db_path
+            with TestClient(app) as client:
+                doc = client.get("/api/reader/documents/1").json()["document"]
+        # /reader shows the original markdown where it exists; older chunks have none.
+        self.assertEqual([s.get("source_text") for s in doc["sections"]], [None, "Three: $x^2$.", None])
 
 
 

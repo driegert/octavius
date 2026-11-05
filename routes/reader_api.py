@@ -62,6 +62,10 @@ async def reader_get(doc_id: int, request: Request):
                         # Full sentence text so clients can render a tappable read-along and
                         # seek to any sentence. Additive; the PWA ignores the extra field.
                         "sentences": c["sentences"],
+                        # The chunk's markdown (LaTeX and tables intact), which /reader can
+                        # show in place of the spoken text. Chunks converted before
+                        # 2026-10-31 have none and are shown as spoken.
+                        **({"source_text": c["source_text"]} if c.get("source_text") else {}),
                     }
                     for c in speech["chunks"]
                 ]

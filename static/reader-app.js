@@ -56,6 +56,7 @@
   const paneContents = $('pane-contents');
   const tocDoc = $('toc-doc');
   const tocTree = $('toc-tree');
+  const viewSeg = $('view-seg');
 
   let ws = null;
   let connected = false;
@@ -86,7 +87,13 @@
   // Rendered sentences of the open document, keyed "chunk:sentence".
   let sentenceEls = new Map();
   let markedEl = null;
+  let markedSec = null; // the chunk holding the place, highlighted whole in Original view
   let follow = true;
+
+  // Original view shows each chunk's markdown (tables, rendered math) where the document
+  // has it; Reading view shows the spoken sentences. `flipped` holds chunks Dave switched
+  // to the other view by hand; changing the document-wide view clears it.
+  let flipped = new Set();
 
   // Table of contents for the open document.
   let tocLinks = new Map(); // section index -> link element
@@ -110,6 +117,7 @@
   }
 
   const prefs = loadPrefs();
+  let viewMode = prefs.view === 'reading' ? 'reading' : 'original';
   if (prefs.speed) speedSlider.value = prefs.speed;
   speedVal.textContent = parseFloat(speedSlider.value).toFixed(1) + 'x';
 
@@ -321,13 +329,30 @@
 
   function markSentence(chunkIdx, sentIdx, scroll) {
     if (markedEl) markedEl.classList.remove('active', 'cursor');
+    if (markedSec) markedSec.classList.remove('here', 'playing');
+    const prevSec = markedSec;
     markedEl = sentenceEls.get(chunkIdx + ':' + sentIdx) || null;
+    markedSec = markedEl ? markedEl.closest('.sec') : null;
     updateTocCurrent(chunkIdx);
     if (!markedEl) return;
     markedEl.classList.add(isPlaying ? 'active' : 'cursor');
-    if (scroll && follow) {
-      markedEl.scrollIntoView({ block: 'center', behavior: scroll === 'instant' ? 'auto' : 'smooth' });
-    }
+    markedSec.classList.add(isPlaying ? 'playing' : 'here');
+    // In Original view the next sentence of the same chunk is no reason to scroll.
+    const sameChunk = markedSec === prevSec && markedSec.classList.contains('orig');
+    if (scroll && follow && !(sameChunk && scroll === true)) scrollToPlace(scroll === 'instant' ? 'auto' : 'smooth');
+  }
+
+  // In Original view the marked sentence is hidden, so the place is its whole chunk.
+  function placeEl() {
+    if (markedSec && markedSec.classList.contains('orig')) return markedSec.querySelector('.sec-orig');
+    return markedEl;
+  }
+  function scrollToPlace(behavior) {
+    const el = placeEl();
+    if (!el) return;
+    // A chunk taller than the page is shown from its top, not its middle.
+    const tall = el.getBoundingClientRect().height > pageEl.clientHeight * 0.7;
+    el.scrollIntoView({ block: tall ? 'start' : 'center', behavior });
   }
 
   function userScrolled() {
@@ -340,7 +365,7 @@
   followBtn.addEventListener('click', () => {
     follow = true;
     followBtn.hidden = true;
-    if (markedEl) markedEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    scrollToPlace('smooth');
   });
 
   function setNotice(text, tone) {
@@ -691,9 +716,17 @@
   sectionsEl.addEventListener('click', (event) => {
     const t = event.target;
     if (!(t instanceof Element)) return;
+    const flip = t.closest('.sec-flip');
+    if (flip) { flipChunk(Number(flip.dataset.c)); return; }
     if (window.getSelection && String(window.getSelection()).length > 0) return; // selecting text
     const s = t.closest('.s');
     if (s) { seekTo(Number(s.dataset.c), Number(s.dataset.s)); return; }
+    const orig = t.closest('.sec-orig');
+    if (orig && !t.closest('a')) {
+      const place = origPlaceAt(orig, event.clientX, event.clientY);
+      if (place) seekTo(place[0], place[1]);
+      return;
+    }
     const h = t.closest('.sec-head');
     if (h) seekTo(Number(h.dataset.c), 0);
   });
@@ -708,6 +741,75 @@
   voiceSelect.addEventListener('change', () => {
     savePrefs({ voice: voiceSelect.value });
     if (isPlaying) sendPlay(currentChunk, currentSentence);
+  });
+
+  // ---------- Original / Reading view ----------
+
+  // The sentence a click in an Original-view chunk means: the caret's character offset in
+  // the chunk's text, matched against its spoken sentences (OctaviusReaderOriginal.sentenceAt).
+  function origPlaceAt(orig, x, y) {
+    const c = Number(orig.closest('.sec').dataset.c);
+    const sec = (currentDoc && currentDoc.sections || []).find((z) => z.index === c);
+    if (!sec) return null;
+    let node = null;
+    let off = 0;
+    if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(x, y);
+      if (pos) { node = pos.offsetNode; off = pos.offset; }
+    } else if (document.caretRangeFromPoint) {
+      const r = document.caretRangeFromPoint(x, y);
+      if (r) { node = r.startContainer; off = r.startOffset; }
+    }
+    let offset = 0;
+    if (node && orig.contains(node)) {
+      try {
+        const r = document.createRange();
+        r.setStart(orig, 0);
+        r.setEnd(node, off);
+        offset = r.toString().length;
+      } catch (_err) {
+      }
+    }
+    return [c, OctaviusReaderOriginal.sentenceAt(orig.textContent, offset, sec.sentences)];
+  }
+
+  function showsOriginal(chunkIdx) {
+    return (viewMode === 'original') !== flipped.has(chunkIdx);
+  }
+  function applyChunkView(wrap) {
+    const idx = Number(wrap.dataset.c);
+    const orig = showsOriginal(idx);
+    wrap.classList.toggle('orig', orig);
+    const flip = wrap.querySelector(':scope > .sec-flip');
+    if (flip) {
+      flip.textContent = orig ? 'Reading' : 'Original';
+      flip.title = orig ? 'Show this part as it is read aloud' : 'Show this part as written';
+      flip.setAttribute('aria-label', flip.title);
+    }
+  }
+  function syncViewSeg() {
+    viewSeg.querySelectorAll('button[data-view]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b.dataset.view === viewMode));
+    });
+  }
+  function setViewMode(mode) {
+    if (mode !== 'original' && mode !== 'reading') return;
+    viewMode = mode;
+    flipped = new Set();
+    savePrefs({ view: mode });
+    syncViewSeg();
+    sectionsEl.querySelectorAll('.sec.has-orig').forEach(applyChunkView);
+    if (follow) scrollToPlace('auto');
+  }
+  function flipChunk(chunkIdx) {
+    if (flipped.has(chunkIdx)) flipped.delete(chunkIdx);
+    else flipped.add(chunkIdx);
+    const wrap = sectionsEl.querySelector(`.sec[data-c="${chunkIdx}"]`);
+    if (wrap) applyChunkView(wrap);
+  }
+  viewSeg.addEventListener('click', (event) => {
+    const b = event.target instanceof Element && event.target.closest('button[data-view]');
+    if (b) setViewMode(b.dataset.view);
   });
 
   // ---------- Document view ----------
@@ -731,7 +833,12 @@
     syncDocFromDetail(doc);
     sentenceEls = new Map();
     markedEl = null;
+    markedSec = null;
     sectionsEl.innerHTML = '';
+    if (!opts || !opts.keepFlips) flipped = new Set();
+    const hasOriginal = doc.status === 'ready' && (doc.sections || []).some((sec) => sec.source_text);
+    viewSeg.hidden = !hasOriginal;
+    syncViewSeg();
 
     if (doc.status !== 'ready') {
       buildToc(null);
@@ -754,6 +861,7 @@
     for (const sec of doc.sections || []) {
       const wrap = document.createElement('section');
       wrap.className = 'sec';
+      wrap.dataset.c = sec.index;
       if (sec.heading) {
         const h = document.createElement('button');
         h.type = 'button';
@@ -778,6 +886,21 @@
         sentenceEls.set(sec.index + ':' + i, span);
       });
       wrap.appendChild(body);
+      if (sec.source_text) {
+        const orig = document.createElement('div');
+        orig.className = 'sec-orig';
+        orig.appendChild(OctaviusReaderOriginal.render(sec.source_text));
+        wrap.appendChild(orig);
+        wrap.classList.add('has-orig');
+        if (OctaviusReaderOriginal.differs(sec.source_text, sentences)) {
+          const flip = document.createElement('button');
+          flip.type = 'button';
+          flip.className = 'sec-flip';
+          flip.dataset.c = sec.index;
+          wrap.insertBefore(flip, body);
+        }
+        applyChunkView(wrap);
+      }
       frag.appendChild(wrap);
     }
     sectionsEl.appendChild(frag);
@@ -902,6 +1025,8 @@
     totalSentences = 0;
     sentenceEls = new Map();
     markedEl = null;
+    markedSec = null;
+    viewSeg.hidden = true;
     sectionsEl.innerHTML = '';
     docStateEl.hidden = true;
     setNotice('');
@@ -1472,7 +1597,7 @@
             setNotice(`The new text wasn’t added: ${doc.error}`, 'error');
             return;
           }
-          renderDocument(doc, { preservePosition: !replace });
+          renderDocument(doc, { preservePosition: !replace, keepFlips: !replace });
         })
         .catch(retry);
     }
@@ -1569,6 +1694,70 @@
   railClose.addEventListener('click', closeRail);
   scrim.addEventListener('click', closeRail);
 
+  // ---------- Resizable side panels (wide screens only) ----------
+
+  // Each handle sets a CSS variable on :root (--rail-w / --chat-w) and remembers it.
+  // Drag, or focus the handle and use the arrow keys; double-click resets.
+  const WIDE = window.matchMedia('(min-width: 861px)');
+  const PANELS = [
+    { handle: $('rail-resizer'), cssVar: '--rail-w', pref: 'railW', min: 220, max: () => Math.min(560, innerWidth * 0.4), edge: 'left' },
+    { handle: $('chat-resizer'), cssVar: '--chat-w', pref: 'chatW', min: 300, max: () => Math.min(820, innerWidth * 0.55), edge: 'right' },
+  ];
+  function clampWidth(panel, px) {
+    return Math.round(Math.max(panel.min, Math.min(panel.max(), px)));
+  }
+  function setPanelWidth(panel, px, save) {
+    if (px == null) {
+      document.documentElement.style.removeProperty(panel.cssVar);
+    } else {
+      document.documentElement.style.setProperty(panel.cssVar, clampWidth(panel, px) + 'px');
+    }
+    if (save) savePrefs({ [panel.pref]: px == null ? null : clampWidth(panel, px) });
+  }
+  for (const panel of PANELS) {
+    if (!panel.handle) continue;
+    const stored = Number(prefs[panel.pref]);
+    if (stored > 0) setPanelWidth(panel, stored, false);
+    const current = () => panel.handle.parentElement.getBoundingClientRect().width;
+    panel.handle.addEventListener('pointerdown', (event) => {
+      if (!WIDE.matches || event.button !== 0) return;
+      event.preventDefault();
+      panel.handle.setPointerCapture(event.pointerId);
+      document.body.classList.add('resizing');
+      const startX = event.clientX;
+      const startW = current();
+      const move = (e) => {
+        const dx = e.clientX - startX;
+        setPanelWidth(panel, panel.edge === 'left' ? startW + dx : startW - dx, false);
+      };
+      const end = () => {
+        panel.handle.removeEventListener('pointermove', move);
+        panel.handle.removeEventListener('pointerup', end);
+        panel.handle.removeEventListener('pointercancel', end);
+        document.body.classList.remove('resizing');
+        savePrefs({ [panel.pref]: Math.round(current()) });
+      };
+      panel.handle.addEventListener('pointermove', move);
+      panel.handle.addEventListener('pointerup', end);
+      panel.handle.addEventListener('pointercancel', end);
+    });
+    panel.handle.addEventListener('dblclick', () => setPanelWidth(panel, null, true));
+    panel.handle.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      event.stopPropagation();  // not a sentence step
+      const grow = (event.key === 'ArrowRight') === (panel.edge === 'left');
+      setPanelWidth(panel, current() + (grow ? 24 : -24), true);
+    });
+  }
+  // A narrower window re-clamps the saved widths so the reading column keeps its room.
+  window.addEventListener('resize', () => {
+    for (const panel of PANELS) {
+      const stored = Number(loadPrefs()[panel.pref]);
+      if (stored > 0) setPanelWidth(panel, stored, false);
+    }
+  });
+
   // ---------- Keyboard ----------
 
   function isTypingTarget(el) {
@@ -1595,6 +1784,12 @@
       if (narrow && !shell.classList.contains('rail-open')) { selectRailTab('contents'); openRail(); return; }
       selectRailTab(railTab === 'contents' ? 'library' : 'contents');
       if (narrow && railTab === 'library') closeRail();
+      return;
+    }
+    if ((event.key === 'v' || event.key === 'V') && !event.shiftKey) {
+      if (viewSeg.hidden) return;
+      event.preventDefault();
+      setViewMode(viewMode === 'original' ? 'reading' : 'original');
       return;
     }
     if (event.key === '/') {
@@ -1650,10 +1845,19 @@
   // moved, else the marked sentence (playing, paused, or clicked while paused; a click
   // never reaches the server, so the page is the only one that knows it).
   let lastSelection = null;
-  function sentenceOf(node) {
+  // A selection in an Original-view chunk names the whole chunk: its first sentence for
+  // the start of the selection, its last for the end (the original has no sentence map).
+  function sentenceOf(node, atEnd) {
     const el = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
-    const s = el && el.closest('.s');
-    return s && sectionsEl.contains(s) ? [Number(s.dataset.c), Number(s.dataset.s)] : null;
+    if (!el || !sectionsEl.contains(el)) return null;
+    const s = el.closest('.s');
+    if (s) return [Number(s.dataset.c), Number(s.dataset.s)];
+    const orig = el.closest('.sec-orig');
+    if (!orig) return null;
+    const c = Number(orig.closest('.sec').dataset.c);
+    if (!atEnd) return [c, 0];
+    const sec = (currentDoc && currentDoc.sections || []).find((x) => x.index === c);
+    return [c, Math.max(0, ((sec && sec.sentence_count) || 1) - 1)];
   }
   document.addEventListener('selectionchange', () => {
     const sel = window.getSelection();
@@ -1665,7 +1869,7 @@
       return;
     }
     const a = sentenceOf(range.startContainer);
-    const b = sentenceOf(range.endContainer);
+    const b = sentenceOf(range.endContainer, true);
     if (!a || !b || !currentDocId) return;
     lastSelection = { doc_id: currentDocId, chunk_index: a[0], sentence_index: a[1],
                       end_chunk_index: b[0], end_sentence_index: b[1], text: String(sel).slice(0, 200) };
