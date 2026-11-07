@@ -74,6 +74,7 @@ Examples:
 - $e^{it\\lambda}$ becomes "e to the i t lambda", and $2\\pi f t$ becomes "2 pi f t" (symbols multiplied together are read side by side: no "times", no "to the power of")
 - $3 \\cdot 4$ and $a \\cdot b$ become "3 times 4" and "a times b" (never "dot")
 - $dZ(\\lambda)$ becomes "dee zed of lambda", and $dx$ becomes "dee x" (the d of a differential is its own word)
+- $F(d\\lambda)$ becomes "F of dee lambda" (a differential inside parentheses is an argument: keep the "of", with no comma)
 - $v_t^{(k)}$ becomes "v sub t superscript k" (a superscript in parentheses is a label, not a power)
 - A multi-line equation (aligned, & and \\\\) is read as one continuous statement: "... equals ..., which equals ..."
 
