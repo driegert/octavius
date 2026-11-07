@@ -22,6 +22,7 @@
   const trimCb = $('trim-cb');
   const normalizeCb = $('normalize-cb');
   const proactiveSpeakCb = $('proactive-speak-cb');
+  const oneTurnBtn = $('one-turn-btn');
   const sttToggle = $('stt-toggle');
   const ttsToggle = $('tts-toggle');
   const textForm = $('text-form');
@@ -68,6 +69,7 @@
   let ttsEnabled = true;
   let talkMode = 'hold';
   let continuousActive = false;
+  let singleTurn = false; // this capture is a one-off: a pause sends it, whatever talkMode says
   let currentConversationId = null;
   let viewingConversationId = null;
   let conversationHistory = [];
@@ -207,6 +209,7 @@
     if (!connected) return '';
     if (!sttEnabled) return 'Microphone is off. Write below.';
     if (sttStreaming) {
+      if (singleTurn) return `A pause sends it. Press ${coarse ? 'One turn' : 'T'} to send now.`;
       if (talkMode === 'hold') return 'Release to send';
       if (talkMode === 'toggle') return coarse ? 'Tap the orb again to send' : 'Press Space or the orb again to send';
       return `Pauses end your turn. Press ${KEY} to stop.`;
@@ -226,6 +229,11 @@
     talkBtn.setAttribute('aria-label', talkLabel());
     talkBtn.title = talkLabel();
     hintEl.textContent = hintText();
+    oneTurnBtn.disabled = !connected || !sttEnabled;
+    oneTurnBtn.classList.toggle('live', singleTurn);
+    const oneTurnLabel = singleTurn ? 'Send this turn now' : 'One voice turn: a pause sends it and the mic stays closed';
+    oneTurnBtn.title = oneTurnLabel;
+    oneTurnBtn.setAttribute('aria-label', oneTurnLabel);
     textSend.disabled = !connected || !textInput.value.trim();
     statusEl.dataset.tone = toneFor(statusEl.textContent);
   }
@@ -738,6 +746,7 @@
 
   function teardownMic() {
     sttStreaming = false;
+    singleTurn = false;
     if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
     if (sttStream) { sttStream.getTracks().forEach((t) => t.stop()); sttStream = null; }
     if (sttAudioCtx) { sttAudioCtx.close(); sttAudioCtx = null; }
@@ -775,9 +784,9 @@
       sttSendTimer = setInterval(sendPCMChunks, 250);
 
       micStarting = false;
-      setStatus(continuousActive ? 'Listening…' : 'Recording…');
+      setStatus(continuousActive || singleTurn ? 'Listening…' : 'Recording…');
       refreshUi();
-      if (releaseWhileStarting && talkMode === 'hold') stopRecording();
+      if (releaseWhileStarting && (talkMode === 'hold' || singleTurn)) stopRecording();
     } catch (_err) {
       micStarting = false;
       teardownMic();
@@ -834,8 +843,27 @@
     refreshUi();
   }
 
+  // One capture and one reply, then the mic stays closed. The server's VAD ends the
+  // capture on a pause in every talk mode; nothing but continuousActive reopens the mic.
+  function oneTurnPress() {
+    if (!connected || !sttEnabled) return;
+    const capturing = sttStreaming || micStarting;
+    if (singleTurn && capturing) { stopRecording(); return; }
+    continuousActive = false; // during hands-free, this makes the current turn the last
+    singleTurn = true;
+    if (capturing) {
+      setStatus('Listening…');
+      refreshUi();
+      return;
+    }
+    bargeIn();
+    startRecording();
+    refreshUi();
+  }
+
   function talkPress() {
     if (!connected || !sttEnabled) return;
+    if (singleTurn && (sttStreaming || micStarting)) { stopRecording(); return; }
     if (talkMode === 'continuous') {
       if (continuousActive) endContinuousConversation();
       else startContinuousConversation();
@@ -894,6 +922,11 @@
     if (event.key === '/') {
       event.preventDefault();
       textInput.focus();
+      return;
+    }
+    if (event.key === 't' || event.key === 'T') {
+      event.preventDefault();
+      if (!event.repeat) oneTurnPress();
       return;
     }
     if (event.code === 'Space' || event.key === ' ') {
@@ -1153,6 +1186,11 @@
 
   // ---------- Controls ----------
 
+  oneTurnBtn.addEventListener('click', (event) => {
+    if (event.detail > 0) oneTurnBtn.blur(); // a mouse click must not take Space away from talking
+    oneTurnPress();
+  });
+
   sttToggle.addEventListener('click', () => {
     sttEnabled = !sttEnabled;
     if (!sttEnabled) {
@@ -1176,6 +1214,60 @@
     if (sttStreaming && value !== talkMode) cancelRecording();
     talkMode = value;
     updateInputMode();
+  });
+
+  // ---------- Resizable side rail (wide screens only) ----------
+
+  // Sets --rail-w on :root and remembers it. Drag, or focus the handle and use the
+  // arrow keys; double-click resets. Same behaviour as the panels on /reader.
+  const railResizer = $('rail-resizer');
+  const wideScreen = window.matchMedia('(min-width: 861px)');
+  const clampRail = (px) => Math.round(Math.max(220, Math.min(Math.min(560, innerWidth * 0.4), px)));
+  const railWidth = () => $('rail').getBoundingClientRect().width;
+
+  function setRailWidth(px, save) {
+    if (px == null) document.documentElement.style.removeProperty('--rail-w');
+    else document.documentElement.style.setProperty('--rail-w', clampRail(px) + 'px');
+    if (save) {
+      const prefs = loadPrefs();
+      if (px == null) delete prefs.railW;
+      else prefs.railW = clampRail(px);
+      savePrefs(prefs);
+    }
+  }
+
+  const storedRail = Number(loadPrefs().railW);
+  if (storedRail > 0) setRailWidth(storedRail, false);
+
+  railResizer.addEventListener('pointerdown', (event) => {
+    if (!wideScreen.matches || event.button !== 0) return;
+    event.preventDefault();
+    railResizer.setPointerCapture(event.pointerId);
+    document.body.classList.add('resizing');
+    const startX = event.clientX;
+    const startW = railWidth();
+    const move = (e) => setRailWidth(startW + e.clientX - startX, false);
+    const end = () => {
+      railResizer.removeEventListener('pointermove', move);
+      railResizer.removeEventListener('pointerup', end);
+      railResizer.removeEventListener('pointercancel', end);
+      document.body.classList.remove('resizing');
+      setRailWidth(railWidth(), true);
+    };
+    railResizer.addEventListener('pointermove', move);
+    railResizer.addEventListener('pointerup', end);
+    railResizer.addEventListener('pointercancel', end);
+  });
+  railResizer.addEventListener('dblclick', () => setRailWidth(null, true));
+  railResizer.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    setRailWidth(railWidth() + (event.key === 'ArrowRight' ? 24 : -24), true);
+  });
+  // A narrower window re-clamps the saved width so the stage keeps its room.
+  window.addEventListener('resize', () => {
+    const stored = Number(loadPrefs().railW);
+    if (stored > 0) setRailWidth(stored, false);
   });
 
   // The agent is Octavja in a female voice, Octavius in a male one.

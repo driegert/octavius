@@ -5,7 +5,7 @@ body { overflow: hidden; }
 
 .shell {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: var(--rail-w, 300px) minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
 }
@@ -15,6 +15,7 @@ body { overflow: hidden; }
 /* ---------------- Rail ---------------- */
 
 .rail {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -37,17 +38,42 @@ body { overflow: hidden; }
   gap: 0.6rem;
   margin: 1.5rem 1rem 0.75rem;
   padding: 0.65rem 0.85rem;
-  border: 1px solid var(--line);
+  border: 0;
   border-radius: var(--r-md);
-  background: transparent;
+  background: rgba(185, 166, 255, 0.16);
   color: var(--ink);
   font-weight: 500;
   font-size: 0.9rem;
   text-align: left;
-  transition: border-color 0.15s, background 0.15s;
+  transition: background 0.15s;
 }
 .new-conv svg { width: 16px; height: 16px; color: var(--violet); }
-.new-conv:hover { border-color: var(--ink-3); background: var(--surface); }
+.new-conv:hover { background: rgba(185, 166, 255, 0.26); }
+
+/* Drag the rail's edge (wide screens) */
+.resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -4px;
+  z-index: 5;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.resizer:hover::after, .resizer:focus-visible::after, body.resizing .resizer::after { background: rgba(185, 166, 255, 0.45); }
+.resizer:focus-visible { outline: none; }
+body.resizing { cursor: col-resize; user-select: none; }
 
 .rail-pane {
   flex: 1;
@@ -543,11 +569,14 @@ body { overflow: hidden; }
 .toggle .slash { opacity: 0; transition: opacity 0.15s; }
 .toggle[aria-pressed="false"] { color: var(--ink-3); }
 .toggle[aria-pressed="false"] .slash { opacity: 1; }
+.toggle:disabled { color: var(--ink-3); opacity: 0.6; background: transparent; }
+.toggle.live { color: var(--tide); }
 
 /* ---------------- Narrow screens ---------------- */
 
 @media (max-width: 860px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
+  .resizer { display: none; }
   .only-narrow { display: inline-flex; }
 
   .rail {

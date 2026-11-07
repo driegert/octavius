@@ -702,6 +702,12 @@ Three talk modes, selectable in the settings panel:
   Octavius responds via TTS, then the mic automatically reopens for the next
   turn. Press "End Conversation" to exit the loop.
 
+**One turn** (`T`, or the dock's "One turn" button; web `/` only, whatever the talk
+mode): a pause ends the capture, the reply plays, and the mic stays closed. Pressing
+it again, or Space or the orb, sends early; `Esc` cancels. During hands-free it makes
+the current turn the last. Pure silence never auto-stops (see "Native Android client"),
+so the mic stays open until one of those keys if nothing is said.
+
 Streaming STT: the browser captures PCM at 16kHz via Web Audio API
 ScriptProcessor and sends binary chunks every 250ms over the WebSocket. The
 server accumulates a buffer, runs background faster-whisper transcription, and
@@ -793,7 +799,7 @@ Still live:
   `POST /api/reader/documents/{id}/finished {"finished": true|false}` (`reader_store.set_finished`, ready documents
   only, strict bool) marks a document finished or unread without playing it; both rewind the place to the start.
   `/reader` has a header button and a row action for it; the open document's playback is stopped first.
-- **Original view** (since 2026-11-04): `GET /api/reader/documents/{id}` includes each chunk's `source_text` where stored, and `/reader` shows it rendered (tables, KaTeX math) by default, with a header Original/Reading switch (`V`, remembered) and a per-chunk pill to flip one chunk to the other view. There is no sentence map from the original to the spoken text, so in Original view the place and playback are highlighted per chunk, a click moves the place to the sentence it most likely means (`OctaviusReaderOriginal.sentenceAt`: the words around the click matched against the spoken sentences, else the click's relative position in the chunk, which is what happens inside math), and a selection there names whole chunks for the reader chat. Documents converted before 2026-10-31 have no `source_text` and show only the reading text; the switch is hidden for them. The rail and the chat panel are resizable on wide screens (drag the edge, arrow keys on the focused handle, double-click to reset; `railW`/`chatW` in `octavius-reader-prefs`).
+- **Original view** (since 2026-11-04): `GET /api/reader/documents/{id}` includes each chunk's `source_text` where stored, and `/reader` shows it rendered (tables, KaTeX math) by default, with a header Original/Reading switch (`V`, remembered) and a per-chunk pill to flip one chunk to the other view. There is no sentence map from the original to the spoken text, so in Original view the place and playback are highlighted per chunk, a click moves the place to the sentence it most likely means (`OctaviusReaderOriginal.sentenceAt`: the words around the click matched against the spoken sentences, else the click's relative position in the chunk, which is what happens inside math), and a selection there names whole chunks for the reader chat. Documents converted before 2026-10-31 have no `source_text` and show only the reading text; the switch is hidden for them. The rail and the chat panel are resizable on wide screens (drag the edge, arrow keys on the focused handle, double-click to reset; `railW`/`chatW` in `octavius-reader-prefs`). `/`'s rail resizes the same way (`railW` in `octavius-prefs`).
 - Sections carry `level` (1-3 from `#`/`##`/`###`) for the page's table of contents. Documents converted earlier
   have none (clients treat that as 1); `scripts/reader-backfill-heading-levels [--apply]` restores it where the
   source markdown still exists.

@@ -76,6 +76,7 @@
         <span class="field-label">Keyboard</span>
         <dl>
           <dt><kbd>Space</kbd></dt><dd>Talk (outside the text box)</dd>
+          <dt><kbd>T</kbd></dt><dd>One voice turn: a pause sends it and the mic stays closed</dd>
           <dt><kbd>/</kbd></dt><dd>Jump to the text box</dd>
           <dt><kbd>Esc</kbd></dt><dd>Stop speaking</dd>
         </dl>
@@ -86,6 +87,8 @@
       <a class="rail-link" id="inbox-link" href="/inbox">Inbox<span id="inbox-badge" class="dot" hidden></span></a>
       <a class="rail-link" href="/reader">Reader</a>
     </footer>
+
+    <div class="resizer" id="rail-resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel" title="Drag to resize; double-click to reset" tabindex="0"></div>
   </aside>
 
   <div class="scrim" id="scrim" hidden></div>
@@ -143,6 +146,12 @@
         </div>
 
         <div class="dock-toggles">
+          <button class="toggle" id="one-turn-btn" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="8.5"/><path d="M10 9.5l2.5-1.5v8"/>
+            </svg>
+            <span class="toggle-label">One turn</span>
+          </button>
           <button class="toggle" id="stt-toggle" aria-pressed="true" title="Microphone">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
               <rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/><path class="slash" d="M4 4l16 16"/>
