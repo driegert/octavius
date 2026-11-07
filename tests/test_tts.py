@@ -1,7 +1,11 @@
 import asyncio
+import io
 import re
 import unittest
+import wave
 from unittest.mock import AsyncMock, patch
+
+import numpy as np
 
 import tts
 from tts import speechify
@@ -180,6 +184,56 @@ class PiRespellingTests(unittest.TestCase):
         self.assertEqual(speechify("Pi is about 3, and so is π."), "pie is about 3, and so is pie.")
         for text in ("The PI signed it.", "a pig and a pin", "pi_harness runs"):
             self.assertEqual(speechify(text), text)
+
+
+class SpeechClipTests(unittest.IsolatedAsyncioTestCase):
+    async def clips(self, sentence):
+        async def spoken(text):
+            return f"<{text}>" if "$" in text else text
+
+        with patch("tts.speakable", spoken):
+            return [(c.text, c.math) for c in await tts.speech_clips(sentence)]
+
+    async def test_a_large_formula_is_its_own_clip_with_its_punctuation(self):
+        self.assertEqual(
+            await self.clips(r"It says: $X = \int_0^1 f(x) dx$, where $f$ is smooth."),
+            [("It says", False), (r"<$X = \int_0^1 f(x) dx$,>", True), ("<where $f$ is smooth.>".replace("<", "").replace(">", ""), False)]
+            if False else
+            [("It says", False), (r"<$X = \int_0^1 f(x) dx$,>", True), ("<where $f$ is smooth.>", False)],
+        )
+
+    async def test_a_small_formula_stays_in_its_sentence(self):
+        self.assertEqual(await self.clips("Here $n$ and $x_i$ are small."), [("<Here $n$ and $x_i$ are small.>", False)])
+        self.assertEqual(await self.clips("No math at all."), [("No math at all.", False)])
+
+    async def test_nothing_is_spoken_for_a_tail_of_punctuation_or_a_citation(self):
+        self.assertEqual(await self.clips(r"$$a + b$$ [§4]."), [("<$$a + b$$>", True)])
+        self.assertEqual(await self.clips(r"So $\frac{a}{b}$."), [("So", False), (r"<$\frac{a}{b}$.>", True)])
+
+    async def test_two_formulas_keep_the_words_between_them(self):
+        self.assertEqual(
+            await self.clips(r"$\sum_i a_i$ and then $\sum_j b_j$"),
+            [(r"<$\sum_i a_i$>", True), ("and then", False), (r"<$\sum_j b_j$>", True)],
+        )
+
+    async def test_seams_are_trimmed_only_at_joined_ends(self):
+        def make(lead, voiced, tail, rate=24000):
+            samples = np.concatenate([np.zeros(int(lead * rate)), 0.3 * np.ones(int(voiced * rate)), np.zeros(int(tail * rate))])
+            out = io.BytesIO()
+            with wave.open(out, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                w.writeframes((samples * 32767).astype(np.int16).tobytes())
+            return out.getvalue()
+
+        def seconds(data):
+            with wave.open(io.BytesIO(data)) as r:
+                return r.getnframes() / r.getframerate()
+
+        clip = make(0.5, 1.0, 0.6)
+        self.assertAlmostEqual(seconds(tts.trim_seam(clip, lead=True, tail=True)), 1.25, delta=0.05)
+        self.assertAlmostEqual(seconds(tts.trim_seam(clip, lead=True, tail=False)), 1.75, delta=0.05)
+        self.assertAlmostEqual(seconds(tts.trim_seam(clip, lead=False, tail=True)), 1.6, delta=0.05)
+        self.assertEqual(tts.trim_seam(b"not a wav", lead=True, tail=True), b"not a wav")
 
 
 class SpeakableTests(unittest.IsolatedAsyncioTestCase):

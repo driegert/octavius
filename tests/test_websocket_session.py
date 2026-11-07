@@ -356,6 +356,47 @@ class RunTurnAudioDoneTests(unittest.TestCase):
         replies = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "response"]
         self.assertEqual(replies, ["So $x^2$ works."])
 
+    def test_a_large_formula_is_announced_before_its_clip(self):
+        import json
+
+        async def run():
+            handler, ws = self._make_handler()
+            handler.state.tts_enabled = True
+            events = []
+
+            async def record_bytes(data):
+                events.append(data)
+
+            real_payload = handler.send_payload
+
+            async def record_payload(payload):
+                if payload.get("type") == "speech_clip":
+                    events.append(payload)
+                await real_payload(payload)
+
+            handler.send_bytes = record_bytes
+            handler.send_payload = record_payload
+
+            async def fake_stream(*args, **kwargs):
+                yield r"Then $\sum_i x_i$ works."
+
+            async def fake_synthesize(text, voice=None):
+                return text.encode()
+
+            async def fake_speakable(text):
+                return text
+
+            with patch("agent.stream_agent_turn", fake_stream), \
+                    patch("tts.synthesize", fake_synthesize), patch("tts.speakable", fake_speakable):
+                await handler.run_turn("hi", "voice")
+            return events
+
+        events = asyncio.run(run())
+        self.assertEqual(events[0], b"Then")
+        self.assertEqual(events[1], {"type": "speech_clip", "math": True})
+        self.assertIn(b"sum", events[2])
+        self.assertEqual(events[3], b"works.")
+
     def test_audio_done_sent_on_normal_reply(self):
         async def run():
             handler, ws = self._make_handler()

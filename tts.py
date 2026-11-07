@@ -1,7 +1,13 @@
 import asyncio
+import io
 import logging
 import re
 import time
+import wave
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+
+import numpy as np
 
 from service_clients import tts_client
 
@@ -195,6 +201,104 @@ async def speakable(text: str) -> str:
         log.warning("Math-to-speech took over %.0f s; using the local rewrite for %.0f s",
                     SPEECH_MATH_TIMEOUT_S, SPEECH_MATH_COOLDOWN_S)
         return _LETTER_Z.sub('zed', strip_latex(cleaned))
+
+
+# --- A sentence with a large formula -> clips --------------------------------
+# A large formula is its own clip, so the listener's player can slow it down (the
+# speech_clip frame, "Math speed" on /). Dave chose this over slowing the whole sentence
+# by ear (2026-11-07). A passing $n$ stays in its sentence, at the normal speed.
+_LARGE_MATH_COMMAND = re.compile(r'\\(?:int|sum|prod|frac|sqrt|begin)(?![a-zA-Z])')
+LARGE_MATH_MIN_CHARS = 15
+_LEADING_PUNCTUATION = re.compile(r'\s*[.,;:!?]*')
+
+# Each clip comes with about 0.5 s of silence before it and 0.6 s after: fine between
+# sentences, too long inside one. Keep what the sample Dave picked had, about 0.25 s.
+SEAM_LEAD_S = 0.15
+SEAM_TAIL_S = 0.10
+_SEAM_WINDOW_S = 0.02
+_SEAM_SILENCE_RMS = 0.01
+
+
+@dataclass
+class SpeechClip:
+    text: str
+    math: bool = False
+
+
+def _is_large_math(span: str) -> bool:
+    return span.startswith(('$$', '\\[')) or bool(_LARGE_MATH_COMMAND.search(span)) or len(span) >= LARGE_MATH_MIN_CHARS
+
+
+async def speech_clips(sentence: str) -> list[SpeechClip]:
+    """A sentence as clips to speak in order: large formulas apart from the words around them."""
+    clips: list[SpeechClip] = []
+    pos = 0
+    for match in _MATH_SPAN.finditer(sentence):
+        if not _is_large_math(match.group()):
+            continue
+        prose = sentence[pos:match.start()]
+        if clips and clips[-1].math:  # punctuation after a formula is read with it
+            punctuation = _LEADING_PUNCTUATION.match(prose).group()
+            clips[-1].text += punctuation.strip()
+            prose = prose[len(punctuation):]
+        if re.search(r'\w', _CITE.sub('', prose)):
+            clips.append(SpeechClip(prose.strip().rstrip(':').rstrip()))
+        clips.append(SpeechClip(match.group(), math=True))
+        pos = match.end()
+    if not clips:
+        return [SpeechClip(await speakable(sentence))]
+    prose = sentence[pos:]
+    if clips[-1].math:
+        punctuation = _LEADING_PUNCTUATION.match(prose).group()
+        clips[-1].text += punctuation.strip()
+        prose = prose[len(punctuation):]
+    if re.search(r'\w', _CITE.sub('', prose)):
+        clips.append(SpeechClip(prose.strip()))
+    spoken = await asyncio.gather(*(speakable(clip.text) for clip in clips))
+    for clip, text in zip(clips, spoken):
+        clip.text = text
+    return clips
+
+
+def trim_seam(wav_bytes: bytes, *, lead: bool, tail: bool) -> bytes:
+    """Shorten the silence at a clip's joined ends. Anything but 16-bit WAV passes through."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes)) as reader:
+            params = reader.getparams()
+            frames = reader.readframes(reader.getnframes())
+        if params.sampwidth != 2:
+            return wav_bytes
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768
+        window = max(1, int(params.framerate * params.nchannels * _SEAM_WINDOW_S))
+        count = len(samples) // window
+        if not count:
+            return wav_bytes
+        rms = np.sqrt((samples[:count * window].reshape(count, window) ** 2).mean(axis=1))
+        voiced = np.flatnonzero(rms >= _SEAM_SILENCE_RMS)
+        if not len(voiced):
+            return wav_bytes
+        unit = params.framerate * params.nchannels
+        start = max(0, int(voiced[0]) * window - int(SEAM_LEAD_S * unit)) if lead else 0
+        end = min(len(samples), (int(voiced[-1]) + 1) * window + int(SEAM_TAIL_S * unit)) if tail else len(samples)
+        start -= start % params.nchannels
+        end -= end % params.nchannels
+        out = io.BytesIO()
+        with wave.open(out, 'wb') as writer:
+            writer.setparams(params)
+            writer.writeframes(frames[start * 2:end * 2])
+        return out.getvalue()
+    except (wave.Error, EOFError, ValueError):
+        return wav_bytes
+
+
+async def speech_audio(sentence: str, voice: str | None = None) -> AsyncIterator[tuple[bytes, bool]]:
+    """A sentence of a reply as (wav, is_math) clips, in order."""
+    clips = await speech_clips(sentence)
+    for i, clip in enumerate(clips):
+        wav_bytes = await synthesize(clip.text, voice=voice)
+        if len(clips) > 1:
+            wav_bytes = trim_seam(wav_bytes, lead=i > 0, tail=i < len(clips) - 1)
+        yield wav_bytes, clip.math
 
 
 async def synthesize(text: str, voice: str | None = None) -> bytes:

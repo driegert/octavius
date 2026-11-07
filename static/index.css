@@ -167,7 +167,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 .field-row { display: flex; justify-content: space-between; align-items: baseline; }
 .field-help { margin: 0.55rem 0 0; font-size: 0.8rem; color: var(--ink-3); line-height: 1.45; }
 
-#speed-value { font-size: 0.85rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+#speed-value, #math-speed-value { font-size: 0.85rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
 
 
 

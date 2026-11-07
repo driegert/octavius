@@ -19,6 +19,8 @@
   const modelPicker = $('model-picker');
   const speedSlider = $('speed-slider');
   const speedValue = $('speed-value');
+  const mathSpeedSlider = $('math-speed-slider');
+  const mathSpeedValue = $('math-speed-value');
   const trimCb = $('trim-cb');
   const normalizeCb = $('normalize-cb');
   const proactiveSpeakCb = $('proactive-speak-cb');
@@ -61,6 +63,7 @@
   let phase = 'idle'; // idle | transcribing | thinking | speaking
   let acceptPartials = false; // true from stt_start until that capture's transcript
   let dropAudio = false; // after barge-in, ignore stale audio until the next transcript
+  let nextClipIsMath = false; // speech_clip: the next audio frame is a formula
 
   let currentVoice = null; // from prefs at boot, else the server's agent default
   let chatModel = null; // agent model menu id Dave picked; null: never picked (server default)
@@ -135,6 +138,9 @@
   const audioPlayer = OctaviusVoiceAudio.createStreamingAudioPlayer({
     getPlaybackRate() {
       return parseFloat(speedSlider.value);
+    },
+    getMathPlaybackRate() {
+      return parseFloat(mathSpeedSlider.value);
     },
     shouldTrimSilence() {
       return trimCb.checked;
@@ -625,8 +631,10 @@
       onMessage(evt) {
         ws = socketController.getSocket();
         if (evt.data instanceof ArrayBuffer) {
+          const isMath = nextClipIsMath;
+          nextClipIsMath = false;
           if (dropAudio) return;
-          audioPlayer.enqueueAudio(evt.data);
+          audioPlayer.enqueueAudio(evt.data, isMath);
           return;
         }
         if (typeof evt.data !== 'string') return;
@@ -649,6 +657,9 @@
               localStorage.setItem('octavius-conv-id', msg.conversation_id);
             } catch (_err) {
             }
+            break;
+          case 'speech_clip':
+            nextClipIsMath = msg.math === true;
             break;
           case 'stt_auto_stop':
             // Server detected end of speech: clean up recording on our side.
@@ -1341,6 +1352,17 @@
   speedSlider.addEventListener('input', () => {
     speedValue.textContent = parseFloat(speedSlider.value).toFixed(1) + 'x';
     persistCurrent();
+    audioPlayer.updatePlaybackRate();
+  });
+
+  const storedMathSpeed = Number(loadPrefs().mathSpeed);
+  if (storedMathSpeed > 0) mathSpeedSlider.value = storedMathSpeed;
+  mathSpeedValue.textContent = parseFloat(mathSpeedSlider.value).toFixed(1) + 'x';
+  mathSpeedSlider.addEventListener('input', () => {
+    mathSpeedValue.textContent = parseFloat(mathSpeedSlider.value).toFixed(1) + 'x';
+    const prefs = loadPrefs();
+    prefs.mathSpeed = parseFloat(mathSpeedSlider.value);
+    savePrefs(prefs);
     audioPlayer.updatePlaybackRate();
   });
 

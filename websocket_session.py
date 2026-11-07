@@ -1317,7 +1317,7 @@ class WebSocketSessionHandler:
     ):
         from agent import stream_agent_turn
         from pi_brain import stream_pi_turn, wants_pi
-        from tts import speakable, synthesize
+        from tts import speech_audio
         async with self.state.turn_lock:
             turn_start = time.monotonic()
             await self.send_json("status", "Thinking...")
@@ -1394,8 +1394,10 @@ class WebSocketSessionHandler:
                                     time.monotonic() - turn_start, source, turn_model,
                                 )
                             try:
-                                wav_bytes = await synthesize(await speakable(sentence), voice=self.state.voice)
-                                await self.send_bytes(wav_bytes)
+                                async for wav_bytes, is_math in speech_audio(sentence, voice=self.state.voice):
+                                    if is_math:
+                                        await self.send_payload({"type": "speech_clip", "math": True})
+                                    await self.send_bytes(wav_bytes)
                             except Exception:
                                 log.exception("TTS failed for chunk")
             except Exception as exc:

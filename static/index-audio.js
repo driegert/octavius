@@ -2,6 +2,7 @@
   function createStreamingAudioPlayer(options) {
     const {
       getPlaybackRate,
+      getMathPlaybackRate, // a formula's speed; never faster than getPlaybackRate
       shouldTrimSilence,
       shouldNormalizeVolume,
       onPlaybackStart,
@@ -13,8 +14,14 @@
     let audioDone = false;
     let isPlaying = false;
     let currentAudio = null;
+    let currentIsMath = false;
     let analyser = null;
     let levelBuf = null;
+
+    function currentRate() {
+      const rate = getPlaybackRate ? getPlaybackRate() : 1.0;
+      return currentIsMath && getMathPlaybackRate ? Math.min(rate, getMathPlaybackRate()) : rate;
+    }
 
     function getAudioCtx() {
       if (!audioCtx) audioCtx = new AudioContext();
@@ -223,7 +230,8 @@
       }
 
       isPlaying = true;
-      let arrayBuffer = audioQueue.shift();
+      const clip = audioQueue.shift();
+      let arrayBuffer = clip.data;
 
       const trimEnabled = shouldTrimSilence && shouldTrimSilence();
       const normalizeEnabled = shouldNormalizeVolume && shouldNormalizeVolume();
@@ -249,7 +257,8 @@
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.preservesPitch = true;
-      audio.playbackRate = getPlaybackRate ? getPlaybackRate() : 1.0;
+      currentIsMath = clip.math;
+      audio.playbackRate = currentRate();
       currentAudio = audio;
       attachAnalyser(audio);
 
@@ -269,8 +278,8 @@
     }
 
     return {
-      enqueueAudio(arrayBuffer) {
-        audioQueue.push(arrayBuffer);
+      enqueueAudio(arrayBuffer, math = false) {
+        audioQueue.push({ data: arrayBuffer, math });
         if (onPlaybackStart) onPlaybackStart();
         if (!isPlaying) playNext();
       },
@@ -302,7 +311,7 @@
       },
       updatePlaybackRate() {
         if (currentAudio) {
-          currentAudio.playbackRate = getPlaybackRate ? getPlaybackRate() : 1.0;
+          currentAudio.playbackRate = currentRate();
         }
       },
     };

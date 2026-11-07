@@ -123,6 +123,7 @@
 
   const audioPlayer = OctaviusVoiceAudio.createStreamingAudioPlayer({
     getPlaybackRate() { return voicePrefs().speed || 1.4; },
+    getMathPlaybackRate() { return Number(mainPrefs().mathSpeed) || 1.2; },
     shouldTrimSilence() { return voicePrefs().trim !== false; },
     shouldNormalizeVolume() { return voicePrefs().normalize !== false; },
     onPlaybackStart() { refreshUi(); },
@@ -362,8 +363,10 @@
       onMessage(evt) {
         ws = controller.getSocket();
         if (evt.data instanceof ArrayBuffer) {
+          const isMath = nextClipIsMath;
+          nextClipIsMath = false;
           if (dropAudio) return;
-          audioPlayer.enqueueAudio(evt.data);
+          audioPlayer.enqueueAudio(evt.data, isMath);
           return;
         }
         if (typeof evt.data !== 'string') return;
@@ -402,6 +405,8 @@
     refreshUi();
   }
 
+  let nextClipIsMath = false; // speech_clip: the next audio frame is a formula
+
   function handleMessage(msg) {
     switch (msg.type) {
       case 'doc_chat_opened':
@@ -428,6 +433,9 @@
         break;
       case 'status':
         handleStatus(String(msg.text || ''));
+        break;
+      case 'speech_clip':
+        nextClipIsMath = msg.math === true;
         break;
       case 'stt_auto_stop':
         // Server heard the end of speech: finish our side of the capture.
