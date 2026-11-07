@@ -28,29 +28,6 @@
     });
   }
 
-  // Math is pulled out before markdown runs, or `_` and `\\` inside it get eaten as
-  // emphasis and escapes. Pandoc's rule for inline $: no space just inside either
-  // dollar, and no digit right after the closing one (so "$5 and $10" stays text).
-  const MATH = [
-    { re: /\$\$([\s\S]+?)\$\$/g, display: true },
-    { re: /\\\[([\s\S]+?)\\\]/g, display: true },
-    { re: /\\\(([\s\S]+?)\\\)/g, display: false },
-    { re: /(?<![\\$])\$(?![\s$])((?:[^$\n]|\n(?!\n))*?[^\s\\$])\$(?!\d)/g, display: false },
-    { re: /(?<![\\$])\$([^\s$\\])\$(?!\d)/g, display: false },
-  ];
-
-  // katex.render, not renderToString: the string form carries style="..." attributes,
-  // which the page's CSP blocks; render() sets the same styles through the CSSOM.
-  function renderTex(el, tex, display) {
-    try {
-      if (typeof katex === 'undefined') throw new Error('KaTeX not loaded');
-      katex.render(tex, el, { displayMode: display, throwOnError: false, strict: 'ignore', output: 'html' });
-    } catch (_err) {
-      el.textContent = tex;
-      el.classList.add('orig-math-raw');
-    }
-  }
-
   // Quarto cross-reference attributes ({#eq-x}, {#tbl-y .class}) and ::: div fences
   // are markup, not text.
   function stripQuarto(text) {
@@ -61,28 +38,18 @@
 
   // Returns a DocumentFragment, built in an inert <template> (nothing loads or runs).
   function render(source) {
-    const maths = [];
-    let text = String(source || '');
-    for (const { re, display } of MATH) {
-      text = text.replace(re, (_m, tex) => {
-        maths.push({ tex: tex.trim(), display });
-        return `OCTMATH${maths.length - 1}X`;
-      });
-    }
-    text = stripQuarto(text);
+    const extracted = OctaviusMath.extract(source);
+    const maths = extracted.maths;
+    const text = stripQuarto(extracted.text);
     let html;
     try {
       html = md ? md.parse(text) : `<p>${esc(text)}</p>`;
     } catch (_err) {
       html = `<p>${esc(text)}</p>`;
     }
-    html = html.replace(/OCTMATH(\d+)X/g, (_m, i) => `<span class="orig-math" data-m="${Number(i)}"></span>`);
     const tpl = document.createElement('template');
-    tpl.innerHTML = html;
-    tpl.content.querySelectorAll('span.orig-math').forEach((el) => {
-      const m = maths[Number(el.dataset.m)];
-      if (m) renderTex(el, m.tex, m.display);
-    });
+    tpl.innerHTML = OctaviusMath.insertSlots(html, maths);
+    OctaviusMath.fill(tpl.content, maths);
     tpl.content.querySelectorAll('a').forEach((a) => {
       const href = a.getAttribute('href') || '';
       if (/^(https?:|mailto:)/i.test(href)) {

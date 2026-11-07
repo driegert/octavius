@@ -328,6 +328,34 @@ class RunTurnAudioDoneTests(unittest.TestCase):
             if json.loads(text).get("type") == "status"
         ]
 
+    def test_reply_keeps_latex_while_tts_gets_the_spoken_math(self):
+        import json
+
+        async def run():
+            handler, ws = self._make_handler()
+            handler.state.tts_enabled = True
+            spoken = []
+
+            async def fake_stream(*args, **kwargs):
+                yield "So $x^2$ works."
+
+            async def fake_synthesize(text, voice=None):
+                spoken.append(text)
+                return b"wav"
+
+            async def fake_speakable(text):
+                return "So x squared works."
+
+            with patch("agent.stream_agent_turn", fake_stream), \
+                    patch("tts.synthesize", fake_synthesize), patch("tts.speakable", fake_speakable):
+                await handler.run_turn("hi", "voice")
+            return spoken, ws
+
+        spoken, ws = asyncio.run(run())
+        self.assertEqual(spoken, ["So x squared works."])
+        replies = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "response"]
+        self.assertEqual(replies, ["So $x^2$ works."])
+
     def test_audio_done_sent_on_normal_reply(self):
         async def run():
             handler, ws = self._make_handler()

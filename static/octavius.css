@@ -253,3 +253,7 @@ kbd {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Typeset math (math-render.js) */
+.math-raw { font-family: ui-monospace, monospace; font-size: 0.85em; color: var(--ink-3); }
+.katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }

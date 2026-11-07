@@ -165,7 +165,7 @@
     clearLog();
     for (const m of messages || []) {
       if (m.role === 'user') addTurn('user').textContent = m.content;
-      else if (m.role === 'assistant') addTurn('assistant').innerHTML = renderReply(m.content);
+      else if (m.role === 'assistant') OctaviusMath.setMarkdown(addTurn('assistant'), m.content, renderReply);
     }
     if (!logEl.children.length) {
       showNote('Ask about this document. Type, or tap the mic and speak.');
@@ -209,7 +209,7 @@
     streamingEl.classList.remove('pending');
     streamingEl.classList.add('streaming');
     streamingText += text;
-    streamingEl.innerHTML = renderReply(streamingText);
+    OctaviusMath.setMarkdown(streamingEl, streamingText, renderReply);
     scrollToEnd();
   }
 
@@ -217,7 +217,7 @@
     dropEmptyNote();
     const el = streamingEl || addTurn('assistant');
     el.classList.remove('pending', 'streaming');
-    el.innerHTML = renderReply(text);
+    OctaviusMath.setMarkdown(el, text, renderReply);
     if (answeredBy) {
       const by = document.createElement('p');
       by.className = 'chat-by';

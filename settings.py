@@ -279,8 +279,9 @@ class Settings:
 # default. The female ones make the agent Octavja (TTSSettings.agent_name).
 DEFAULT_TTS_VOICES = [
     "Imogen", "Delia", "Hugh", "Edwin", "Spencer", "Teddy", "Sir Bramwell",
+    "Easton", "Everly", "Freya", "Juniper", "Maeve", "Pippa", "Russell", "Trevor", "Zoey",
 ]
-DEFAULT_TTS_FEMALE_VOICES = ["Imogen", "Delia"]
+DEFAULT_TTS_FEMALE_VOICES = ["Imogen", "Delia", "Everly", "Freya", "Juniper", "Maeve", "Pippa", "Zoey"]
 
 
 DEFAULT_TOOL_LABELS = {

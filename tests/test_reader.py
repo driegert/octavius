@@ -174,6 +174,13 @@ class ReaderTests(unittest.TestCase):
         self.assertNotIn("frac", stripped)
         self.assertNotIn("tag", stripped)
 
+    def test_strip_latex_leaves_no_commands_behind(self):
+        out = strip_latex(r"$P(A \mid B)$ and $\sum_k \alpha$")
+        self.assertNotIn("\\", out)
+        self.assertIn("given", out)
+        self.assertIn("the sum", out)
+        self.assertIn("alpha", out)
+
     def test_strip_latex_handles_powers_and_subscripts(self):
         self.assertIn("squared", strip_latex("$x^2$"))
         self.assertIn("sub i", strip_latex("$x_{i}$"))

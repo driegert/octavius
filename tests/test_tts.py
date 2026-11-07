@@ -1,5 +1,9 @@
+import asyncio
+import re
 import unittest
+from unittest.mock import AsyncMock, patch
 
+import tts
 from tts import speechify
 
 
@@ -168,3 +172,51 @@ class SpeechifyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PiRespellingTests(unittest.TestCase):
+    def test_pi_is_respelled_where_it_is_the_word(self):
+        self.assertEqual(speechify("from negative pi to pi of e"), "from negative pie to pie of e")
+        self.assertEqual(speechify("Pi is about 3, and so is π."), "pie is about 3, and so is pie.")
+        for text in ("The PI signed it.", "a pig and a pin", "pi_harness runs"):
+            self.assertEqual(speechify(text), text)
+
+
+class SpeakableTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        tts._speech_math_down_until = 0.0
+        self.addCleanup(setattr, tts, "_speech_math_down_until", 0.0)
+
+    async def test_text_without_math_never_reaches_the_llm(self):
+        convert = AsyncMock()
+        with patch("reader_text._llm_convert_math", convert):
+            for text in ("Plain words.", "It costs $5 and then $10.", "Use `$HOME` here."):
+                self.assertEqual(await tts.speakable(text), text)
+        convert.assert_not_called()
+
+    async def test_math_is_rewritten_without_its_citation(self):
+        convert = AsyncMock(return_value="x squared is fine.")
+        with patch("reader_text._llm_convert_math", convert):
+            self.assertEqual(await tts.speakable("$x^2$ is fine [§4]."), "x squared is fine.")
+        self.assertNotIn("§", convert.call_args.args[1])
+
+    async def test_the_letter_z_is_zed_only_in_a_math_sentence(self):
+        convert = AsyncMock(return_value="where Z has mean z, for Gen Zs.")
+        with patch("reader_text._llm_convert_math", convert):
+            self.assertEqual(await tts.speakable("where $Z$ has mean $z$, for Gen Zs."), "where zed has mean zed, for Gen Zs.")
+            self.assertEqual(await tts.speakable("Gen Z likes it."), "Gen Z likes it.")
+
+    async def test_slow_rewrite_falls_back_and_later_sentences_skip_the_wait(self):
+        async def hang(_client, _text):
+            await asyncio.sleep(30)
+
+        convert = AsyncMock(side_effect=hang)
+        with patch("reader_text._llm_convert_math", convert), patch.object(tts, "SPEECH_MATH_TIMEOUT_S", 0.01):
+            self.assertEqual(await tts.speakable(r"So $\mu$ here."), "So mu here.")
+            self.assertEqual(await tts.speakable(r"And $\sigma$ there."), "And sigma there.")
+        self.assertEqual(convert.call_count, 1)
+
+    def test_breaks_skip_equations(self):
+        pattern = re.compile(r"(?<=[.!?])\s+")
+        text = "See $a. b$ and $$c. d$$ here. Next."
+        self.assertEqual([text[m.end():] for m in tts.breaks_outside_math(pattern, text)], ["Next."])

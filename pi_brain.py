@@ -38,6 +38,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
 from settings import settings
+from tts import breaks_outside_math
 
 log = logging.getLogger(__name__)
 
@@ -220,18 +221,27 @@ def tool_label(pi_tool_name: str) -> str:
     return settings.tool_labels.get(f"{server}_{tool}") or settings.tool_labels.get(tool, tool)
 
 
+_SENTENCE_GAP = re.compile(r"(?<=[.!?])\s+")
+
+
 def split_sentences(text: str) -> list[str]:
     """Sentences for the voice, each carrying the break that followed it.
 
     The reply is these joined back together, so a line break after a full stop
     (between list items or paragraphs) must survive; anything else is one space.
+    An equation is never split, whatever punctuation it holds.
     """
-    pieces = re.split(r"(?<=[.!?])(\s+)", text.strip())
+    text = text.strip()
     out = []
-    for sentence, gap in zip(pieces[::2], pieces[1::2] + [""]):
-        sentence = sentence.strip()
+    start = 0
+    for match in breaks_outside_math(_SENTENCE_GAP, text):
+        sentence = text[start:match.start()].strip()
+        gap = match.group()
+        start = match.end()
         if sentence:
-            out.append(sentence + (("\n" * min(gap.count("\n"), 2)) if "\n" in gap else " " if gap else ""))
+            out.append(sentence + ("\n" * min(gap.count("\n"), 2) if "\n" in gap else " "))
+    if text[start:].strip():
+        out.append(text[start:].strip())
     return out
 
 
@@ -1070,7 +1080,8 @@ async def stream_pi_turn(
             state.doc_chat_position = None  # sent per turn by the panel; without one, the saved place
         except Exception:
             log.warning("Reader chat context failed; the turn proceeds without it", exc_info=True)
-    message = build_prompt(user_text, _style_directive(source), memory, seed, context)
+    style = _style_directive(source, math=getattr(state, "renders_math", False) is True)
+    message = build_prompt(user_text, style, memory, seed, context)
 
     async with proc.lock:
         proc.last_used = time.monotonic()

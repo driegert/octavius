@@ -320,7 +320,7 @@
     streamingEl.classList.remove('pending');
     streamingEl.classList.add('streaming');
     streamingText += text;
-    streamingEl.innerHTML = renderMarkdown(streamingText);
+    OctaviusMath.setMarkdown(streamingEl, streamingText, renderMarkdown);
     scrollToEnd();
   }
 
@@ -344,7 +344,7 @@
   function commitAssistant(text) {
     const el = streamingEl || addTurn('assistant', true);
     el.classList.remove('pending', 'streaming');
-    el.innerHTML = renderMarkdown(text);
+    OctaviusMath.setMarkdown(el, text, renderMarkdown);
     if (answeredBy) {
       addAnsweredBy(el, answeredBy);
       const picked = pickedModelLabel();
@@ -387,7 +387,7 @@
         addTurn('user', false).textContent = message.content;
       } else if (message.role === 'assistant') {
         const el = addTurn('assistant', false);
-        el.innerHTML = renderMarkdown(message.content);
+        OctaviusMath.setMarkdown(el, message.content, renderMarkdown);
         addAnsweredBy(el, message.answered_by);
       }
     }
@@ -1017,7 +1017,7 @@
       const summary = conversation.summary || '';
       const count = conversation.message_count || 0;
       item.innerHTML = `
-        <div class="hi-summary${summary ? '' : ' untitled'}">${OctaviusApp.escapeHtml(summary || 'Not summarised yet')}</div>
+        <div class="hi-summary${summary ? '' : ' untitled'}">${OctaviusApp.escapeHtml(summary || 'Not summarized yet')}</div>
         <div class="hi-meta"><span>${OctaviusApp.escapeHtml(formatWhen(conversation.started_at))}</span><span>${count} ${count === 1 ? 'message' : 'messages'}</span></div>
       `;
       if (conversation.tags && conversation.tags.length) item.title = conversation.tags.join(', ');

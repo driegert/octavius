@@ -422,8 +422,8 @@ file: `~/.config/octavius/models.json.bak-2026-10-31-pre-workhorse`.
   TTS endpoint since 2026-10-31 (Voxtral, disabled since August, was retired from the
   code then, with its voices and circuit breaker). Env: `OCTAVIUS_TTS_URL`, `_MODEL`,
   `_VOICE` (the server and reader default, `Imogen`), `_AGENT_VOICE` (the agent's
-  default on `/` until Dave picks one, `Delia`), `_VOICES` (Phonon's seven) and
-  `_FEMALE_VOICES` (`Imogen`, `Delia`); code defaults match `~/.config/octavius/env`.
+  default on `/` until Dave picks one, `Delia`), `_VOICES` (16 of Phonon's voices) and
+  `_FEMALE_VOICES` (8 of those); code defaults match `~/.config/octavius/env`.
   A voice not in `_VOICES` is sent as `_VOICE`: Phonon **400s on unknown voices** and
   the sentence would play silent (`TTS failed for chunk`), so list only names
   `GET /v1/audio/voices` returns. **The agent's name follows its voice:** Octavja in a
@@ -535,6 +535,7 @@ so it never depends on display names. Upstream renames: mcp-tools `RENAMES-2026-
   and give a complete answer. The base `settings.system_prompt` is
   channel-neutral; the directive (`VOICE_STYLE`/`TEXT_STYLE` in `agent.py`) is
   the tuning knob. Defaults to `"voice"` if a caller omits it.
+- **A reply has two forms: LaTeX on screen, words in the voice** (since 2026-11-07). `VOICE_MATH_STYLE`/`TEXT_MATH_STYLE` in `agent.py` ask for LaTeX unless the client cannot show it (a Matrix thread, `state.renders_math` False, set when it attaches; the Inbox). The text sent to clients and history keeps it; `run_turn` hands TTS `tts.speakable(sentence)`, which rewrites only sentences holding math, through the reader's `_llm_convert_math` (0.1-0.4 s on workhorse's 12B, measured 2026-11-07). Past `SPEECH_MATH_TIMEOUT_S` (4) it uses the local `strip_latex` and skips the LLM for 60 s. `breaks_outside_math` keeps both sentence splitters out of equations. Phrasing lives in `MATH_TO_SPEECH_PROMPT` (commas after "the integral"/"the sum", after the limits and before the differential are the pauses Dave asked for; Phonon gives a comma ~0.3 s and has no pause control or SSML); `speakable` forces "zed" in code and `speechify` respells pi as "pie". `/` and `/reader`'s chat typeset replies with `static/math-render.js` (KaTeX, shared with the Original view); Android already did.
 - Spoken text is markdown-normalized before TTS. `tts.synthesize` runs every
   string through `speechify` (the single choke point all TTS callers share),
   stripping `**bold**`/`*italic*`/`` `code` ``/links/headings and line-leading
@@ -640,7 +641,8 @@ Frontend:
 - `static/index.css` / `static/reader.css` / `static/inbox.css` - page layouts (desktop-first; the side panel becomes a drawer on phones). `main.py` sends `Cache-Control: no-cache` on the UI pages and `/static`, so browsers revalidate (ETag/304) and no `?v=` cache-busting is needed
 - `static/inbox-app.js` - inbox page: item list with search/filters, item view, item chat panel, keyboard shortcuts; renders untrusted item markdown with raw HTML escaped, non-http(s)/mailto links neutralised and images never loaded
 - `static/reader-app.js` - reader page behavior: document library, reading column with sentence highlight and follow, Original/Reading view, resizable side panels, edit panel, retry flow, keyboard shortcuts, and playback client logic
-- `static/reader-original.js` - `OctaviusReaderOriginal.render`: a chunk's `source_text` to a DocumentFragment (a private `marked` instance plus KaTeX; math pulled out before markdown, raw HTML escaped except bare `sub`/`sup`/`br`/emphasis tags, Quarto `{#...}` attributes and `:::` fences dropped, images named rather than loaded)
+- `static/math-render.js` - `OctaviusMath`: pulls LaTeX out before markdown runs (not from code) and typesets it with KaTeX; used by `/`, `/reader`'s chat and the Original view
+- `static/reader-original.js` - `OctaviusReaderOriginal.render`: a chunk's `source_text` to a DocumentFragment (a private `marked` instance plus `OctaviusMath`; raw HTML escaped except bare `sub`/`sup`/`br`/emphasis tags, Quarto `{#...}` attributes and `:::` fences dropped, images named rather than loaded)
 - `static/reader-chat.js` - the reader's "Chat" pull tab and side panel: its own `/ws`, opened lazily; `doc_chat_open` on each document change; typed turns silent (`tts:false`), spoken ones voiced in the main page's voice (`octavius-prefs`); pauses reading before a turn; `c` opens it (or focuses its box), as in the Inbox. Talks to `reader-app.js` only through `window.OctaviusReader` (`currentDoc`, `heardPlace`, `pause`, `onDocChange`)
 - `static/voice-capture.js` - `OctaviusVoiceCapture.createCapture`: mic → 16 kHz Float32 PCM frames between `stt_start`/`stt_stop`. Used by the reader chat; `index-app.js` still has its own copy
 - `static/index.html` - main voice UI shell

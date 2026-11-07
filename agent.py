@@ -12,6 +12,7 @@ from service_clients import llm_client, vision_llm_client
 from settings import settings
 from subagent import _unwrap_double_encoded_args, parse_xml_tool_calls
 import tools as local_tools
+from tts import breaks_outside_math
 
 log = logging.getLogger(__name__)
 
@@ -38,13 +39,27 @@ TEXT_STYLE = (
 )
 
 
-def _style_directive(source: str) -> str:
+# Added when the client typesets math (`/`, /reader's chat, Android): not Matrix or the
+# Inbox. The written reply keeps the LaTeX; tts.speakable rewrites the spoken copy.
+VOICE_MATH_STYLE = (
+    "Math is the one exception: write it in LaTeX, $...$ inline, and it is read aloud "
+    "correctly and shown typeset. Keep it to short expressions; give a long result in words."
+)
+TEXT_MATH_STYLE = (
+    "Write math in LaTeX, $...$ inline and $$...$$ for a displayed equation; it is shown "
+    "typeset, so never spell it out in plain text or unicode."
+)
+
+
+def _style_directive(source: str, math: bool = False) -> str:
     """Return the per-turn style directive for a turn's originating channel.
 
     Only ``source == "voice"`` is spoken; every other channel (text, matrix,
     image, file, inbox_chat) is read as text.
     """
-    return VOICE_STYLE if source == "voice" else TEXT_STYLE
+    if source == "voice":
+        return f"{VOICE_STYLE} {VOICE_MATH_STYLE}" if math else VOICE_STYLE
+    return f"{TEXT_STYLE} {TEXT_MATH_STYLE}" if math and source != "inbox_chat" else TEXT_STYLE
 
 # Thread-start episodic recall (Q1): non-authoritative "related past discussions".
 RECALL_DISTANCE_CUTOFF = 0.6
@@ -198,7 +213,7 @@ async def stream_agent_turn(
         # Fold the per-turn style directive (channel-dependent) and any memory
         # into the system message (index 0). Qwen requires system only at the
         # start, so we rebuild messages[0] rather than insert mid-list.
-        suffix = _style_directive(source)
+        suffix = _style_directive(source, math=getattr(getattr(session, "state", None), "renders_math", False) is True)
         if memory_block:
             suffix += "\n\n" + memory_block
         if messages and messages[0].get("role") == "system":
@@ -247,7 +262,6 @@ async def stream_agent_turn(
                 tool_calls_acc: dict[int, dict] = {}
                 in_think = False
                 sentence_buffer = ""
-                buffered_sentences: list[str] = []
 
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
@@ -301,14 +315,6 @@ async def stream_agent_turn(
 
                     sentence_buffer += token
 
-                    parts = SENTENCE_END.split(sentence_buffer)
-                    if len(parts) > 1:
-                        for sentence in parts[:-1]:
-                            sentence = sentence.strip()
-                            if sentence:
-                                buffered_sentences.append(sentence + " ")
-                        sentence_buffer = parts[-1]
-
         except Exception as e:
             log.exception("LLM request failed")
             yield f"I'm having trouble reaching my brain right now. Error: {e}"
@@ -334,7 +340,6 @@ async def stream_agent_turn(
         if tool_calls_acc:
             # Discard any text generated alongside tool calls — the LLM will
             # produce a proper response after seeing tool results.
-            buffered_sentences.clear()
             sentence_buffer = ""
 
             for idx in sorted(tool_calls_acc.keys()):
@@ -396,11 +401,14 @@ async def stream_agent_turn(
             continue  # Loop back for LLM to process tool results
 
         # --- Final text response (no tool calls) ---
-        # Yield all buffered sentences
-        for sent in buffered_sentences:
-            yield sent
-        # Flush remaining sentence buffer
-        remaining = sentence_buffer.strip()
+        # Yield the sentences, then whatever follows the last break
+        start = 0
+        for gap in breaks_outside_math(SENTENCE_END, sentence_buffer):
+            sentence = sentence_buffer[start:gap.start()].strip()
+            start = gap.end()
+            if sentence:
+                yield sentence + " "
+        remaining = sentence_buffer[start:].strip()
         if remaining:
             yield remaining
 

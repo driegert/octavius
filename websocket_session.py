@@ -187,6 +187,7 @@ class WebSocketSessionState:
     # record and the UI shows a non-intrusive badge instead of speaking
     # results aloud. Flip to True to restore the old interrupt-and-speak path.
     proactive_speak_enabled: bool = False
+    renders_math: bool = True  # False on a Matrix thread, which shows a reply's LaTeX raw
     # Set while a pi turn waits on Dave to answer a confirmation (pi_brain); his
     # next transcript or text input resolves it instead of starting a turn.
     pending_confirm: asyncio.Future | None = None
@@ -359,6 +360,7 @@ class WebSocketSessionHandler:
         if not key:
             return
         await self.state.history_session.end_async()  # retire the empty connect-time record
+        self.state.renders_math = False
         self.state.history_session = self.state.history.resume_or_start_conversation(
             key,
             source="matrix",
@@ -1315,7 +1317,7 @@ class WebSocketSessionHandler:
     ):
         from agent import stream_agent_turn
         from pi_brain import stream_pi_turn, wants_pi
-        from tts import synthesize
+        from tts import speakable, synthesize
         async with self.state.turn_lock:
             turn_start = time.monotonic()
             await self.send_json("status", "Thinking...")
@@ -1392,7 +1394,7 @@ class WebSocketSessionHandler:
                                     time.monotonic() - turn_start, source, turn_model,
                                 )
                             try:
-                                wav_bytes = await synthesize(sentence, voice=self.state.voice)
+                                wav_bytes = await synthesize(await speakable(sentence), voice=self.state.voice)
                                 await self.send_bytes(wav_bytes)
                             except Exception:
                                 log.exception("TTS failed for chunk")
@@ -1482,7 +1484,7 @@ class WebSocketSessionHandler:
 
     async def _proactive_speak(self, msg: ProactiveMessage) -> None:
         from agent import SENTENCE_END
-        from tts import synthesize
+        from tts import speakable, synthesize
 
         spoken = msg.text.split("\n\n===TOOL DATA", 1)[0].strip()
         if not spoken:
@@ -1516,7 +1518,7 @@ class WebSocketSessionHandler:
             if not sentence:
                 continue
             try:
-                wav_bytes = await synthesize(sentence, voice=self.state.voice)
+                wav_bytes = await synthesize(await speakable(sentence), voice=self.state.voice)
                 await self.send_bytes(wav_bytes)
             except Exception:
                 log.exception("TTS failed for proactive chunk")

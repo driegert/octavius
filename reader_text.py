@@ -61,15 +61,29 @@ Examples:
 - $\\hat{\\beta}$ becomes "beta hat"
 - $\\bar{x}$ becomes "x bar"
 - $\\frac{a}{b}$ becomes "a over b"
-- $\\sum_{i=1}^{n}$ becomes "the sum from i equals 1 to n"
-- $\\int_0^1 f(x) dx$ becomes "the integral from 0 to 1 of f of x dx"
+- $\\sum_{i=1}^{n} x_i$ becomes "the sum, from i equals 1 to n, of x sub i"
+- $\\int_0^1 f(x) dx$ becomes "the integral, from 0 to 1, of f of x, dee x"
+- $X_t = \\int_{-\\pi}^{\\pi} e^{it\\lambda} dZ(\\lambda)$ becomes "X sub t equals the integral, from negative pi to pi, of e to the i t lambda, dee zed of lambda" (the commas are the pauses a person makes: after "the integral" or "the sum", after the limits, and before the differential)
 - $\\alpha$ becomes "alpha"
 - $p < 0.05$ becomes "p less than 0.05"
 - $x_i$ becomes "x sub i"
 - $\\frac{n(n+1)}{2}$ becomes "n times the quantity n plus 1, all over 2"
-- $|x|^2$ and $\\left| \\sum_t a_t \\right|^2$ become "the absolute value of x, squared" and "the squared magnitude of the sum over t of a sub t"
-- $v_t^{(k)}$ becomes "v sub t, superscript k" (a superscript in parentheses is a label, not a power)
+- $\\frac{a - b}{c / d}$ becomes "the quantity a minus b, all over c over d" (a numerator or denominator with more than one term must be grouped out loud, or the formula changes meaning)
+- $|x|^2$ and $\\left| \\sum_t a_t \\right|^2$ become "the absolute value of x, squared" and "the squared magnitude of the sum over t of a sub t"; "magnitude" only ever means absolute value bars, so $(\\sum_i x_i)^2$ becomes "the square of the sum over i of x sub i"
+- $(X^T X)^{-1} X^T y$ becomes "the inverse of the quantity X transpose X, times X transpose y", and $x^{-1}$ becomes "x inverse" (a power of negative 1 is an inverse, never "over 1")
+- $e^{it\\lambda}$ becomes "e to the i t lambda", and $2\\pi f t$ becomes "2 pi f t" (symbols multiplied together are read side by side: no "times", no "to the power of")
+- $3 \\cdot 4$ and $a \\cdot b$ become "3 times 4" and "a times b" (never "dot")
+- $dZ(\\lambda)$ becomes "dee zed of lambda", and $dx$ becomes "dee x" (the d of a differential is its own word)
+- $v_t^{(k)}$ becomes "v sub t superscript k" (a superscript in parentheses is a label, not a power)
 - A multi-line equation (aligned, & and \\\\) is read as one continuous statement: "... equals ..., which equals ..."
+
+Spoken math has no brackets, so a listener must be able to write the formula back down from your words. A comma is a pause that closes a group; "the quantity" opens one. Say every sign and every factor.
+- Never pause inside a symbol ("x sub t", "mu hat") or between plain multiplied symbols.
+- Close a fraction, root, exponent, sum or integral with a comma whenever anything follows it:
+  $\\frac{a}{b} + c$ becomes "a over b, plus c"; $\\sqrt{a} + b$ becomes "the square root of a, plus b"; $\\sqrt{a + b} + c$ becomes "the square root of the quantity a plus b, plus c"; $e^{-x^2/2} + 1$ becomes "e to the negative x squared over 2, plus 1"; $e^{-x^2}/2$ becomes "e to the negative x squared, all over 2"
+- A denominator with several factors is grouped: $\\frac{a}{b c}$ becomes "a over the quantity b c", and $\\frac{a}{b} c$ becomes "a over b, times c"; $\\frac{a + b}{c} d$ becomes "the quantity a plus b, all over c, times d"
+- A long formula: $\\frac{1}{\\sqrt{2\\pi\\sigma^2}} \\exp\\left(-\\frac{(x-\\mu)^2}{2\\sigma^2}\\right)$ becomes "1 over the square root of 2 pi sigma squared, times e to the negative, the quantity x minus mu, squared, all over 2 sigma squared" ($\\exp$ is always said as "e to the")
+- Nested sums: $\\frac{1}{K} \\sum_{k=0}^{K-1} \\left| \\sum_{t=0}^{N-1} v_t x_t \\right|^2$ becomes "1 over K, times the sum, from k equals 0 to K minus 1, of the squared magnitude, of the sum, from t equals 0 to N minus 1, of v sub t, x sub t"
 
 Output ONLY the rewritten text, once. Do not repeat the original, do not label your answer, no preamble, no explanation."""
 
@@ -205,6 +219,16 @@ def has_math(text: str) -> bool:
     return bool(MATH_RE.search(text))
 
 
+_LATEX_WORDS = {
+    'sum': 'the sum', 'prod': 'the product', 'int': 'the integral', 'mid': 'given', 'cap': 'intersect',
+    'cup': 'union', 'cdot': 'times', 'times': 'times', 'leq': 'less than or equal to',
+    'le': 'less than or equal to', 'geq': 'greater than or equal to', 'ge': 'greater than or equal to',
+    'neq': 'not equal to', 'ne': 'not equal to', 'approx': 'approximately', 'sim': 'distributed as',
+    'in': 'in', 'infty': 'infinity', 'to': 'to', 'rightarrow': 'to', 'pm': 'plus or minus',
+    'ldots': '', 'cdots': '', 'dots': '',
+}
+
+
 def strip_latex(text: str) -> str:
     """Last-resort de-LaTeX for when the LLM pass fails: not real spoken math, but far
     better than the command soup ("frac{1}{N} sum_{n=0}...") the TTS reads otherwise.
@@ -224,6 +248,8 @@ def strip_latex(text: str) -> str:
     text = re.sub(r'[${}]', '', text)
     text = re.sub(r'\\\(|\\\)|\\\[|\\\]', ' ', text)
     text = re.sub(r'\\(?:begin|end)\{[a-z]+\*?\}', ' ', text)
+    # What is left is words (\\mid) and bare names (\\alpha, \\mu).
+    text = re.sub(r'\\([a-zA-Z]+)', lambda m: f' {_LATEX_WORDS.get(m.group(1), m.group(1))} ', text)
     return re.sub(r'  +', ' ', text).strip()
 
 

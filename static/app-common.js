@@ -140,7 +140,20 @@
     }
 
     selectEl.innerHTML = '';
-    for (const voice of data.voices || []) selectEl.appendChild(makeOption(voice));
+    // Grouped under the name the agent goes by in each voice (TTSSettings.agent_name).
+    const names = data.agent_names || {};
+    for (const name of ['Octavius', 'Octavja']) {
+      const voices = (data.voices || []).filter((voice) => names[voice] === name).sort();
+      if (!voices.length) continue;
+      const group = document.createElement('optgroup');
+      group.label = name;
+      for (const voice of voices) group.appendChild(makeOption(voice));
+      selectEl.appendChild(group);
+    }
+    // A voice with no known name still has to be offered.
+    for (const voice of data.voices || []) {
+      if (names[voice] !== 'Octavius' && names[voice] !== 'Octavja') selectEl.appendChild(makeOption(voice));
+    }
 
     let resolvedVoice = (agent && data.agent_default) || data.default || fallbackVoice;
     if (currentVoice && (data.voices || []).includes(currentVoice)) {

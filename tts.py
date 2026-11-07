@@ -1,6 +1,11 @@
+import asyncio
+import logging
 import re
+import time
 
 from service_clients import tts_client
+
+log = logging.getLogger(__name__)
 
 # --- Markdown -> speech normalization --------------------------------------
 # The LLM frequently emits light markdown (**bold**, `code`, "1)" lists,
@@ -11,7 +16,8 @@ from service_clients import tts_client
 #
 # This is deliberately LIGHTER than reader_text.clean_for_speech, which also
 # strips academic citations and LaTeX math for converted journal PDFs. Here we
-# only touch conversational markdown and never delete characters that carry
+# only touch conversational markdown (a reply's LaTeX is rewritten first, by
+# `speakable`) and never delete characters that carry
 # meaning in speech (e.g. a lone "*" in "3 * 4" is left alone).
 
 _MD_IMAGE = re.compile(r'!\[([^\]]*)\]\([^)]*\)')          # ![alt](url) -> alt
@@ -81,6 +87,12 @@ _QUARTER_YEAR = re.compile(r'\b(Q[1-4]),?[ \t]+((?:19|20)\d\d)\b(?!\.\d)')
 _OUSING = re.compile(r'\b(h|r|ar)(ousing)(s?)\b', re.IGNORECASE)
 
 
+# "pi": Phonon clips it to "p" at the end of a phrase ("from negative pi to p of e", heard
+# through Whisper with Delia, 2026-11-07, and by Dave). Respelled "pie", it is heard as "pi"
+# in Delia and Imogen at 1x, and in Delia at 1.4x. All-caps "PI" (a principal investigator) is left alone.
+_PI = re.compile(r'\b[Pp]i\b|π')
+
+
 def _respell_ousing(m: re.Match) -> str:
     # Keep only the first letter's case: all-caps "HOWZING" is heard as "pausing".
     return m.group(1)[0] + m.group(1)[1:].lower() + 'owzing' + m.group(3).lower()
@@ -121,9 +133,68 @@ def speechify(text: str) -> str:
     cleaned = _DECIMAL.sub(_say_decimal, cleaned)
     cleaned = _QUARTER_YEAR.sub(r'\1 of \2', cleaned)
     cleaned = _OUSING.sub(_respell_ousing, cleaned)
+    cleaned = _PI.sub('pie', cleaned)
     cleaned = _INITIALISM.sub(_undot, cleaned.rstrip())
     cleaned = _WS.sub(' ', cleaned).strip()
     return cleaned or text.strip()
+
+
+# --- A reply's math -> speech ------------------------------------------------
+# A reply keeps its LaTeX for the screen and history; only the copy handed to TTS is
+# rewritten, one sentence at a time, by the reader's math conversion.
+
+# The rules every renderer of a reply uses (static/math-render.js, Android's
+# MathDelimiters): an inline $ has no space just inside it and no digit right after
+# its closing one, so "$5 and $10" is not math.
+_MATH_SPAN = re.compile(
+    r'\$\$.+?\$\$'
+    r'|\\\[.+?\\\]'
+    r'|\\\(.+?\\\)'
+    r'|\\begin\{([a-zA-Z]+\*?)\}.*?\\end\{\1\}'
+    r'|(?<![\\$])\$(?![\s$])(?:[^$\n]|\n(?!\n))*?[^\s\\$]\$(?!\d)',
+    re.DOTALL,
+)
+_LATEX_COMMAND = re.compile(r'\\[a-zA-Z]{2,}')
+
+# The rewrite normally takes 0.2-0.4 s, and a reply waits on it, so a stuck endpoint
+# must cost one sentence a short wait and the rest of the reply nothing.
+# Canadian "zed". Only in a sentence that held math, so "Gen Z" elsewhere keeps its "zee";
+# the rewrite prompt alone did not hold (the 12B wrote "where Z has", 2026-11-07).
+_LETTER_Z = re.compile(r'\b[Zz]\b')
+
+SPEECH_MATH_TIMEOUT_S = 4.0
+SPEECH_MATH_COOLDOWN_S = 60.0
+_speech_math_down_until = 0.0
+
+
+def breaks_outside_math(pattern: re.Pattern, text: str) -> list[re.Match]:
+    """Matches of a sentence-break pattern, leaving out any inside an equation."""
+    spans = [m.span() for m in _MATH_SPAN.finditer(text)]
+    return [m for m in pattern.finditer(text) if not any(a <= m.start() < b for a, b in spans)]
+
+
+async def speakable(text: str) -> str:
+    """A sentence of a reply as it should be read aloud: its math in spoken English.
+
+    Text without math comes back untouched and at no cost. A failed or slow rewrite
+    falls back to the local strip_latex; speech must never hold up on it for long.
+    """
+    global _speech_math_down_until
+    if not (_MATH_SPAN.search(text) or _LATEX_COMMAND.search(text)):
+        return text
+    from reader_text import _llm_convert_math, strip_latex
+
+    cleaned = _CITE.sub('', text)  # a tag means nothing to the rewriter, and is not spoken
+    if time.monotonic() < _speech_math_down_until:
+        return _LETTER_Z.sub('zed', strip_latex(cleaned))
+    try:
+        spoken = await asyncio.wait_for(_llm_convert_math(None, cleaned), SPEECH_MATH_TIMEOUT_S)
+        return _LETTER_Z.sub('zed', spoken)
+    except asyncio.TimeoutError:
+        _speech_math_down_until = time.monotonic() + SPEECH_MATH_COOLDOWN_S
+        log.warning("Math-to-speech took over %.0f s; using the local rewrite for %.0f s",
+                    SPEECH_MATH_TIMEOUT_S, SPEECH_MATH_COOLDOWN_S)
+        return _LETTER_Z.sub('zed', strip_latex(cleaned))
 
 
 async def synthesize(text: str, voice: str | None = None) -> bytes:

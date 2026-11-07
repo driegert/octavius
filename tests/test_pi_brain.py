@@ -112,6 +112,10 @@ class PiBrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(parts), text)
         self.assertEqual(parts[1], "More.\n")
 
+    def test_split_sentences_keeps_an_equation_whole(self):
+        text = "It is $a. b$ here. Then $$c. d$$ too."
+        self.assertEqual(pi_brain.split_sentences(text), ["It is $a. b$ here. ", "Then $$c. d$$ too."])
+
     async def test_plain_turn_yields_sentences_and_records_conversation(self):
         session = _Session(self.manager)
         out, _ = await self.turn(session, "hi")
