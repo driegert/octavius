@@ -553,19 +553,16 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
         self.assertEqual(stripped, "just some text")
 
-    async def test_vikunja_project_list_is_shared(self):
-        from settings import (
-            DEFAULT_SYSTEM_PROMPT,
-            format_vikunja_default,
-            format_vikunja_projects,
-        )
+    async def test_vikunja_default_is_shared_and_no_project_list(self):
+        from settings import DEFAULT_SYSTEM_PROMPT, format_vikunja_default
 
-        projects_snippet = format_vikunja_projects()
         default_snippet = format_vikunja_default()
         tasks_prompt = subagent.SUBAGENT_DOMAINS["tasks"]["system_prompt"]
 
-        self.assertIn(projects_snippet, DEFAULT_SYSTEM_PROMPT)
-        self.assertIn(projects_snippet, tasks_prompt)
+        self.assertEqual(default_snippet, "Inbox (id=1)")
+        # No hardcoded name -> id table: the server resolves names live.
+        self.assertNotIn("Key projects", DEFAULT_SYSTEM_PROMPT)
+        self.assertNotIn("Key projects", tasks_prompt)
         self.assertIn(default_snippet, DEFAULT_SYSTEM_PROMPT)
         self.assertIn(default_snippet, tasks_prompt)
 

@@ -494,30 +494,16 @@ DEFAULT_MCP_SERVERS = {
 }
 
 
-VIKUNJA_PROJECTS: dict[str, int] = {
-    "Inbox": 1,
-    "Teaching and Trent": 9,
-    "math1052": 10,
-    "amod5240": 2,
-    "math3560": 3,
-    "Email Tasks": 14,
-    "Personal and Professional": 13,
-    "PhD": 4,
-    "Projects": 5,
-    "AI Projects": 6,
-    "SSC 2026 Workshop": 11,
-    "Exploration": 8,
-}
+# Only the default is pinned. Project names are passed through as Dave says
+# them: the vikunja-tasks server resolves a name against Vikunja's live list on
+# every call, so a hardcoded name -> id table here only goes stale (it had, by
+# 2026-11-08: five of twelve entries renamed or gone, eight projects missing).
 VIKUNJA_DEFAULT_PROJECT = "Inbox"
-
-
-def format_vikunja_projects() -> str:
-    return ", ".join(f"{name} (id={pid})" for name, pid in VIKUNJA_PROJECTS.items())
+VIKUNJA_DEFAULT_PROJECT_ID = 1
 
 
 def format_vikunja_default() -> str:
-    pid = VIKUNJA_PROJECTS[VIKUNJA_DEFAULT_PROJECT]
-    return f"{VIKUNJA_DEFAULT_PROJECT} (id={pid})"
+    return f"{VIKUNJA_DEFAULT_PROJECT} (id={VIKUNJA_DEFAULT_PROJECT_ID})"
 
 
 _RAW_SYSTEM_PROMPT = """You are Octavius, Dave's personal voice assistant. You run
@@ -549,9 +535,8 @@ You have access to tools:
     tool for academic/scholarly queries — do not fall back to web search.
     Include topic details.
   * Tasks: "add a task", "what's on my list", "mark X as done" →
-    consult_specialist(domain="tasks", task="..."). Include project names if
-    Dave specified one. Key projects: {vikunja_projects}.
-    Default to {vikunja_default} if Dave doesn't specify a project.
+    consult_specialist(domain="tasks", task="..."). Include the project name
+    if Dave said one, in his words; otherwise the task goes to {vikunja_default}.
   consult_specialist is SYNCHRONOUS. It returns the specialist's findings as
   the tool result; wait for them and then weave them into a natural, spoken
   reply to Dave. Do NOT just acknowledge and stop — the answer comes back to
@@ -606,7 +591,6 @@ Important guidelines for your responses:
 
 
 DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
-    vikunja_projects=format_vikunja_projects(),
     vikunja_default=format_vikunja_default(),
 )
 

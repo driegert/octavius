@@ -15,7 +15,7 @@ import re
 from typing import TYPE_CHECKING, Callable
 
 from service_clients import subagent_llm_client
-from settings import format_vikunja_default, format_vikunja_projects, settings
+from settings import format_vikunja_default, settings
 
 if TYPE_CHECKING:
     from mcp_manager import MCPManager
@@ -202,13 +202,14 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "search_tasks and list-style task calls. Only pass done=true (or omit the filter) "
             "when Dave explicitly asks about completed/done/finished tasks.\n"
             "- Sort by due_date or created when listing tasks so the most relevant appear first.\n"
-            "- When creating tasks, ask which project if not obvious from context.\n"
+            "- When creating tasks, pass the project Dave named as project_id, in "
+            "his words (the server matches names). If he named none, use "
+            f"{format_vikunja_default()}: do not guess a project from the task's "
+            "content and do not ask him which one.\n"
             "- Avoid calling search_tasks more than twice for the same intent. "
             "If two searches haven't surfaced the specific task, stop searching — "
             "summarize what you did find and ask Dave to narrow it down (e.g. by "
-            "project, keyword, or due date) instead of retrying the same query.\n"
-            f"- Key projects: {format_vikunja_projects()}.\n"
-            f"- Default to {format_vikunja_default()} if Dave doesn't specify a project."
+            "project, keyword, or due date) instead of retrying the same query."
         ),
         "max_rounds": 6,
     },
