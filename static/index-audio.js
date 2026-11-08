@@ -37,7 +37,15 @@
       const silenceThreshold = 0.008;
       const windowSize = Math.floor(sampleRate * 0.025);
       const minSilenceDuration = Math.floor(sampleRate * 0.4);
-      const keepSilence = Math.floor(sampleRate * 0.25);
+      // A shortened pause keeps some of its silence on BOTH sides. Phonon's
+      // words start soft: 125-210 ms of onset sit under silenceThreshold
+      // (measured 2026-11-08, every voice), so keeping only the start of a
+      // pause and jumping to the first loud window cut the start of every
+      // sentence. keepBefore covers that onset; keepAfter/keepTail cover the
+      // fade after a word, and keepTail is the clip's own ending.
+      const keepBefore = Math.floor(sampleRate * 0.3);
+      const keepAfter = Math.floor(sampleRate * 0.12);
+      const keepTail = Math.floor(sampleRate * 0.35);
 
       function rms(start, end) {
         let sum = 0;
@@ -77,9 +85,12 @@
       const segments = [];
       let pos = 0;
       for (const region of silentRegions) {
-        if (region.start > pos) segments.push({ start: pos, end: region.start });
-        segments.push({ start: region.start, end: Math.min(region.start + keepSilence, region.end) });
-        pos = region.end;
+        const atEnd = region.end >= len;
+        const head = region.start === 0 ? 0 : (atEnd ? keepTail : keepAfter);
+        const lead = atEnd ? 0 : keepBefore;
+        if (head + lead >= region.end - region.start) continue; // nothing worth cutting
+        segments.push({ start: pos, end: region.start + head });
+        pos = region.end - lead;
       }
       if (pos < len) segments.push({ start: pos, end: len });
 
