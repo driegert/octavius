@@ -87,10 +87,6 @@ def _init_inbox_delete_db(db_path: Path):
         CREATE TABLE saved_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT
         );
-        CREATE TABLE saved_item_embeddings (
-            saved_item_id INTEGER PRIMARY KEY,
-            embedding BLOB
-        );
         CREATE TABLE reader_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
@@ -104,6 +100,8 @@ def _init_inbox_delete_db(db_path: Path):
             error TEXT,
             last_chunk INTEGER NOT NULL DEFAULT 0,
             last_sentence INTEGER NOT NULL DEFAULT 0,
+            total_sentences INTEGER,
+            progress_sentences INTEGER,
             created_at TEXT NOT NULL DEFAULT 'now',
             updated_at TEXT
         );
@@ -117,20 +115,28 @@ def _init_inbox_delete_db(db_path: Path):
 def _isolated_app(factory):
     """Point the module-global app at a throwaway DB for the duration.
 
-    db_path matters as much as db_init here: the lifespan hands db_path to
-    background work (the embedding sweeper), so leaving it at DEFAULT_DB_PATH
-    would run sweeps against the real octavius_history.db during unit tests.
+    db_path matters as much as db_init here: the lifespan hands db_path on to
+    other startup work, so leaving it at DEFAULT_DB_PATH would let a unit test
+    touch the real octavius_history.db.
+
+    verify_search is stubbed out for the same reason. In production it is
+    history_store.assert_history_serveable, which deliberately refuses to start
+    when the opened database is not the one sites.toml names and keeps indexed —
+    a throwaway temp DB is exactly that case, and that refusal is the point.
     """
     state = main.app.state
-    originals = (state.mcp_manager_factory, state.db_init, state.db_path)
+    originals = (state.mcp_manager_factory, state.db_init, state.db_path,
+                 state.verify_search)
     with tempfile.TemporaryDirectory() as tmpdir:
         state.mcp_manager_factory = factory
         state.db_init = lambda: _FakeConn()
         state.db_path = Path(tmpdir) / "history.db"
+        state.verify_search = lambda conn, db_path: None
         try:
             yield
         finally:
-            (state.mcp_manager_factory, state.db_init, state.db_path) = originals
+            (state.mcp_manager_factory, state.db_init, state.db_path,
+             state.verify_search) = originals
 
 
 @unittest.skipIf(TestClient is None or main is None, "fastapi dependency not installed")
@@ -166,6 +172,84 @@ class MainTests(unittest.TestCase):
         )
         self.assertFalse(embedding["endpoints"][0]["tripped"])
 
+    def test_ui_pages_and_assets_always_revalidate(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                page = client.get("/reader")
+                asset = client.get("/static/reader-app.js")
+                again = client.get("/static/reader-app.js", headers={"If-None-Match": asset.headers["etag"]})
+                health = client.get("/health")
+        self.assertEqual(page.headers["cache-control"], "no-cache")
+        self.assertEqual(asset.headers["cache-control"], "no-cache")
+        self.assertEqual(again.status_code, 304)
+        self.assertNotIn("cache-control", health.headers)
+
+    def test_voices_name_the_agent_by_voice(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                data = client.get("/api/voices").json()
+        self.assertNotIn("voices_by_engine", data)
+        self.assertEqual(data["agent_default"], "Delia")
+        self.assertEqual(data["agent_names"]["Delia"], "Octavja")
+        self.assertEqual(data["agent_names"]["Hugh"], "Octavius")
+        self.assertEqual(set(data["agent_names"]), set(data["voices"]))
+
+    def test_chat_models_menu_starts_with_auto(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                data = client.get("/api/chat-models").json()
+        self.assertEqual(data["default"], "auto")
+        self.assertEqual(data["models"][0], {"id": "auto", "label": "Auto"})
+        self.assertIn("qwen3.8-27b", [m["id"] for m in data["models"]])
+        self.assertIsInstance(data["enabled"], bool)
+
+    def test_ui_pages_carry_content_security_policy(self):
+        with _isolated_app(_FakeMCPManager):
+            with TestClient(main.app) as client:
+                pages = {path: client.get(path) for path in (
+                    "/", "/inbox", "/reader",
+                    # The same files served directly must not escape the policy.
+                    "/static/index.html", "/static/inbox.html", "/static/reader.html")}
+                health = client.get("/health")
+                asset = client.get("/static/app-common.js")
+        for path, page in pages.items():
+            with self.subTest(path=path):
+                self.assertEqual(page.status_code, 200)
+                self.assertEqual(page.headers["content-security-policy"], main.UI_CSP)
+                self.assertEqual(page.headers["x-content-type-options"], "nosniff")
+                self.assertEqual(page.headers["referrer-policy"], "same-origin")
+        # JSON and assets are not documents: no policy needed there.
+        self.assertNotIn("content-security-policy", health.headers)
+        self.assertNotIn("content-security-policy", asset.headers)
+
+        csp = main.UI_CSP
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("unsafe-eval", csp)
+        directives = dict(d.strip().split(" ", 1) for d in csp.split(";"))
+        self.assertEqual(directives["object-src"], "'none'")
+        self.assertEqual(directives["frame-ancestors"], "'none'")
+
+        # Every external script/stylesheet a page loads must be allowed by the
+        # policy (or the page breaks silently), and cross-origin scripts must
+        # be pinned with SRI.
+        import re
+        for name in ("index.html", "inbox.html", "reader.html"):
+            html = (Path(__file__).resolve().parent.parent / "static" / name).read_text()
+            self.assertNotRegex(html, r"<script(?![^>]*\bsrc=)", f"{name}: inline <script>")
+            self.assertNotRegex(html, r"\sstyle=", f"{name}: style attribute")
+            self.assertNotRegex(html, r"\son[a-z]+=", f"{name}: inline event handler")
+            for tag in re.findall(r"<script\b[^>]*\bsrc=\"https://[^\"]+\"[^>]*>", html):
+                origin = re.search(r"src=\"(https://[^/\"]+)", tag).group(1)
+                with self.subTest(page=name, script=origin):
+                    self.assertIn(origin, directives["script-src"])
+                    self.assertRegex(tag, r'integrity="sha(256|384|512)-')
+                    self.assertIn('crossorigin="anonymous"', tag)
+            for tag in re.findall(r"<link\b[^>]*rel=\"stylesheet\"[^>]*>", html):
+                m = re.search(r"href=\"(https://[^/\"]+)", tag)
+                if m:
+                    with self.subTest(page=name, stylesheet=m.group(1)):
+                        self.assertIn(m.group(1), directives["style-src"])
+
     def test_health_reports_degraded_when_only_partial_runtime_is_ready(self):
         with _isolated_app(_DegradedMCPManager):
             with TestClient(main.app) as client:
@@ -199,6 +283,7 @@ class MainTests(unittest.TestCase):
                 mcp_manager_factory=_FakeMCPManager,
                 db_init=lambda: _init_inbox_delete_db(db_path),
                 db_path=db_path,
+                verify_search=lambda conn, path: None,
             )
 
             with TestClient(app) as client:

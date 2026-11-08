@@ -45,6 +45,8 @@ class ReaderIngestServiceTests(unittest.TestCase):
                     error TEXT,
                     last_chunk INTEGER NOT NULL DEFAULT 0,
                     last_sentence INTEGER NOT NULL DEFAULT 0,
+                    total_sentences INTEGER,
+                    progress_sentences INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT
                 )"""
@@ -76,6 +78,8 @@ class ReaderIngestServiceTests(unittest.TestCase):
                     error TEXT,
                     last_chunk INTEGER NOT NULL DEFAULT 0,
                     last_sentence INTEGER NOT NULL DEFAULT 0,
+                    total_sentences INTEGER,
+                    progress_sentences INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT
                 )"""

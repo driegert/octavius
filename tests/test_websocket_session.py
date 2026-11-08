@@ -165,6 +165,31 @@ class WebSocketSessionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_handle_load_conversation_captions_pi_replies_only(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+            handler.state.history_session = _FakeHistorySession(conv_id=1)
+
+            with patch(
+                "history.get_conversation_messages",
+                return_value=[
+                    {"role": "user", "content": "q1", "model": None},
+                    {"role": "assistant", "content": "a1", "model": "pi:lrv-p01/qwen3.8-27b"},
+                    {"role": "assistant", "content": "a2", "model": "gemma4-26b-a4b"},
+                ],
+            ), patch("websocket_session.chat_model_label", side_effect=lambda m: f"L({m})"):
+                await handler.handle_load_conversation({"conversation_id": 42})
+
+            loaded = [json.loads(t) for t in ws.sent if '"conversation_loaded"' in t][-1]
+            self.assertEqual(loaded["messages"], [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1", "answered_by": "L(lrv-p01/qwen3.8-27b)"},
+                {"role": "assistant", "content": "a2"},
+            ])
+
+        asyncio.run(run())
+
     def test_handle_item_chat_load_updates_saved_pointer_for_existing_chat(self):
         async def run():
             handler = WebSocketSessionHandler(_FakeWS())
@@ -303,6 +328,75 @@ class RunTurnAudioDoneTests(unittest.TestCase):
             if json.loads(text).get("type") == "status"
         ]
 
+    def test_reply_keeps_latex_while_tts_gets_the_spoken_math(self):
+        import json
+
+        async def run():
+            handler, ws = self._make_handler()
+            handler.state.tts_enabled = True
+            spoken = []
+
+            async def fake_stream(*args, **kwargs):
+                yield "So $x^2$ works."
+
+            async def fake_synthesize(text, voice=None):
+                spoken.append(text)
+                return b"wav"
+
+            async def fake_speakable(text):
+                return "So x squared works."
+
+            with patch("agent.stream_agent_turn", fake_stream), \
+                    patch("tts.synthesize", fake_synthesize), patch("tts.speakable", fake_speakable):
+                await handler.run_turn("hi", "voice")
+            return spoken, ws
+
+        spoken, ws = asyncio.run(run())
+        self.assertEqual(spoken, ["So x squared works."])
+        replies = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "response"]
+        self.assertEqual(replies, ["So $x^2$ works."])
+
+    def test_a_large_formula_is_announced_before_its_clip(self):
+        import json
+
+        async def run():
+            handler, ws = self._make_handler()
+            handler.state.tts_enabled = True
+            events = []
+
+            async def record_bytes(data):
+                events.append(data)
+
+            real_payload = handler.send_payload
+
+            async def record_payload(payload):
+                if payload.get("type") == "speech_clip":
+                    events.append(payload)
+                await real_payload(payload)
+
+            handler.send_bytes = record_bytes
+            handler.send_payload = record_payload
+
+            async def fake_stream(*args, **kwargs):
+                yield r"Then $\sum_i x_i$ works."
+
+            async def fake_synthesize(text, voice=None):
+                return text.encode()
+
+            async def fake_speakable(text):
+                return text
+
+            with patch("agent.stream_agent_turn", fake_stream), \
+                    patch("tts.synthesize", fake_synthesize), patch("tts.speakable", fake_speakable):
+                await handler.run_turn("hi", "voice")
+            return events
+
+        events = asyncio.run(run())
+        self.assertEqual(events[0], b"Then")
+        self.assertEqual(events[1], {"type": "speech_clip", "math": True})
+        self.assertIn(b"sum", events[2])
+        self.assertEqual(events[3], b"works.")
+
     def test_audio_done_sent_on_normal_reply(self):
         async def run():
             handler, ws = self._make_handler()
@@ -315,6 +409,26 @@ class RunTurnAudioDoneTests(unittest.TestCase):
                 await handler.run_turn("hello", source="text")
 
             self.assertIn("audio_done", self._statuses(ws))
+
+        asyncio.run(run())
+
+    def test_confirm_question_is_its_own_response(self):
+        """pi's confirm question is committed before Dave answers, so the final
+        response holds only what came after it instead of repeating it."""
+        async def run():
+            import json
+            handler, ws = self._make_handler()
+
+            async def fake_stream(*args, **kwargs):
+                yield "Before I go ahead: create task. Shall I? "
+                await handler.commit_reply_so_far()
+                yield "Done."
+
+            with patch("agent.stream_agent_turn", side_effect=fake_stream):
+                await handler.run_turn("make a task", source="voice")
+
+            responses = [json.loads(t)["text"] for t in ws.sent if json.loads(t).get("type") == "response"]
+            self.assertEqual(responses, ["Before I go ahead: create task. Shall I?", "Done."])
 
         asyncio.run(run())
 
@@ -1313,6 +1427,98 @@ class RunTurnMediaTests(unittest.TestCase):
             self.assertEqual(hs.attachments, [])
             assistant_entries = [m for m in hs.messages if m["role"] == "assistant"]
             self.assertEqual(assistant_entries[-1]["model"], settings.llm_chain[0]["model"])
+
+        asyncio.run(run())
+
+
+class _FakePiBrain:
+    def __init__(self):
+        self.discarded = []
+        self.rekeyed = []
+
+    async def discard(self, conv_id):
+        self.discarded.append(conv_id)
+
+    def rekey(self, old, new):
+        self.rekeyed.append((old, new))
+
+
+class ReaderHeardPositionWiringTests(unittest.TestCase):
+    def test_pause_and_stop_save_the_heard_place_after_cancelling(self):
+        async def run():
+            handler = WebSocketSessionHandler(_FakeWS())
+            handler.state.history = SimpleNamespace(db_path="/x.db")
+            order = []
+
+            async def cancel():
+                order.append("cancel")
+            with patch.object(handler, "cancel_reader_task", cancel), \
+                    patch("websocket_session.save_heard_position",
+                          side_effect=lambda *a: order.append(("save",) + a[1:])):
+                await handler.handle_reader_stop({"doc_id": 3, "chunk_index": 4, "sentence_index": 2})
+                await handler.handle_reader_pause({"doc_id": 3, "chunk_index": 5, "sentence_index": 0})
+                await handler.handle_reader_pause({})  # an older client: nothing to save
+            self.assertEqual(order, ["cancel", ("save", 3, 4, 2), "cancel", ("save", 3, 5, 0), "cancel"])
+
+        asyncio.run(run())
+
+
+class PiBrainWiringTests(unittest.TestCase):
+    """websocket_session's side of pi_brain: confirmations, barge-in, process lifecycle."""
+
+    def _handler(self):
+        ws = _FakeWS()
+        ws.app.state.pi_brain = _FakePiBrain()
+        handler = WebSocketSessionHandler(ws)
+        handler.state.history_session = _FakeHistorySession(conv_id=5)
+        return handler, ws.app.state.pi_brain
+
+    def test_pending_confirm_takes_the_next_input_instead_of_a_turn(self):
+        async def run():
+            handler, _ = self._handler()
+            fut = asyncio.get_running_loop().create_future()
+            handler.state.pending_confirm = fut
+            with patch.object(handler, "_run_turn_guarded") as run_turn:
+                handler._spawn_turn("yes, go ahead", source="voice")
+                run_turn.assert_not_called()
+            self.assertIs(fut.result(), True)
+            handler.state.pending_confirm = asyncio.get_running_loop().create_future()
+            handler._spawn_turn("no thanks", source="text")
+            self.assertIs(handler.state.pending_confirm.result(), False)
+
+        asyncio.run(run())
+
+    def test_mic_open_does_not_cancel_a_turn_waiting_on_confirm(self):
+        async def run():
+            handler, _ = self._handler()
+            handler.state.turn_task = asyncio.create_task(asyncio.sleep(10))
+            handler.state.pending_confirm = asyncio.get_running_loop().create_future()
+            with patch("vad.SileroVAD"):
+                await handler.handle_stt_start({})
+            self.assertFalse(handler.state.turn_task.done())
+            # Without a pending confirm, opening the mic is a barge-in.
+            handler.state.pending_confirm = None
+            with patch("vad.SileroVAD"):
+                await handler.handle_stt_start({})
+            self.assertTrue(handler.state.turn_task.cancelled())
+
+        asyncio.run(run())
+
+    def test_reset_discards_the_conversations_pi_process(self):
+        async def run():
+            handler, brain = self._handler()
+            await handler.handle_reset({})
+            self.assertEqual(brain.discarded, [5])
+
+        asyncio.run(run())
+
+    def test_restore_rekeys_the_live_pi_process(self):
+        async def run():
+            handler, brain = self._handler()
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hi"}]):
+                await handler.handle_restore_session({"conversation_id": 3})
+            self.assertEqual(brain.rekeyed, [(3, 5)])
 
         asyncio.run(run())
 

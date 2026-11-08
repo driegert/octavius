@@ -1,45 +1,74 @@
 (function() {
-  const listView = document.getElementById('list-view');
-  const docList = document.getElementById('doc-list');
-  const ingestInput = document.getElementById('ingest-input');
-  const ingestBtn = document.getElementById('ingest-btn');
-  const pasteToggle = document.getElementById('paste-toggle');
-  const pasteBar = document.getElementById('paste-bar');
-  const pasteInput = document.getElementById('paste-input');
-  const pasteTitle = document.getElementById('paste-title');
-  const pasteSubmit = document.getElementById('paste-submit');
-  const pasteCancel = document.getElementById('paste-cancel');
-  const playerDiv = document.getElementById('player');
-  const playerBack = document.getElementById('player-back');
-  const playerTitle = document.getElementById('player-title');
-  const sectionsEl = document.getElementById('sections');
-  const progressBar = document.getElementById('progress-bar');
-  const progressCur = document.getElementById('progress-current');
-  const progressTot = document.getElementById('progress-total');
-  const playPauseBtn = document.getElementById('play-pause-btn');
-  const skipBack = document.getElementById('skip-back');
-  const skipFwd = document.getElementById('skip-fwd');
-  const speedSlider = document.getElementById('reader-speed');
-  const speedVal = document.getElementById('reader-speed-val');
-  const voiceSelect = document.getElementById('reader-voice');
-  const readAlong = document.getElementById('read-along');
-  const playerEdit = document.getElementById('player-edit');
-  const editBar = document.getElementById('edit-bar');
-  const editBarCaption = document.getElementById('edit-bar-caption');
-  const editTitleInput = document.getElementById('edit-title');
-  const editAppendInput = document.getElementById('edit-append');
-  const editReplaceCheckbox = document.getElementById('edit-replace');
-  const editError = document.getElementById('edit-error');
-  const editHint = document.getElementById('edit-hint');
-  const editCancelBtn = document.getElementById('edit-cancel');
-  const editSaveBtn = document.getElementById('edit-save');
-  const editMountList = document.getElementById('edit-bar-mount-list');
-  const editMountPlayer = document.getElementById('edit-bar-mount-player');
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) => OctaviusApp.escapeHtml(v);
+
+  const shell = $('shell');
+  const docList = $('doc-list');
+  const ingestForm = $('ingest-form');
+  const ingestInput = $('ingest-input');
+  const addMsg = $('add-msg');
+  const pasteToggle = $('paste-toggle');
+  const pasteBar = $('paste-bar');
+  const pasteInput = $('paste-input');
+  const pasteTitle = $('paste-title');
+  const pasteSubmit = $('paste-submit');
+  const pasteCancel = $('paste-cancel');
+  const searchInput = $('doc-search');
+  const statusFilter = $('status-filter');
+  const playerTitle = $('player-title');
+  const playerEdit = $('player-edit');
+  const playerFinish = $('player-finish');
+  const connEl = $('conn-state');
+  const pageEl = $('page');
+  const emptyEl = $('empty-state');
+  const docStateEl = $('doc-state');
+  const noticeEl = $('read-along');
+  const sectionsEl = $('sections');
+  const followBtn = $('follow-btn');
+  const progressBar = $('progress-bar');
+  const progressCur = $('progress-current');
+  const progressTot = $('progress-total');
+  const statusEl = $('status');
+  const whereEl = $('where');
+  const playPauseBtn = $('play-pause-btn');
+  const skipBack = $('skip-back');
+  const skipFwd = $('skip-fwd');
+  const stepBack = $('step-back');
+  const stepFwd = $('step-fwd');
+  const speedSlider = $('reader-speed');
+  const speedVal = $('reader-speed-val');
+  const voiceSelect = $('reader-voice');
+  const editBar = $('edit-bar');
+  const editTitleInput = $('edit-title');
+  const editAppendInput = $('edit-append');
+  const editReplaceCheckbox = $('edit-replace');
+  const editError = $('edit-error');
+  const editHint = $('edit-hint');
+  const editCancelBtn = $('edit-cancel');
+  const editSaveBtn = $('edit-save');
+  const railOpen = $('rail-open');
+  const railClose = $('rail-close');
+  const scrim = $('scrim');
+  const railTabs = $('rail-tabs');
+  const tabLibrary = $('tab-library');
+  const tabContents = $('tab-contents');
+  const paneLibrary = $('pane-library');
+  const paneContents = $('pane-contents');
+  const tocDoc = $('toc-doc');
+  const tocTree = $('toc-tree');
+  const viewSeg = $('view-seg');
 
   let ws = null;
+  let connected = false;
+  let docs = [];
+  let filter = 'all';
+  let query = '';
+
   let currentDocId = null;
   let currentDoc = null;
   let isPlaying = false;
+  let finished = false;
+  let stopped = false;
   let currentChunk = 0;
   let currentSentence = 0;
   let totalSentences = 0;
@@ -47,13 +76,305 @@
   const audioQueue = [];
   const positionQueue = [];
   let pollTimer = null;
+  let docPollTimer = null;
   let playSeqId = 0;
   let audioEpochArmed = false;
   let seekDebounce = null;
   let editDocId = null;
   let editOrigTitle = '';
-  let editContext = null; // 'list' | 'player'
   let editPollTimer = null;
+
+  // Rendered sentences of the open document, keyed "chunk:sentence".
+  let sentenceEls = new Map();
+  let markedEl = null;
+  let markedSec = null; // the chunk holding the place, highlighted whole in Original view
+  let follow = true;
+
+  // Original view shows each chunk's markdown (tables, rendered math) where the document
+  // has it; Reading view shows the spoken sentences. `flipped` holds chunks Dave switched
+  // to the other view by hand; changing the document-wide view clears it.
+  let flipped = new Set();
+
+  // Table of contents for the open document.
+  let tocLinks = new Map(); // section index -> link element
+  let tocCurrent = null;
+  let railTab = 'library';
+
+  // ---------- Preferences ----------
+
+  function loadPrefs() {
+    try {
+      return JSON.parse(localStorage.getItem('octavius-reader-prefs')) || {};
+    } catch (_err) {
+      return {};
+    }
+  }
+  function savePrefs(patch) {
+    try {
+      localStorage.setItem('octavius-reader-prefs', JSON.stringify(Object.assign(loadPrefs(), patch)));
+    } catch (_err) {
+    }
+  }
+
+  const prefs = loadPrefs();
+  let viewMode = prefs.view === 'reading' ? 'reading' : 'original';
+  if (prefs.speed) speedSlider.value = prefs.speed;
+  speedVal.textContent = parseFloat(speedSlider.value).toFixed(1) + 'x';
+
+  // ---------- Playback level for the orb ----------
+
+  let audioCtx = null;
+  let analyser = null;
+  let levelBuf = null;
+
+  function wakeAudioContext() {
+    // Called from a user gesture (play) so the context is allowed to run.
+    try {
+      if (!audioCtx) audioCtx = new AudioContext();
+      if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    } catch (_err) {
+    }
+  }
+
+  function attachAnalyser(audio) {
+    // Only route through the context when it is running; otherwise the
+    // element plays directly and the orb simply doesn't follow the level.
+    try {
+      if (!audioCtx || audioCtx.state !== 'running') return;
+      if (!analyser) {
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.connect(audioCtx.destination);
+        levelBuf = new Float32Array(analyser.fftSize);
+      }
+      audioCtx.createMediaElementSource(audio).connect(analyser);
+    } catch (_err) {
+    }
+  }
+
+  function playbackLevel() {
+    if (!analyser || !currentAudio || currentAudio.paused) return 0;
+    analyser.getFloatTimeDomainData(levelBuf);
+    let sum = 0;
+    for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
+    return Math.min(1, Math.sqrt(sum / levelBuf.length) * 5);
+  }
+
+  const orb = OctaviusOrb.create($('orb-canvas'), {
+    core: false,
+    getLevel(state) {
+      return state === 'speaking' ? playbackLevel() : 0;
+    },
+  });
+
+  // ---------- Transport UI ----------
+
+  function playable() {
+    return !!(currentDoc && currentDoc.status === 'ready' && totalSentences > 0);
+  }
+
+  function refreshTransport() {
+    const canPlay = connected && playable();
+    playPauseBtn.disabled = !canPlay;
+    playPauseBtn.dataset.playing = String(isPlaying);
+    playPauseBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+    playPauseBtn.title = isPlaying ? 'Pause (Space)' : 'Play (Space)';
+    [skipBack, skipFwd, stepBack, stepFwd].forEach((b) => { b.disabled = !playable(); });
+    progressBar.disabled = !playable();
+
+    let state = 'disabled';
+    let text = 'No document open';
+    let tone = '';
+    if (!connected) {
+      state = 'offline';
+      text = 'Disconnected. Reconnecting…';
+      tone = 'error';
+    } else if (currentDoc && currentDoc.status === 'processing') {
+      state = 'thinking';
+      text = 'Converting…';
+    } else if (currentDoc && currentDoc.status === 'failed') {
+      text = 'Conversion failed';
+      tone = 'error';
+    } else if (isPlaying && currentAudio && !currentAudio.paused) {
+      state = 'speaking';
+      text = 'Reading';
+      tone = 'playing';
+    } else if (isPlaying) {
+      state = 'thinking';
+      text = 'Starting…';
+      tone = 'playing';
+    } else if (playable()) {
+      state = 'idle';
+      if (finished) text = 'Finished';
+      else if (stopped) text = 'Stopped';
+      else if (currentChunk > 0 || currentSentence > 0) text = 'Paused';
+      else text = 'Ready';
+    }
+    playerFinish.hidden = !(currentDoc && currentDoc.status === 'ready');
+    playerFinish.textContent = finished ? 'Mark unread' : 'Mark finished';
+    orb.setState(state);
+    statusEl.textContent = text;
+    statusEl.dataset.tone = tone;
+    syncMediaSession();
+  }
+
+  // ---------- Media Session (media keys, headset buttons, OS controls) ----------
+
+  const mediaSession = 'mediaSession' in navigator ? navigator.mediaSession : null;
+  let keepalive = null;
+  let mediaMetaKey = '';
+
+  // Each sentence is its own short-lived <audio> (often routed through Web Audio for
+  // the orb), with gaps between them, so the browser has no steady media element to
+  // hang the controls on. A silent looping element, started from the Play gesture,
+  // gives it one for as long as we're reading.
+  function silentWavUrl() {
+    const rate = 8000;
+    const n = rate; // one second of silence, looped
+    const buf = new ArrayBuffer(44 + n * 2);
+    const v = new DataView(buf);
+    const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, n * 2, true);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+
+  function setKeepalive(on) {
+    if (!mediaSession) return;
+    if (on) {
+      if (!keepalive) {
+        keepalive = new Audio(silentWavUrl());
+        keepalive.loop = true;
+      }
+      if (keepalive.paused) keepalive.play().catch(() => {});
+    } else if (keepalive && !keepalive.paused) {
+      keepalive.pause();
+    }
+  }
+
+  function syncMediaSession() {
+    if (!mediaSession) return;
+    const active = isPlaying || !!currentAudio;
+    setKeepalive(active);
+    mediaSession.playbackState = active ? 'playing' : (playable() ? 'paused' : 'none');
+    if (!currentDoc) {
+      if (mediaMetaKey) { mediaSession.metadata = null; mediaMetaKey = ''; }
+      return;
+    }
+    const album = sectionHeading(currentChunk);
+    const key = currentDoc.title + '\u0000' + album;
+    if (key === mediaMetaKey || typeof MediaMetadata === 'undefined') return;
+    mediaMetaKey = key;
+    mediaSession.metadata = new MediaMetadata({
+      title: currentDoc.title || 'Untitled document',
+      artist: 'Octavius Reader',
+      album,
+      artwork: [
+        { src: '/static/icon-192.png', sizes: '192x192', type: 'image/png' },
+        { src: '/static/icon-512.png', sizes: '512x512', type: 'image/png' },
+      ],
+    });
+  }
+
+  if (mediaSession) {
+    const handlers = {
+      play: () => { if (!isPlaying) togglePlay(); },
+      pause: () => { if (isPlaying) sendPause(); },
+      stop: () => { if (isPlaying || currentAudio) sendStop(); },
+      previoustrack: () => stepSection(-1),
+      nexttrack: () => stepSection(1),
+      seekbackward: () => stepSentence(-1),
+      seekforward: () => stepSentence(1),
+    };
+    for (const [action, fn] of Object.entries(handlers)) {
+      try {
+        mediaSession.setActionHandler(action, fn);
+      } catch (_err) {
+        // This browser doesn't support that action.
+      }
+    }
+  }
+
+  function sectionHeading(chunkIdx) {
+    const sections = (currentDoc && currentDoc.sections) || [];
+    let heading = '';
+    for (const sec of sections) {
+      if (sec.index > chunkIdx) break;
+      if (sec.heading) heading = sec.heading;
+    }
+    return heading;
+  }
+
+  function globalIndex(chunkIdx, sentIdx) {
+    const sections = (currentDoc && currentDoc.sections) || [];
+    let total = 0;
+    for (const sec of sections) {
+      if (sec.index < chunkIdx) total += sec.sentence_count;
+      else if (sec.index === chunkIdx) return total + sentIdx;
+    }
+    return total;
+  }
+
+  function showProgress(globalPos) {
+    progressBar.max = totalSentences;
+    progressBar.value = globalPos;
+    progressCur.textContent = totalSentences ? Math.min(globalPos + 1, totalSentences) : 0;
+    progressTot.textContent = totalSentences;
+    whereEl.textContent = currentDoc ? sectionHeading(currentChunk) : '';
+  }
+
+  // ---------- Read-along highlight ----------
+
+  function markSentence(chunkIdx, sentIdx, scroll) {
+    if (markedEl) markedEl.classList.remove('active', 'cursor');
+    if (markedSec) markedSec.classList.remove('here', 'playing');
+    const prevSec = markedSec;
+    markedEl = sentenceEls.get(chunkIdx + ':' + sentIdx) || null;
+    markedSec = markedEl ? markedEl.closest('.sec') : null;
+    updateTocCurrent(chunkIdx);
+    if (!markedEl) return;
+    markedEl.classList.add(isPlaying ? 'active' : 'cursor');
+    markedSec.classList.add(isPlaying ? 'playing' : 'here');
+    // In Original view the next sentence of the same chunk is no reason to scroll.
+    const sameChunk = markedSec === prevSec && markedSec.classList.contains('orig');
+    if (scroll && follow && !(sameChunk && scroll === true)) scrollToPlace(scroll === 'instant' ? 'auto' : 'smooth');
+  }
+
+  // In Original view the marked sentence is hidden, so the place is its whole chunk.
+  function placeEl() {
+    if (markedSec && markedSec.classList.contains('orig')) return markedSec.querySelector('.sec-orig');
+    return markedEl;
+  }
+  function scrollToPlace(behavior) {
+    const el = placeEl();
+    if (!el) return;
+    // A chunk taller than the page is shown from its top, not its middle.
+    const tall = el.getBoundingClientRect().height > pageEl.clientHeight * 0.7;
+    el.scrollIntoView({ block: tall ? 'start' : 'center', behavior });
+  }
+
+  function userScrolled() {
+    if (!isPlaying || !markedEl) return;
+    follow = false;
+    followBtn.hidden = false;
+  }
+  pageEl.addEventListener('wheel', userScrolled, { passive: true });
+  pageEl.addEventListener('touchmove', userScrolled, { passive: true });
+  followBtn.addEventListener('click', () => {
+    follow = true;
+    followBtn.hidden = true;
+    scrollToPlace('smooth');
+  });
+
+  function setNotice(text, tone) {
+    noticeEl.textContent = text || '';
+    noticeEl.dataset.tone = tone || '';
+    noticeEl.hidden = !text;
+  }
+
+  // ---------- Audio queue (paired with reader_position frames) ----------
 
   function enqueuePosition(pos) {
     positionQueue.push(pos);
@@ -71,24 +392,24 @@
     totalSentences = pos.total_sentences;
     progressBar.max = totalSentences;
     progressBar.value = pos.sentence_global;
-    progressCur.textContent = pos.sentence_global;
+    progressCur.textContent = pos.sentence_global + 1;
     progressTot.textContent = totalSentences;
-
-    document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
-    const secEl = document.querySelector(`.section-item[data-chunk="${pos.chunk_index}"]`);
-    if (secEl) {
-      secEl.classList.add('active');
-      secEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
-
-    if (pos.sentence_text) {
-      readAlong.innerHTML = '<span class="current-sentence">' + OctaviusApp.escapeHtml(pos.sentence_text) + '</span>';
-    }
+    whereEl.textContent = pos.heading || sectionHeading(pos.chunk_index);
+    markSentence(pos.chunk_index, pos.sentence_index, true);
+    // Keep the open document's row current; after reader_audio_done the queued
+    // tail must not pull "Finished" back down.
+    if (!finished) setDocProgress(currentDocId, pos.sentence_global, pos.total_sentences);
+    syncMediaSession();
   }
 
   async function playNextAudio() {
     if (audioQueue.length === 0) {
       currentAudio = null;
+      if (finished && !isPlaying) {
+        if (markedEl) markedEl.classList.remove('active');
+        followBtn.hidden = true;
+      }
+      refreshTransport();
       return;
     }
     const arrayBuffer = audioQueue.shift();
@@ -103,18 +424,54 @@
     audio.preservesPitch = true;
     audio.playbackRate = speed;
     currentAudio = audio;
+    attachAnalyser(audio);
 
-    audio.onended = () => {
+    // Report the sentence as heard when its audio actually starts. This is a media
+    // event, so it keeps firing in a background tab; the paced server releases the
+    // next sentence on it. A sentence that can't play is reported too, or the
+    // server would wait on it forever.
+    let reported = false;
+    const report = () => {
+      if (reported) return;
+      reported = true;
+      sendHeard(pos);
+    };
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
       URL.revokeObjectURL(url);
       if (currentAudio === audio) currentAudio = null;
       playNextAudio();
     };
+    audio.onplaying = () => {
+      report();
+      refreshTransport();
+    };
+    audio.onended = advance;
     audio.onerror = () => {
-      URL.revokeObjectURL(url);
-      if (currentAudio === audio) currentAudio = null;
-      playNextAudio();
+      report();
+      advance();
     };
-    audio.play().catch(() => playNextAudio());
+    audio.play().catch(() => {
+      report();
+      advance();
+    });
+  }
+
+  function sendHeard(pos) {
+    // Only for the current play, and not for the tail that is still playing after
+    // reader_audio_done (the server already treats the document as finished).
+    if (!pos || pos.seq !== playSeqId || finished || !currentDocId) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: 'reader_heard',
+      seq: pos.seq,
+      doc_id: currentDocId,
+      chunk_index: pos.chunk_index,
+      sentence_index: pos.sentence_index,
+      sentence_global: pos.sentence_global,
+    }));
   }
 
   function clearAudioQueue() {
@@ -127,12 +484,18 @@
     }
   }
 
+  // ---------- WebSocket ----------
+
   function connectWS() {
     const socketController = OctaviusApp.createWebSocket({
       binaryType: 'arraybuffer',
       heartbeat: true,
       onOpen(_evt, socket) {
         ws = socket;
+        connected = true;
+        connEl.dataset.state = 'open';
+        connEl.textContent = 'Connected';
+        refreshTransport();
       },
       onMessage(evt) {
         ws = socketController.getSocket();
@@ -142,7 +505,13 @@
           enqueueAudio(evt.data);
           return;
         }
-        const msg = JSON.parse(evt.data);
+        let msg;
+        try {
+          msg = JSON.parse(evt.data);
+        } catch (_err) {
+          return;
+        }
+        if (!msg || typeof msg !== 'object') return;
         if (msg.seq !== undefined && msg.seq !== playSeqId) {
           audioEpochArmed = false;
           return;
@@ -153,269 +522,892 @@
         }
         if (msg.type === 'reader_audio_done') {
           isPlaying = false;
-          playPauseBtn.innerHTML = '&#9654;';
+          finished = true;
+          if (totalSentences) setDocProgress(currentDocId, totalSentences, totalSentences);
+          refreshTransport();
         }
+        if (msg.type === 'status' && isPlaying && /not ready|not found/i.test(String(msg.text || ''))) {
+          isPlaying = false;
+          setNotice(String(msg.text), 'error');
+          refreshTransport();
+        }
+      },
+      onClose() {
+        connected = false;
+        connEl.dataset.state = 'closed';
+        connEl.textContent = 'Offline';
+        if (isPlaying) {
+          isPlaying = false;
+          clearAudioQueue();
+        }
+        refreshTransport();
       },
     });
     ws = socketController.connect();
   }
 
-  OctaviusApp.loadVoices(voiceSelect).catch(() => {});
+  function sendPlay(chunkIdx, sentIdx) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !currentDocId) return;
+    wakeAudioContext();
+
+    if (isPlaying) ws.send(JSON.stringify({ type: 'reader_pause' }));
+    clearAudioQueue();
+
+    playSeqId++;
+    const mySeq = playSeqId;
+    lastSelection = null;  // playing moves the place on
+    finished = false;
+    stopped = false;
+    follow = true;
+    followBtn.hidden = true;
+    isPlaying = true;
+    markSentence(chunkIdx !== undefined ? chunkIdx : currentChunk, sentIdx !== undefined ? sentIdx : currentSentence, true);
+    refreshTransport();
+    setTimeout(() => {
+      if (mySeq !== playSeqId) return;
+      ws.send(JSON.stringify({
+        type: 'reader_play',
+        doc_id: currentDocId,
+        chunk_index: chunkIdx !== undefined ? chunkIdx : currentChunk,
+        sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
+        voice: voiceSelect.value,
+        seq: mySeq,
+        // Server stays a few sentences ahead of what reader_heard reports.
+        paced: true,
+      }));
+    }, 100);
+  }
+
+  // The server synthesizes ahead of what is heard, so pause and stop tell it the
+  // sentence actually playing; it saves that as the place instead of its own.
+  function heardPlace() {
+    return isPlaying && currentDocId
+      ? { doc_id: currentDocId, chunk_index: currentChunk, sentence_index: currentSentence }
+      : {};
+  }
+
+  function sendPause() {
+    playSeqId++;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_pause', ...heardPlace() }));
+    clearAudioQueue();
+    isPlaying = false;
+    followBtn.hidden = true;
+    markSentence(currentChunk, currentSentence, false);
+    refreshTransport();
+  }
+
+  // Leaving mid-play: without this the server keeps the further-ahead place it streamed to.
+  window.addEventListener('pagehide', () => {
+    if (isPlaying && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'reader_pause', ...heardPlace() }));
+    }
+  });
+
+  function sendStop() {
+    // Stop playback but keep the place on the sentence being read: the next Play
+    // starts that sentence again from its beginning.
+    playSeqId++;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_stop', ...heardPlace() }));
+    clearAudioQueue();
+    isPlaying = false;
+    stopped = true;
+    followBtn.hidden = true;
+    showProgress(globalIndex(currentChunk, currentSentence));
+    markSentence(currentChunk, currentSentence, false);
+    refreshTransport();
+  }
+
+  function togglePlay() {
+    if (!playable()) return;
+    if (isPlaying) sendPause();
+    else if (finished) sendPlay(firstChunk(), 0);
+    else sendPlay(currentChunk, currentSentence);
+  }
+
+  // ---------- Seeking ----------
+
+  function firstChunk() {
+    const sections = (currentDoc && currentDoc.sections) || [];
+    return sections.length ? sections[0].index : 0;
+  }
+
+  function seekTo(chunkIdx, sentIdx) {
+    lastSelection = null;  // a click names a new place
+    currentChunk = chunkIdx;
+    currentSentence = sentIdx;
+    finished = false;
+    stopped = false;
+    showProgress(globalIndex(chunkIdx, sentIdx));
+    follow = true;
+    followBtn.hidden = true;
+    markSentence(chunkIdx, sentIdx, 'smooth');
+    if (isPlaying) sendPlay(chunkIdx, sentIdx);
+    refreshTransport();
+  }
+
+  // Every non-blank sentence in reading order; the server skips blank ones.
+  function readingOrder() {
+    const out = [];
+    for (const sec of (currentDoc && currentDoc.sections) || []) {
+      const sentences = sec.sentences || [];
+      for (let i = 0; i < sec.sentence_count; i++) {
+        if (sentences.length && !String(sentences[i] || '').trim()) continue;
+        out.push([sec.index, i]);
+      }
+    }
+    return out;
+  }
+
+  function stepSentence(dir) {
+    if (!playable()) return;
+    const order = readingOrder();
+    if (!order.length) return;
+    let j;
+    const i = order.findIndex(([c, s]) => c === currentChunk && s === currentSentence);
+    if (i >= 0) {
+      j = i + dir;
+    } else {
+      // Cursor sits on a blank sentence: move to the nearest real one in that direction.
+      let k = order.findIndex(([c, s]) => c > currentChunk || (c === currentChunk && s > currentSentence));
+      if (k < 0) k = order.length;
+      j = dir > 0 ? k : k - 1;
+    }
+    j = Math.max(0, Math.min(order.length - 1, j));
+    seekTo(order[j][0], order[j][1]);
+  }
+
+  function stepSection(dir) {
+    if (!playable()) return;
+    const sections = currentDoc.sections || [];
+    if (!sections.length) return;
+    const idx = Math.max(0, sections.findIndex((s) => s.index === currentChunk));
+    if (dir < 0) {
+      // Like a "previous track" button: back to the start of this section first.
+      if (currentSentence > 0) { seekTo(sections[idx].index, 0); return; }
+      seekTo(sections[Math.max(0, idx - 1)].index, 0);
+    } else {
+      seekTo(sections[Math.min(sections.length - 1, idx + 1)].index, 0);
+    }
+  }
+
+  playPauseBtn.addEventListener('click', togglePlay);
+  skipBack.addEventListener('click', () => stepSection(-1));
+  skipFwd.addEventListener('click', () => stepSection(1));
+  stepBack.addEventListener('click', () => stepSentence(-1));
+  stepFwd.addEventListener('click', () => stepSentence(1));
+
+  progressBar.addEventListener('input', () => {
+    clearTimeout(seekDebounce);
+    progressCur.textContent = Math.min(parseInt(progressBar.value, 10) + 1, totalSentences);
+    seekDebounce = setTimeout(() => {
+      const target = parseInt(progressBar.value, 10);
+      const sections = (currentDoc && currentDoc.sections) || [];
+      let accum = 0;
+      for (const sec of sections) {
+        if (accum + sec.sentence_count > target) {
+          seekTo(sec.index, target - accum);
+          return;
+        }
+        accum += sec.sentence_count;
+      }
+    }, 200);
+  });
+
+  sectionsEl.addEventListener('click', (event) => {
+    const t = event.target;
+    if (!(t instanceof Element)) return;
+    const flip = t.closest('.sec-flip');
+    if (flip) { flipChunk(Number(flip.dataset.c)); return; }
+    if (window.getSelection && String(window.getSelection()).length > 0) return; // selecting text
+    const s = t.closest('.s');
+    if (s) { seekTo(Number(s.dataset.c), Number(s.dataset.s)); return; }
+    const orig = t.closest('.sec-orig');
+    if (orig && !t.closest('a')) {
+      const place = origPlaceAt(orig, event.clientX, event.clientY);
+      if (place) seekTo(place[0], place[1]);
+      return;
+    }
+    const h = t.closest('.sec-head');
+    if (h) seekTo(Number(h.dataset.c), 0);
+  });
 
   speedSlider.addEventListener('input', () => {
     speedVal.textContent = parseFloat(speedSlider.value).toFixed(1) + 'x';
     if (currentAudio) currentAudio.playbackRate = parseFloat(speedSlider.value);
+    savePrefs({ speed: parseFloat(speedSlider.value) });
   });
 
-  function showEditError(msg) {
-    editError.textContent = msg || '';
-  }
-
-  function openEditBar(docId, title, context, mountEl) {
-    editDocId = docId;
-    editOrigTitle = title || '';
-    editContext = context;
-    editTitleInput.value = title || '';
-    editAppendInput.value = '';
-    editReplaceCheckbox.checked = false;
-    syncEditHint();
-    showEditError('');
-    editBarCaption.textContent = title ? `Editing: ${title}` : '';
-    mountEl.appendChild(editBar);
-    editBar.classList.add('active');
-    editTitleInput.focus();
-  }
-
-  function closeEditBar() {
-    editBar.classList.remove('active');
-    editDocId = null;
-    editContext = null;
-    editTitleInput.value = '';
-    editAppendInput.value = '';
-    editReplaceCheckbox.checked = false;
-    showEditError('');
-  }
-
-  editCancelBtn.addEventListener('click', closeEditBar);
-
-  const HINT_APPEND = 'The text is cleaned and math is converted to speech, then added to the end. Playback position is kept.';
-  const HINT_REPLACE = 'The current content is discarded and the document is rebuilt from this text alone. Playback position resets.';
-  function syncEditHint() {
-    editHint.textContent = editReplaceCheckbox.checked ? HINT_REPLACE : HINT_APPEND;
-  }
-  editReplaceCheckbox.addEventListener('change', syncEditHint);
-
-  // Ctrl/Cmd+Enter submits, matching the paste panel's textarea behavior.
-  editAppendInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) editSaveBtn.click();
-  });
-  editTitleInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) editSaveBtn.click();
+  OctaviusApp.loadVoices(voiceSelect, { currentVoice: prefs.voice }).catch(() => {});
+  voiceSelect.addEventListener('change', () => {
+    savePrefs({ voice: voiceSelect.value });
+    if (isPlaying) sendPlay(currentChunk, currentSentence);
   });
 
-  function stopAppendPoll() {
-    clearTimeout(editPollTimer);
-    editPollTimer = null;
-  }
+  // ---------- Original / Reading view ----------
 
-  function startAppendPoll(docId, replace) {
-    stopAppendPoll();
-    readAlong.innerHTML = '<span style="color:#666">Processing appended text\u2026</span>';
-    let failures = 0;
-
-    function showPollError(msg) {
-      readAlong.innerHTML = '<span style="color:#bf6a6a">' + OctaviusApp.escapeHtml(msg) + '</span>';
+  // The sentence a click in an Original-view chunk means: the caret's character offset in
+  // the chunk's text, matched against its spoken sentences (OctaviusReaderOriginal.sentenceAt).
+  function origPlaceAt(orig, x, y) {
+    const c = Number(orig.closest('.sec').dataset.c);
+    const sec = (currentDoc && currentDoc.sections || []).find((z) => z.index === c);
+    if (!sec) return null;
+    let node = null;
+    let off = 0;
+    if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(x, y);
+      if (pos) { node = pos.offsetNode; off = pos.offset; }
+    } else if (document.caretRangeFromPoint) {
+      const r = document.caretRangeFromPoint(x, y);
+      if (r) { node = r.startContainer; off = r.startOffset; }
     }
-
-    // Transient failures (network blip, a non-JSON error page) retry on the normal
-    // cadence; a run of them stops the poll with a visible message rather than
-    // leaving "Processing…" up forever.
-    function retry() {
-      if (currentDocId !== docId) return;
-      failures++;
-      if (failures >= 5) {
-        editPollTimer = null;
-        showPollError('Lost track of the update \u2014 reopen the document to check.');
-        return;
+    let offset = 0;
+    if (node && orig.contains(node)) {
+      try {
+        const r = document.createRange();
+        r.setStart(orig, 0);
+        r.setEnd(node, off);
+        offset = r.toString().length;
+      } catch (_err) {
       }
-      editPollTimer = setTimeout(poll, 3000);
     }
-
-    function poll() {
-      if (currentDocId !== docId) return; // stale poll for a doc we've navigated away from
-      fetch(`/api/reader/documents/${docId}`)
-        .then(resp => (resp.ok ? resp.json() : Promise.reject(new Error('HTTP ' + resp.status))))
-        .then(data => {
-          if (currentDocId !== docId) return; // guard again after the await
-          const doc = data.document;
-          if (!doc) { retry(); return; }
-          failures = 0;
-          if (doc.status === 'processing') {
-            editPollTimer = setTimeout(poll, 3000);
-            return;
-          }
-          editPollTimer = null;
-          if (doc.status === 'failed' || doc.error) {
-            // A failed append on a previously-ready document comes back `ready` with
-            // `error` set and its content untouched, so there is nothing to re-render.
-            currentDoc = doc;
-            showPollError(doc.error || 'Append failed.');
-            return;
-          }
-          renderDocument(doc, { preservePosition: !replace });
-        })
-        .catch(retry);
-    }
-    poll();
+    return [c, OctaviusReaderOriginal.sentenceAt(orig.textContent, offset, sec.sentences)];
   }
 
-  async function saveEdit() {
-    const docId = editDocId;
-    const ctx = editContext;
-    if (docId == null) return;
+  function showsOriginal(chunkIdx) {
+    return (viewMode === 'original') !== flipped.has(chunkIdx);
+  }
+  function applyChunkView(wrap) {
+    const idx = Number(wrap.dataset.c);
+    const orig = showsOriginal(idx);
+    wrap.classList.toggle('orig', orig);
+    const flip = wrap.querySelector(':scope > .sec-flip');
+    if (flip) {
+      flip.textContent = orig ? 'Reading' : 'Original';
+      flip.title = orig ? 'Show this part as it is read aloud' : 'Show this part as written';
+      flip.setAttribute('aria-label', flip.title);
+    }
+  }
+  function syncViewSeg() {
+    viewSeg.querySelectorAll('button[data-view]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b.dataset.view === viewMode));
+    });
+  }
+  function setViewMode(mode) {
+    if (mode !== 'original' && mode !== 'reading') return;
+    viewMode = mode;
+    flipped = new Set();
+    savePrefs({ view: mode });
+    syncViewSeg();
+    sectionsEl.querySelectorAll('.sec.has-orig').forEach(applyChunkView);
+    if (follow) scrollToPlace('auto');
+  }
+  function flipChunk(chunkIdx) {
+    if (flipped.has(chunkIdx)) flipped.delete(chunkIdx);
+    else flipped.add(chunkIdx);
+    const wrap = sectionsEl.querySelector(`.sec[data-c="${chunkIdx}"]`);
+    if (wrap) applyChunkView(wrap);
+  }
+  viewSeg.addEventListener('click', (event) => {
+    const b = event.target instanceof Element && event.target.closest('button[data-view]');
+    if (b) setViewMode(b.dataset.view);
+  });
 
-    const rawTitle = editTitleInput.value.trim();
-    const titleChanged = !!rawTitle && rawTitle !== editOrigTitle;
-    const text = editAppendInput.value.trim();
-    const replace = editReplaceCheckbox.checked;
+  // ---------- Document view ----------
 
-    if (!titleChanged && !text) {
-      closeEditBar();
+  // Builds the text + position state for a document. Shared by the initial open and by
+  // the append-poll completion, so a document that grows or is replaced while open
+  // re-renders the same way. `preservePosition: false` (after a replace) resets to the start.
+  function renderDocument(doc, opts) {
+    const preservePosition = !opts || opts.preservePosition !== false;
+    currentDoc = doc;
+    notifyDocChange();
+    totalSentences = doc.total_sentences || 0;
+    playerTitle.textContent = doc.title;
+    playerEdit.hidden = !(doc.status === 'ready' || doc.status === 'failed');
+    emptyEl.hidden = true;
+    isPlaying = false;
+    finished = false;
+    stopped = false;
+    follow = true;
+    followBtn.hidden = true;
+    syncDocFromDetail(doc);
+    sentenceEls = new Map();
+    markedEl = null;
+    markedSec = null;
+    sectionsEl.innerHTML = '';
+    if (!opts || !opts.keepFlips) flipped = new Set();
+    const hasOriginal = doc.status === 'ready' && (doc.sections || []).some((sec) => sec.source_text);
+    viewSeg.hidden = !hasOriginal;
+    syncViewSeg();
+
+    if (doc.status !== 'ready') {
+      buildToc(null);
+      renderDocState(doc);
+      currentChunk = 0;
+      currentSentence = 0;
+      showProgress(0);
+      refreshTransport();
       return;
     }
+    docStateEl.hidden = true;
+    docStateEl.innerHTML = '';
 
-    if (text && replace) {
-      if (!confirm('Replace the whole document? Playback position resets.')) return;
+    const title = document.createElement('h2');
+    title.className = 'text-title';
+    title.textContent = doc.title;
+    sectionsEl.appendChild(title);
+
+    const frag = document.createDocumentFragment();
+    for (const sec of doc.sections || []) {
+      const wrap = document.createElement('section');
+      wrap.className = 'sec';
+      wrap.dataset.c = sec.index;
+      if (sec.heading) {
+        const h = document.createElement('button');
+        h.type = 'button';
+        h.className = 'sec-head';
+        h.dataset.c = sec.index;
+        h.textContent = sec.heading;
+        h.title = 'Read from here';
+        wrap.appendChild(h);
+      }
+      const body = document.createElement('p');
+      body.className = 'sec-body';
+      const sentences = sec.sentences || [];
+      sentences.forEach((text, i) => {
+        if (!String(text || '').trim()) return;
+        const span = document.createElement('span');
+        span.className = 's';
+        span.dataset.c = sec.index;
+        span.dataset.s = i;
+        span.textContent = text;
+        body.appendChild(span);
+        body.appendChild(document.createTextNode(' '));
+        sentenceEls.set(sec.index + ':' + i, span);
+      });
+      wrap.appendChild(body);
+      if (sec.source_text) {
+        const orig = document.createElement('div');
+        orig.className = 'sec-orig';
+        orig.appendChild(OctaviusReaderOriginal.render(sec.source_text));
+        wrap.appendChild(orig);
+        wrap.classList.add('has-orig');
+        if (OctaviusReaderOriginal.differs(sec.source_text, sentences)) {
+          const flip = document.createElement('button');
+          flip.type = 'button';
+          flip.className = 'sec-flip';
+          flip.dataset.c = sec.index;
+          wrap.insertBefore(flip, body);
+        }
+        applyChunkView(wrap);
+      }
+      frag.appendChild(wrap);
+    }
+    sectionsEl.appendChild(frag);
+
+    if (preservePosition) {
+      currentChunk = doc.last_chunk || 0;
+      currentSentence = doc.last_sentence || 0;
+    } else {
+      currentChunk = firstChunk();
+      currentSentence = 0;
+    }
+    // Read to the end last time: show it as finished, and Play starts over.
+    const prog = numOrNull(doc.progress_sentences);
+    if (totalSentences && prog !== null && prog >= totalSentences) finished = true;
+    showProgress(globalIndex(currentChunk, currentSentence));
+    buildToc(doc);
+
+    if (doc.error) {
+      setNotice(`The last update didn’t go through: ${doc.error}`, 'error');
+    } else {
+      setNotice('');
     }
 
-    editSaveBtn.disabled = true;
-    showEditError('');
-    try {
-      if (titleChanged) {
-        const resp = await fetch(`/api/reader/documents/${docId}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: rawTitle }),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          showEditError(resp.status === 409
-            ? 'Still processing \u2014 try again in a moment.'
-            : (data.error || 'Rename failed.'));
-          return;
-        }
-        editOrigTitle = data.title;
-        if (ctx === 'player' && currentDocId === docId) {
-          playerTitle.textContent = data.title;
-          if (currentDoc) currentDoc.title = data.title;
-        }
-      }
+    if (currentChunk > 0 || currentSentence > 0) {
+      requestAnimationFrame(() => markSentence(currentChunk, currentSentence, 'instant'));
+    } else {
+      pageEl.scrollTop = 0;
+      markSentence(currentChunk, currentSentence, false);
+    }
+    refreshTransport();
+  }
 
-      if (text) {
-        if (ctx === 'player' && isPlaying) sendPause();
-        const resp = await fetch(`/api/reader/documents/${docId}/append`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text, replace }),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          const why = resp.status === 409
-            ? 'Still processing \u2014 try again in a moment.'
-            : (data.error || 'Append failed.');
-          // The rename above already landed; say so rather than implying nothing changed.
-          showEditError(titleChanged ? 'Title saved. ' + why : why);
-          return;
-        }
-        closeEditBar();
-        if (ctx === 'player' && currentDocId === docId) {
-          startAppendPoll(docId, replace);
-        } else {
-          loadDocList();
-        }
-        return;
-      }
+  const SOURCE_LABELS = { pdf: 'PDF', url: 'Web page', inbox_item: 'From inbox', markdown: 'Text', text: 'Pasted text' };
 
-      closeEditBar();
-      if (ctx === 'list') loadDocList();
-    } catch (e) {
-      showEditError('Save failed.');
-    } finally {
-      editSaveBtn.disabled = false;
+  function renderDocState(doc) {
+    setNotice('');
+    docStateEl.hidden = false;
+    if (doc.status === 'processing') {
+      docStateEl.innerHTML = `
+        <h2>Converting this document</h2>
+        <p>It opens here as soon as it’s ready. Long PDFs can take a few minutes.</p>`;
+      startDocPoll(doc.id);
+    } else {
+      docStateEl.innerHTML = `
+        <h2>This document didn’t convert</h2>
+        <p class="why">${esc(doc.error || 'No reason was recorded.')}</p>
+        <p>Retry fetches the original source again. If the page was behind a sign-in, use Edit to paste the text instead.</p>
+        <div class="actions">
+          <button class="btn primary" data-act="retry">Retry</button>
+          <button class="btn" data-act="edit">Edit</button>
+        </div>`;
     }
   }
 
-  editSaveBtn.addEventListener('click', saveEdit);
-
-  playerEdit.addEventListener('click', () => {
-    if (!currentDocId || !currentDoc) return;
-    openEditBar(currentDocId, currentDoc.title, 'player', editMountPlayer);
+  docStateEl.addEventListener('click', (event) => {
+    const btn = event.target instanceof Element ? event.target.closest('button[data-act]') : null;
+    if (!btn || !currentDoc) return;
+    if (btn.dataset.act === 'retry') retryDoc(currentDoc.id);
+    if (btn.dataset.act === 'edit') openEditBar();
   });
 
+  function stopDocPoll() {
+    clearTimeout(docPollTimer);
+    docPollTimer = null;
+  }
+
+  function startDocPoll(docId) {
+    stopDocPoll();
+    docPollTimer = setTimeout(async () => {
+      if (currentDocId !== docId) return;
+      try {
+        const resp = await fetch(`/api/reader/documents/${docId}`);
+        const data = await resp.json();
+        if (currentDocId !== docId) return;
+        const doc = data.document;
+        if (doc && doc.status !== 'processing') {
+          renderDocument(doc, { preservePosition: true });
+          loadDocList();
+          return;
+        }
+      } catch (_err) {
+      }
+      startDocPoll(docId);
+    }, 3000);
+  }
+
+  async function openDocument(docId) {
+    try {
+      const resp = await fetch(`/api/reader/documents/${docId}`);
+      const data = await resp.json();
+      if (!data.document) throw new Error(data.error || 'not found');
+      if (isPlaying) sendPause();
+      clearAudioQueue();
+      currentDocId = docId;
+      stopAppendPoll();
+      stopDocPoll();
+      closeEditBar();
+      renderDocument(data.document, { preservePosition: true });
+      markCurrentInList();
+      closeRail();
+      try {
+        const url = new URL(location.href);
+        url.searchParams.set('doc_id', docId);
+        url.searchParams.delete('inbox_id');
+        history.replaceState(null, '', url);
+      } catch (_err) {
+      }
+    } catch (e) {
+      console.error('Failed to open document:', e);
+    }
+  }
+
+  function closeDocument() {
+    if (isPlaying) sendPause();
+    clearAudioQueue();
+    stopAppendPoll();
+    stopDocPoll();
+    closeEditBar();
+    currentDocId = null;
+    currentDoc = null;
+    notifyDocChange();
+    totalSentences = 0;
+    sentenceEls = new Map();
+    markedEl = null;
+    markedSec = null;
+    viewSeg.hidden = true;
+    sectionsEl.innerHTML = '';
+    docStateEl.hidden = true;
+    setNotice('');
+    emptyEl.hidden = false;
+    playerTitle.textContent = 'Reader';
+    playerEdit.hidden = true;
+    playerFinish.hidden = true;
+    buildToc(null);
+    showProgress(0);
+    markCurrentInList();
+    refreshTransport();
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('doc_id');
+      history.replaceState(null, '', url);
+    } catch (_err) {
+    }
+  }
+
+  // ---------- Reading progress ----------
+
+  function numOrNull(v) {
+    return typeof v === 'number' && isFinite(v) ? v : null;
+  }
+
+  // Returns {pct, done} or null when there is nothing worth showing (unknown or not started).
+  function progressOf(doc) {
+    const total = numOrNull(doc.total_sentences);
+    const done = numOrNull(doc.progress_sentences);
+    if (!total || done === null || done <= 0) return null;
+    if (done >= total) return { pct: 100, done: true };
+    return { pct: Math.max(1, Math.min(99, Math.floor((100 * done) / total))), done: false };
+  }
+
+  function paintRowProgress(row, doc) {
+    const pctEl = row.querySelector('.doc-pct');
+    const bar = row.querySelector('.doc-bar');
+    if (!pctEl || !bar) return;
+    const p = progressOf(doc);
+    pctEl.hidden = !p;
+    bar.hidden = !p;
+    if (!p) return;
+    pctEl.textContent = p.done ? 'Finished' : `${p.pct}%`;
+    pctEl.classList.toggle('done', p.done);
+    bar.classList.toggle('done', p.done);
+    bar.firstElementChild.style.width = p.pct + '%';
+    bar.setAttribute('aria-label', p.done ? 'Finished' : `${p.pct}% read`);
+  }
+
+  function setDocProgress(id, done, total) {
+    if (id == null) return;
+    const doc = docs.find((d) => d.id === id);
+    if (!doc) return;
+    doc.progress_sentences = done;
+    if (numOrNull(total)) doc.total_sentences = total;
+    const row = docList.querySelector(`.doc[data-id="${id}"]`);
+    if (row) paintRowProgress(row, doc);
+  }
+
+  // The detail endpoint carries the same two fields; fold them into the list entry.
+  function syncDocFromDetail(doc) {
+    const entry = docs.find((d) => d.id === doc.id);
+    if (!entry) return;
+    entry.total_sentences = numOrNull(doc.total_sentences);
+    entry.progress_sentences = numOrNull(doc.progress_sentences);
+    entry.status = doc.status;
+    const row = docList.querySelector(`.doc[data-id="${doc.id}"]`);
+    if (row) paintRowProgress(row, entry);
+  }
+
+  // ---------- Table of contents ----------
+
+  const CHEVRON = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>';
+
+  function tocAvailable() {
+    return tocLinks.size >= 2;
+  }
+
+  function buildToc(doc) {
+    tocTree.innerHTML = '';
+    tocLinks = new Map();
+    tocCurrent = null;
+    const heads = ((doc && doc.sections) || []).filter((sec) => sec.heading);
+    if (heads.length < 2) {
+      railTabs.hidden = true;
+      selectRailTab('library', true);
+      return;
+    }
+    tocDoc.textContent = doc.title || '';
+
+    // Nest by level (1-3); documents converted before levels existed are flat.
+    const root = { level: 0, children: [], el: tocTree };
+    const stack = [root];
+    for (const sec of heads) {
+      const lv = [1, 2, 3].includes(sec.level) ? sec.level : 1;
+      while (stack.length > 1 && stack[stack.length - 1].level >= lv) stack.pop();
+      const parent = stack[stack.length - 1];
+      const node = { level: lv, sec, children: [], parent };
+      parent.children.push(node);
+      stack.push(node);
+    }
+
+    function render(nodes, ul) {
+      for (const node of nodes) {
+        const li = document.createElement('li');
+        li.className = 'toc-item';
+        li.setAttribute('role', 'treeitem');
+        const row = document.createElement('div');
+        row.className = 'toc-row';
+        if (node.children.length) {
+          li.classList.add('collapsed');
+          li.setAttribute('aria-expanded', 'false');
+          const tog = document.createElement('button');
+          tog.type = 'button';
+          tog.className = 'toc-toggle';
+          tog.setAttribute('aria-label', `Show or hide subsections of ${node.sec.heading}`);
+          tog.innerHTML = CHEVRON;
+          tog.addEventListener('click', () => setExpanded(li, li.classList.contains('collapsed')));
+          row.appendChild(tog);
+        } else {
+          const sp = document.createElement('span');
+          sp.className = 'toc-spacer';
+          row.appendChild(sp);
+        }
+        const link = document.createElement('button');
+        link.type = 'button';
+        link.className = 'toc-link';
+        link.textContent = node.sec.heading;
+        link.dataset.c = node.sec.index;
+        link.addEventListener('click', () => {
+          seekTo(node.sec.index, 0);
+          if (window.matchMedia('(max-width: 860px)').matches) closeRail();
+        });
+        row.appendChild(link);
+        li.appendChild(row);
+        tocLinks.set(node.sec.index, link);
+        if (node.children.length) {
+          const sub = document.createElement('ul');
+          sub.setAttribute('role', 'group');
+          render(node.children, sub);
+          li.appendChild(sub);
+        }
+        ul.appendChild(li);
+      }
+    }
+    render(root.children, tocTree);
+    railTabs.hidden = false;
+    selectRailTab(railTab, true);
+  }
+
+  function setExpanded(li, open) {
+    li.classList.toggle('collapsed', !open);
+    li.setAttribute('aria-expanded', String(open));
+  }
+
+  // The heading section the reader is currently inside, if any.
+  function headingFor(chunkIdx) {
+    let found = null;
+    for (const idx of tocLinks.keys()) {
+      if (idx <= chunkIdx) found = idx;
+      else break;
+    }
+    return found;
+  }
+
+  function updateTocCurrent(chunkIdx) {
+    if (!tocLinks.size) return;
+    const idx = headingFor(chunkIdx);
+    const link = idx === null ? null : tocLinks.get(idx);
+    if (link === tocCurrent) return;
+    if (tocCurrent) tocCurrent.removeAttribute('aria-current');
+    tocCurrent = link;
+    if (!link) return;
+    link.setAttribute('aria-current', 'true');
+    // Open the branch that holds the current section.
+    for (let li = link.closest('.toc-item'); li; li = li.parentElement && li.parentElement.closest('.toc-item')) {
+      if (li.querySelector(':scope > ul') && li !== link.closest('.toc-item')) setExpanded(li, true);
+    }
+    if (!paneContents.hidden) link.scrollIntoView({ block: 'nearest' });
+  }
+
+  function selectRailTab(which, quiet) {
+    if (which === 'contents' && !tocAvailable()) which = 'library';
+    if (!quiet) railTab = which;
+    const contents = which === 'contents';
+    tabLibrary.setAttribute('aria-selected', String(!contents));
+    tabContents.setAttribute('aria-selected', String(contents));
+    paneLibrary.hidden = contents;
+    paneContents.hidden = !contents;
+    if (contents && tocCurrent) tocCurrent.scrollIntoView({ block: 'nearest' });
+  }
+  tabLibrary.addEventListener('click', () => selectRailTab('library'));
+  tabContents.addEventListener('click', () => selectRailTab('contents'));
+
+  // ---------- Library ----------
+
+  function formatDate(iso) {
+    if (!iso) return '';
+    const d = new Date(String(iso).replace(' ', 'T'));
+    if (isNaN(d)) return '';
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    return d.toLocaleDateString([], sameYear ? { month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function renderList() {
+    const q = query.trim().toLowerCase();
+    const shown = docs.filter((d) => (filter === 'all' || d.status === filter) &&
+      (!q || String(d.title || '').toLowerCase().includes(q)));
+    if (docs.length === 0) {
+      docList.innerHTML = '<div class="list-empty">No documents yet. Add a file path, a URL or some text above.</div>';
+      return;
+    }
+    if (shown.length === 0) {
+      docList.innerHTML = '<div class="list-empty">Nothing matches. Clear the search or pick another filter.</div>';
+      return;
+    }
+    docList.innerHTML = '';
+    for (const doc of shown) {
+      const row = document.createElement('div');
+      row.className = 'doc';
+      row.setAttribute('role', 'listitem');
+      row.dataset.id = doc.id;
+      let stateTag = '';
+      if (doc.status === 'processing') stateTag = '<span class="doc-state-tag processing">Converting</span><span class="sep"></span>';
+      else if (doc.status === 'failed') stateTag = '<span class="doc-state-tag failed">Failed</span><span class="sep"></span>';
+      const source = SOURCE_LABELS[doc.source_type] || doc.source_type || '';
+      row.innerHTML = `
+        <button type="button" class="doc-open">
+          <span class="doc-title">${esc(doc.title)}</span>
+          <span class="doc-meta">${stateTag}<span class="doc-pct" hidden></span><span class="sep"></span>${source ? `<span>${esc(source)}</span><span class="sep"></span>` : ''}<span>${esc(formatDate(doc.created_at))}</span></span>
+          <span class="doc-bar" hidden><span></span></span>
+        </button>
+        <div class="doc-actions">
+          ${doc.status === 'ready' ? finishButton(doc) : ''}
+          ${doc.status === 'failed' ? `<button class="icon-btn" data-act="retry" title="Retry" aria-label="Retry ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.7-5.6L20 8.7M20 4v4.7h-4.7M20 12a8 8 0 0 1-13.7 5.6L4 15.3M4 20v-4.7h4.7"/></svg></button>` : ''}
+          <button class="icon-btn danger" data-act="delete" title="Delete" aria-label="Delete ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg></button>
+        </div>`;
+      paintRowProgress(row, doc);
+      docList.appendChild(row);
+    }
+    markCurrentInList();
+  }
+
+  function markCurrentInList() {
+    docList.querySelectorAll('.doc').forEach((el) => {
+      el.setAttribute('aria-current', String(Number(el.dataset.id) === currentDocId));
+    });
+  }
+
+  docList.addEventListener('click', async (event) => {
+    const t = event.target;
+    if (!(t instanceof Element)) return;
+    const row = t.closest('.doc');
+    if (!row) return;
+    const id = Number(row.dataset.id);
+    const doc = docs.find((d) => d.id === id);
+    const act = t.closest('button[data-act]');
+    if (act && act.dataset.act === 'retry') {
+      retryDoc(id);
+      return;
+    }
+    if (act && act.dataset.act === 'finish') {
+      const p = doc ? progressOf(doc) : null;
+      markFinished(id, !(p && p.done));
+      return;
+    }
+    if (act && act.dataset.act === 'delete') {
+      if (!confirm(`Delete “${doc ? doc.title : 'this document'}”? This can’t be undone.`)) return;
+      await fetch(`/api/reader/documents/${id}`, { method: 'DELETE' });
+      if (currentDocId === id) closeDocument();
+      loadDocList();
+      return;
+    }
+    if (t.closest('.doc-open')) {
+      if (currentDocId === id && currentDoc && currentDoc.status === 'ready') { closeRail(); return; }
+      openDocument(id);
+    }
+  });
+
+  function finishButton(doc) {
+    const p = progressOf(doc);
+    const label = p && p.done ? 'Mark unread' : 'Mark finished';
+    const icon = p && p.done
+      ? '<path d="M4 12a8 8 0 1 0 2.3-5.7M4 4v4.7h4.7"/>'
+      : '<path d="M5 12.5l4.5 4.5L19 7.5"/>';
+    return `<button class="icon-btn" data-act="finish" title="${label}" aria-label="${label}: ${esc(doc.title)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${icon}</svg></button>`;
+  }
+
+  // Marks a ready document finished (or unread) without listening to the end. Either
+  // way the place rewinds to the start, as reading to the end does.
+  async function markFinished(id, done) {
+    if (id === currentDocId && isPlaying) {
+      // No place on this stop: it would be saved over the mark. A paced stream saves none of its own.
+      playSeqId++;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reader_stop' }));
+      clearAudioQueue();
+      isPlaying = false;
+    }
+    let data;
+    try {
+      const resp = await fetch(`/api/reader/documents/${id}/finished`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ finished: done }),
+      });
+      data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || resp.statusText);
+    } catch (e) {
+      setNotice(`Couldn’t mark it ${done ? 'finished' : 'unread'}: ${e.message || e}`, 'error');
+      return;
+    }
+    setDocProgress(id, data.progress_sentences, data.total_sentences);
+    const row = docList.querySelector(`.doc[data-id="${id}"] [data-act="finish"]`);
+    const entry = docs.find((d) => d.id === id);
+    if (row && entry) row.outerHTML = finishButton(entry);
+    if (id === currentDocId && currentDoc) {
+      currentDoc.progress_sentences = data.progress_sentences;
+      currentDoc.last_chunk = 0;
+      currentDoc.last_sentence = 0;
+      currentChunk = firstChunk();
+      currentSentence = 0;
+      finished = done;
+      stopped = false;
+      setNotice('');
+      showProgress(0);
+      markSentence(currentChunk, currentSentence, false);
+      refreshTransport();
+    }
+  }
+
+  playerFinish.addEventListener('click', () => {
+    if (currentDocId) markFinished(currentDocId, !finished);
+  });
+
+  async function retryDoc(id) {
+    await fetch(`/api/reader/documents/${id}/retry`, { method: 'POST' }).catch(() => {});
+    await loadDocList();
+    if (currentDocId === id) openDocument(id);
+  }
+
   async function loadDocList() {
-    let docs = [];
     try {
       const resp = await fetch('/api/reader/documents');
       const data = await resp.json();
       docs = data.documents || [];
-      if (docs.length === 0) {
-        docList.innerHTML = '<div class="empty-state">No documents yet. Add one above.</div>';
-        return;
-      }
-      docList.innerHTML = '';
-      for (const doc of docs) {
-        const card = document.createElement('div');
-        card.className = 'doc-card';
-        const retryButton = doc.status === 'failed'
-          ? '<button class="dc-retry" title="Retry">retry</button>'
-          : '';
-        const editButton = (doc.status === 'ready' || doc.status === 'failed')
-          ? '<button class="dc-edit" title="Edit">edit</button>'
-          : '';
-        card.innerHTML = `
-          <span class="dc-title">${OctaviusApp.escapeHtml(doc.title)}</span>
-          <span class="dc-status ${doc.status}">${doc.status}</span>
-          ${retryButton}
-          ${editButton}
-          <button class="dc-delete" title="Delete">&times;</button>
-        `;
-        card.addEventListener('click', () => {
-          if (doc.status === 'ready') openDocument(doc.id);
-          else if (doc.status === 'processing') loadDocList();
-        });
-        const retryEl = card.querySelector('.dc-retry');
-        if (retryEl) {
-          retryEl.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            await fetch(`/api/reader/documents/${doc.id}/retry`, { method: 'POST' });
-            loadDocList();
-          });
-        }
-        const editEl = card.querySelector('.dc-edit');
-        if (editEl) {
-          editEl.addEventListener('click', (e) => {
-            e.stopPropagation();
-            openEditBar(doc.id, doc.title, 'list', editMountList);
-          });
-        }
-        card.querySelector('.dc-delete').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          await fetch(`/api/reader/documents/${doc.id}`, { method: 'DELETE' });
-          loadDocList();
-        });
-        docList.appendChild(card);
-      }
-    } catch {
-      docList.innerHTML = '<div class="empty-state">Failed to load.</div>';
+      renderList();
+    } catch (_err) {
+      docList.innerHTML = '<div class="list-empty">Couldn’t load documents. They’ll appear when the server answers.</div>';
     }
 
     clearTimeout(pollTimer);
-    if (docs.some(d => d.status === 'processing')) {
+    if (docs.some((d) => d.status === 'processing')) {
       pollTimer = setTimeout(loadDocList, 5000);
     }
   }
 
-  ingestBtn.addEventListener('click', async () => {
+  searchInput.addEventListener('input', () => {
+    query = searchInput.value;
+    renderList();
+  });
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { searchInput.value = ''; query = ''; renderList(); searchInput.blur(); }
+  });
+
+  statusFilter.addEventListener('click', (event) => {
+    const chip = event.target instanceof Element ? event.target.closest('.chip') : null;
+    if (!chip) return;
+    filter = chip.dataset.filter;
+    statusFilter.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-checked', String(c === chip)));
+    renderList();
+  });
+
+  // ---------- Ingest ----------
+
+  function setAddMsg(text, tone) {
+    addMsg.textContent = text || '';
+    addMsg.dataset.tone = tone || '';
+  }
+
+  ingestForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
     const val = ingestInput.value.trim();
     if (!val) return;
 
@@ -427,36 +1419,41 @@
       title: val.split('/').pop() || 'Document',
     };
 
-    if (isUrl) body.source = 'url';
-
     try {
-      await fetch('/api/reader/documents', {
+      const resp = await fetch('/api/reader/documents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        setAddMsg(err.error || `Couldn’t add that (HTTP ${resp.status}).`, 'error');
+        return;
+      }
       ingestInput.value = '';
+      setAddMsg('Added. It shows as Converting until it’s ready.');
       loadDocList();
     } catch (e) {
       console.error('Ingest failed:', e);
+      setAddMsg('Couldn’t reach the server.', 'error');
     }
   });
 
-  ingestInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') ingestBtn.click();
-  });
-
   function closePasteBar() {
-    pasteBar.classList.remove('active');
+    pasteBar.hidden = true;
+    pasteToggle.setAttribute('aria-expanded', 'false');
     pasteInput.value = '';
     pasteTitle.value = '';
   }
 
   pasteToggle.addEventListener('click', () => {
-    const opening = !pasteBar.classList.contains('active');
-    pasteBar.classList.toggle('active', opening);
-    if (opening) pasteInput.focus();
-    else closePasteBar();
+    if (pasteBar.hidden) {
+      pasteBar.hidden = false;
+      pasteToggle.setAttribute('aria-expanded', 'true');
+      pasteInput.focus();
+    } else {
+      closePasteBar();
+    }
   });
 
   pasteCancel.addEventListener('click', closePasteBar);
@@ -465,7 +1462,7 @@
     const text = pasteInput.value.trim();
     if (!text) return;
 
-    // Title is optional — the server derives one from the first line.
+    // Title is optional; the server derives one from the first line.
     const body = { source: 'text', text };
     const title = pasteTitle.value.trim();
     if (title) body.title = title;
@@ -480,188 +1477,344 @@
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         console.error('Paste ingest failed:', err.error || resp.status);
+        setAddMsg(err.error || `Couldn’t add the text (HTTP ${resp.status}).`, 'error');
         return;
       }
       closePasteBar();
+      setAddMsg('Added. It shows as Converting until it’s ready.');
       loadDocList();
     } catch (e) {
       console.error('Paste ingest failed:', e);
+      setAddMsg('Couldn’t reach the server.', 'error');
     } finally {
       pasteSubmit.disabled = false;
     }
   });
 
-  // Ctrl/Cmd+Enter submits, matching the single-line input's Enter behavior.
-  pasteInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pasteSubmit.click();
+  // Ctrl/Cmd+Enter submits.
+  for (const field of [pasteInput, pasteTitle]) {
+    field.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pasteSubmit.click();
+    });
+  }
+
+  // ---------- Edit panel: rename / append / replace ----------
+
+  const HINT_APPEND = 'The text is cleaned and math is converted to speech, then added to the end. Your place is kept.';
+  const HINT_REPLACE = 'The current content is discarded and the document is rebuilt from this text alone. Your place resets to the start.';
+  function syncEditHint() {
+    editHint.textContent = editReplaceCheckbox.checked ? HINT_REPLACE : HINT_APPEND;
+  }
+  editReplaceCheckbox.addEventListener('change', syncEditHint);
+
+  function showEditError(msg) {
+    editError.textContent = msg || '';
+  }
+
+  function openEditBar() {
+    if (!currentDocId || !currentDoc) return;
+    editDocId = currentDocId;
+    editOrigTitle = currentDoc.title || '';
+    editTitleInput.value = editOrigTitle;
+    editAppendInput.value = '';
+    editReplaceCheckbox.checked = false;
+    syncEditHint();
+    showEditError('');
+    editBar.hidden = false;
+    playerEdit.setAttribute('aria-expanded', 'true');
+    editTitleInput.focus();
+  }
+
+  function closeEditBar() {
+    editBar.hidden = true;
+    playerEdit.setAttribute('aria-expanded', 'false');
+    editDocId = null;
+    editTitleInput.value = '';
+    editAppendInput.value = '';
+    editReplaceCheckbox.checked = false;
+    showEditError('');
+  }
+
+  playerEdit.addEventListener('click', () => {
+    if (editBar.hidden) openEditBar();
+    else closeEditBar();
+  });
+  editCancelBtn.addEventListener('click', closeEditBar);
+
+  editAppendInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) editSaveBtn.click();
+  });
+  editTitleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) editSaveBtn.click();
   });
 
-  // Builds the section list + progress/position state for a document and shows it in the
-  // player. Shared by the initial open and by the append-poll completion, so a document that
-  // grows or is replaced while the player is showing it re-renders the same way it would on
-  // a fresh open. `preservePosition: false` (used after a `replace`) resets to the start.
-  function renderDocument(doc, opts) {
-    const preservePosition = !opts || opts.preservePosition !== false;
-    currentDoc = doc;
-    totalSentences = doc.total_sentences || 0;
-    playerTitle.textContent = doc.title;
-
-    sectionsEl.innerHTML = '';
-    const sections = doc.sections || [];
-    let sentenceOffset = 0;
-    for (const sec of sections) {
-      if (!sec.heading) {
-        sentenceOffset += sec.sentence_count;
-        continue;
-      }
-      const item = document.createElement('div');
-      item.className = 'section-item';
-      item.dataset.chunk = sec.index;
-      item.dataset.sentenceOffset = sentenceOffset;
-      item.textContent = sec.heading;
-      item.addEventListener('click', () => seekTo(sec.index, 0));
-      sectionsEl.appendChild(item);
-      sentenceOffset += sec.sentence_count;
-    }
-
-    progressBar.max = totalSentences;
-    if (preservePosition) {
-      currentChunk = doc.last_chunk || 0;
-      currentSentence = doc.last_sentence || 0;
-    } else {
-      currentChunk = 0;
-      currentSentence = 0;
-    }
-
-    let savedGlobal = 0;
-    for (const sec of sections) {
-      if (sec.index < currentChunk) savedGlobal += sec.sentence_count;
-      else if (sec.index === currentChunk) {
-        savedGlobal += currentSentence;
-        break;
-      }
-    }
-
-    progressBar.value = savedGlobal;
-    progressCur.textContent = savedGlobal;
-    progressTot.textContent = totalSentences;
-    readAlong.innerHTML = currentChunk > 0 || currentSentence > 0
-      ? '<span style="color:#666">Resuming from saved position...</span>'
-      : '';
-    isPlaying = false;
-    playPauseBtn.innerHTML = '&#9654;';
-
-    document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
-    if (currentChunk > 0) {
-      const secEl = document.querySelector(`.section-item[data-chunk="${currentChunk}"]`);
-      if (secEl) secEl.classList.add('active');
-    }
+  function stopAppendPoll() {
+    clearTimeout(editPollTimer);
+    editPollTimer = null;
   }
 
-  async function openDocument(docId) {
-    try {
-      const resp = await fetch(`/api/reader/documents/${docId}`);
-      const data = await resp.json();
-      currentDocId = docId;
-      stopAppendPoll();
-      closeEditBar();
-
-      listView.style.display = 'none';
-      playerDiv.classList.add('active');
-
-      renderDocument(data.document, { preservePosition: true });
-    } catch (e) {
-      console.error('Failed to open document:', e);
-    }
-  }
-
-  playerBack.addEventListener('click', () => {
-    if (isPlaying) sendPause();
-    clearAudioQueue();
+  function startAppendPoll(docId, replace) {
     stopAppendPoll();
-    closeEditBar();
-    playerDiv.classList.remove('active');
-    listView.style.display = '';
-    currentDocId = null;
-    currentDoc = null;
-    loadDocList();
-  });
+    setNotice('Processing the new text…');
+    let failures = 0;
 
-  function sendPlay(chunkIdx, sentIdx) {
-    if (!ws || ws.readyState !== WebSocket.OPEN || !currentDocId) return;
+    // Transient failures retry on the normal cadence; a run of them stops the poll
+    // with a visible message rather than leaving "Processing…" up forever.
+    function retry() {
+      if (currentDocId !== docId) return;
+      failures++;
+      if (failures >= 5) {
+        editPollTimer = null;
+        setNotice('Lost track of the update. Reopen the document to check.', 'error');
+        return;
+      }
+      editPollTimer = setTimeout(poll, 3000);
+    }
 
-    if (isPlaying) ws.send(JSON.stringify({ type: 'reader_pause' }));
-    clearAudioQueue();
-
-    playSeqId++;
-    const mySeq = playSeqId;
-    setTimeout(() => {
-      if (mySeq !== playSeqId) return;
-      ws.send(JSON.stringify({
-        type: 'reader_play',
-        doc_id: currentDocId,
-        chunk_index: chunkIdx !== undefined ? chunkIdx : currentChunk,
-        sentence_index: sentIdx !== undefined ? sentIdx : currentSentence,
-        voice: voiceSelect.value,
-        seq: mySeq,
-      }));
-      isPlaying = true;
-      playPauseBtn.innerHTML = '&#10074;&#10074;';
-    }, 100);
+    function poll() {
+      if (currentDocId !== docId) return; // stale poll for a doc we've navigated away from
+      fetch(`/api/reader/documents/${docId}`)
+        .then((resp) => (resp.ok ? resp.json() : Promise.reject(new Error('HTTP ' + resp.status))))
+        .then((data) => {
+          if (currentDocId !== docId) return;
+          const doc = data.document;
+          if (!doc) { retry(); return; }
+          failures = 0;
+          if (doc.status === 'processing') {
+            editPollTimer = setTimeout(poll, 3000);
+            return;
+          }
+          editPollTimer = null;
+          loadDocList();
+          if (doc.status === 'failed') {
+            renderDocument(doc, { preservePosition: true });
+            return;
+          }
+          if (doc.error) {
+            // A failed append on a previously-ready document comes back `ready` with
+            // `error` set and its content untouched: report it as a failure.
+            currentDoc = Object.assign(currentDoc || {}, { error: doc.error, title: doc.title });
+            setNotice(`The new text wasn’t added: ${doc.error}`, 'error');
+            return;
+          }
+          renderDocument(doc, { preservePosition: !replace, keepFlips: !replace });
+        })
+        .catch(retry);
+    }
+    poll();
   }
 
-  function sendPause() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    playSeqId++;
-    ws.send(JSON.stringify({ type: 'reader_pause' }));
-    clearAudioQueue();
-    isPlaying = false;
-    playPauseBtn.innerHTML = '&#9654;';
-  }
+  async function saveEdit() {
+    const docId = editDocId;
+    if (docId == null) return;
 
-  function seekTo(chunkIdx, sentIdx) {
-    currentChunk = chunkIdx;
-    currentSentence = sentIdx;
+    const rawTitle = editTitleInput.value.trim();
+    const titleChanged = !!rawTitle && rawTitle !== editOrigTitle;
+    const text = editAppendInput.value.trim();
+    const replace = editReplaceCheckbox.checked;
 
-    document.querySelectorAll('.section-item.active').forEach(el => el.classList.remove('active'));
-    const secEl = document.querySelector(`.section-item[data-chunk="${chunkIdx}"]`);
-    if (secEl) secEl.classList.add('active');
+    if (!titleChanged && !text) {
+      closeEditBar();
+      return;
+    }
 
-    if (isPlaying) sendPlay(chunkIdx, sentIdx);
-  }
+    if (text && replace) {
+      if (!confirm('Replace the whole document? Your place resets to the start.')) return;
+    }
 
-  playPauseBtn.addEventListener('click', () => {
-    if (isPlaying) sendPause();
-    else sendPlay(currentChunk, currentSentence);
-  });
-
-  skipBack.addEventListener('click', () => {
-    const newChunk = Math.max(0, currentChunk - 1);
-    seekTo(newChunk, 0);
-  });
-
-  skipFwd.addEventListener('click', () => {
-    const sections = currentDoc?.sections || [];
-    const maxChunk = sections.length > 0 ? sections[sections.length - 1].index : 0;
-    const newChunk = Math.min(maxChunk, currentChunk + 1);
-    seekTo(newChunk, 0);
-  });
-
-  progressBar.addEventListener('input', () => {
-    clearTimeout(seekDebounce);
-    seekDebounce = setTimeout(() => {
-      const target = parseInt(progressBar.value, 10);
-      const sections = currentDoc?.sections || [];
-      let accum = 0;
-      for (const sec of sections) {
-        if (accum + sec.sentence_count > target) {
-          seekTo(sec.index, target - accum);
+    editSaveBtn.disabled = true;
+    showEditError('');
+    try {
+      if (titleChanged) {
+        const resp = await fetch(`/api/reader/documents/${docId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: rawTitle }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showEditError(resp.status === 409
+            ? 'Still processing. Try again in a moment.'
+            : (data.error || 'Rename failed.'));
           return;
         }
-        accum += sec.sentence_count;
+        editOrigTitle = data.title;
+        if (currentDocId === docId) {
+          playerTitle.textContent = data.title;
+          const h = sectionsEl.querySelector('.text-title');
+          if (h) h.textContent = data.title;
+          if (currentDoc) currentDoc.title = data.title;
+        }
+        loadDocList();
       }
-    }, 200);
+
+      if (text) {
+        if (isPlaying) sendPause();
+        const resp = await fetch(`/api/reader/documents/${docId}/append`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, replace }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          const why = resp.status === 409
+            ? 'Still processing. Try again in a moment.'
+            : (data.error || 'Append failed.');
+          // The rename above already landed; say so rather than implying nothing changed.
+          showEditError(titleChanged ? 'Title saved. ' + why : why);
+          return;
+        }
+        closeEditBar();
+        if (currentDocId === docId) startAppendPoll(docId, replace);
+        loadDocList();
+        return;
+      }
+
+      closeEditBar();
+    } catch (e) {
+      showEditError('Save failed.');
+    } finally {
+      editSaveBtn.disabled = false;
+    }
+  }
+
+  editSaveBtn.addEventListener('click', saveEdit);
+
+  // ---------- Drawer (narrow screens) ----------
+
+  function openRail() {
+    shell.classList.add('rail-open');
+    scrim.hidden = false;
+  }
+  function closeRail() {
+    shell.classList.remove('rail-open');
+    scrim.hidden = true;
+  }
+  railOpen.addEventListener('click', openRail);
+  railClose.addEventListener('click', closeRail);
+  scrim.addEventListener('click', closeRail);
+
+  // ---------- Resizable side panels (wide screens only) ----------
+
+  // Each handle sets a CSS variable on :root (--rail-w / --chat-w) and remembers it.
+  // Drag, or focus the handle and use the arrow keys; double-click resets.
+  const WIDE = window.matchMedia('(min-width: 861px)');
+  const PANELS = [
+    { handle: $('rail-resizer'), cssVar: '--rail-w', pref: 'railW', min: 220, max: () => Math.min(560, innerWidth * 0.4), edge: 'left' },
+    { handle: $('chat-resizer'), cssVar: '--chat-w', pref: 'chatW', min: 300, max: () => Math.min(820, innerWidth * 0.55), edge: 'right' },
+  ];
+  function clampWidth(panel, px) {
+    return Math.round(Math.max(panel.min, Math.min(panel.max(), px)));
+  }
+  function setPanelWidth(panel, px, save) {
+    if (px == null) {
+      document.documentElement.style.removeProperty(panel.cssVar);
+    } else {
+      document.documentElement.style.setProperty(panel.cssVar, clampWidth(panel, px) + 'px');
+    }
+    if (save) savePrefs({ [panel.pref]: px == null ? null : clampWidth(panel, px) });
+  }
+  for (const panel of PANELS) {
+    if (!panel.handle) continue;
+    const stored = Number(prefs[panel.pref]);
+    if (stored > 0) setPanelWidth(panel, stored, false);
+    const current = () => panel.handle.parentElement.getBoundingClientRect().width;
+    panel.handle.addEventListener('pointerdown', (event) => {
+      if (!WIDE.matches || event.button !== 0) return;
+      event.preventDefault();
+      panel.handle.setPointerCapture(event.pointerId);
+      document.body.classList.add('resizing');
+      const startX = event.clientX;
+      const startW = current();
+      const move = (e) => {
+        const dx = e.clientX - startX;
+        setPanelWidth(panel, panel.edge === 'left' ? startW + dx : startW - dx, false);
+      };
+      const end = () => {
+        panel.handle.removeEventListener('pointermove', move);
+        panel.handle.removeEventListener('pointerup', end);
+        panel.handle.removeEventListener('pointercancel', end);
+        document.body.classList.remove('resizing');
+        savePrefs({ [panel.pref]: Math.round(current()) });
+      };
+      panel.handle.addEventListener('pointermove', move);
+      panel.handle.addEventListener('pointerup', end);
+      panel.handle.addEventListener('pointercancel', end);
+    });
+    panel.handle.addEventListener('dblclick', () => setPanelWidth(panel, null, true));
+    panel.handle.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      event.stopPropagation();  // not a sentence step
+      const grow = (event.key === 'ArrowRight') === (panel.edge === 'left');
+      setPanelWidth(panel, current() + (grow ? 24 : -24), true);
+    });
+  }
+  // A narrower window re-clamps the saved widths so the reading column keeps its room.
+  window.addEventListener('resize', () => {
+    for (const panel of PANELS) {
+      const stored = Number(loadPrefs()[panel.pref]);
+      if (stored > 0) setPanelWidth(panel, stored, false);
+    }
   });
+
+  // ---------- Keyboard ----------
+
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable ||
+      (tag === 'INPUT' && !['checkbox', 'radio', 'range', 'button'].includes(el.type));
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      if (!editBar.hidden && editBar.contains(document.activeElement)) { closeEditBar(); return; }
+      if (shell.classList.contains('rail-open')) { closeRail(); return; }
+      if (isTypingTarget(document.activeElement)) return;
+      if (isPlaying || audioQueue.length || currentAudio) sendStop();
+      return;
+    }
+    if (isTypingTarget(document.activeElement)) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if ((event.key === 't' || event.key === 'T') && !event.shiftKey) {
+      if (!tocAvailable()) return;
+      event.preventDefault();
+      const narrow = window.matchMedia('(max-width: 860px)').matches;
+      if (narrow && !shell.classList.contains('rail-open')) { selectRailTab('contents'); openRail(); return; }
+      selectRailTab(railTab === 'contents' ? 'library' : 'contents');
+      if (narrow && railTab === 'library') closeRail();
+      return;
+    }
+    if ((event.key === 'v' || event.key === 'V') && !event.shiftKey) {
+      if (viewSeg.hidden) return;
+      event.preventDefault();
+      setViewMode(viewMode === 'original' ? 'reading' : 'original');
+      return;
+    }
+    if (event.key === '/') {
+      event.preventDefault();
+      selectRailTab('library');
+      if (window.matchMedia('(max-width: 860px)').matches) openRail();
+      searchInput.focus();
+      return;
+    }
+    if (event.code === 'Space' || event.key === ' ') {
+      if (document.activeElement && document.activeElement.type === 'range') return;
+      event.preventDefault();
+      if (!event.repeat) togglePlay();
+      return;
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      if (document.activeElement && document.activeElement.type === 'range') return;
+      event.preventDefault();
+      const dir = event.key === 'ArrowLeft' ? -1 : 1;
+      if (event.shiftKey) stepSection(dir);
+      else stepSentence(dir);
+    }
+  });
+
+  // ---------- Boot ----------
 
   const params = new URLSearchParams(location.search);
   const inboxId = params.get('inbox_id');
@@ -671,12 +1824,102 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: 'inbox', saved_item_id: parseInt(inboxId, 10) }),
     }).then(() => loadDocList());
+    // Don't re-ingest the same inbox item if the page is reloaded.
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('inbox_id');
+      history.replaceState(null, '', url);
+    } catch (_err) {
+    }
   }
+
+  // Hook for the chat panel (reader-chat.js). onDocChange fires on every open, re-render
+  // (title or status changes included) and close; listeners compare ids themselves.
+  const docChangeCbs = [];
+  function notifyDocChange() {
+    for (const cb of docChangeCbs) {
+      try { cb(); } catch (err) { console.error('onDocChange listener failed:', err); }
+    }
+  }
+  // The chat's "here": a selection in the document if Dave made one since the place last
+  // moved, else the marked sentence (playing, paused, or clicked while paused; a click
+  // never reaches the server, so the page is the only one that knows it).
+  let lastSelection = null;
+  // A selection in an Original-view chunk names the whole chunk: its first sentence for
+  // the start of the selection, its last for the end (the original has no sentence map).
+  function sentenceOf(node, atEnd) {
+    const el = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
+    if (!el || !sectionsEl.contains(el)) return null;
+    const s = el.closest('.s');
+    if (s) return [Number(s.dataset.c), Number(s.dataset.s)];
+    const orig = el.closest('.sec-orig');
+    if (!orig) return null;
+    const c = Number(orig.closest('.sec').dataset.c);
+    if (!atEnd) return [c, 0];
+    const sec = (currentDoc && currentDoc.sections || []).find((x) => x.index === c);
+    return [c, Math.max(0, ((sec && sec.sentence_count) || 1) - 1)];
+  }
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const range = sel.getRangeAt(0);
+    if (sel.isCollapsed) {
+      // A click inside the document drops the selection; focus moving to the chat box does not.
+      if (sectionsEl.contains(range.startContainer)) lastSelection = null;
+      return;
+    }
+    const a = sentenceOf(range.startContainer);
+    const b = sentenceOf(range.endContainer, true);
+    if (!a || !b || !currentDocId) return;
+    lastSelection = { doc_id: currentDocId, chunk_index: a[0], sentence_index: a[1],
+                      end_chunk_index: b[0], end_sentence_index: b[1], text: String(sel).slice(0, 200) };
+  });
+  function chatPlace() {
+    if (!currentDocId) return {};
+    if (lastSelection && lastSelection.doc_id === currentDocId) return lastSelection;
+    return { doc_id: currentDocId, chunk_index: currentChunk, sentence_index: currentSentence };
+  }
+
+  // A chat citation: show that paragraph without moving the place (playing or not).
+  // "Back to the current sentence" returns, as after scrolling away by hand.
+  let peekTimer = null;
+  function chunkEl(chunkIdx) {
+    const sec = (currentDoc && currentDoc.sections || []).find((x) => x.index === chunkIdx);
+    if (!sec) return null;
+    for (let i = 0; i < (sec.sentence_count || 0); i++) {
+      const el = sentenceEls.get(chunkIdx + ':' + i);
+      if (el) return el.closest('.sec');
+    }
+    return sectionsEl.querySelector(`.sec-head[data-c="${chunkIdx}"]`)?.closest('.sec') || null;
+  }
+  function peek(chunkIdx) {
+    const el = chunkEl(chunkIdx);
+    if (!el) return false;
+    follow = false;
+    followBtn.hidden = !markedEl;
+    sectionsEl.querySelectorAll('.sec.cited').forEach((x) => x.classList.remove('cited'));
+    el.classList.add('cited');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(() => el.classList.remove('cited'), 4000);
+    return true;
+  }
+
+  window.OctaviusReader = {
+    currentDoc() { return currentDoc ? { id: currentDoc.id, title: currentDoc.title } : null; },
+    heardPlace,
+    place: chatPlace,
+    clearSelection() { lastSelection = null; },
+    pause() { if (isPlaying) sendPause(); },
+    onDocChange(cb) { if (typeof cb === 'function') docChangeCbs.push(cb); },
+    hasChunk(chunkIdx) { return !!chunkEl(chunkIdx); },
+    peek,
+  };
 
   const docIdParam = params.get('doc_id');
   if (docIdParam) openDocument(parseInt(docIdParam, 10));
 
+  refreshTransport();
   connectWS();
-  if (!inboxId && !docIdParam) loadDocList();
-  else if (!docIdParam) loadDocList();
+  if (!inboxId) loadDocList();
 })();

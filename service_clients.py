@@ -125,127 +125,27 @@ class STTClient:
 
 
 class TTSClient:
-    """
-    Voice-routed TTS.
+    """Phonon TTS, one endpoint (Voxtral was retired 2026-10-31).
 
-    When `primary_enabled` is False (the default), Voxtral is never attempted:
-    every call goes to Kokoro. Kokoro voices speak in their own voice; voices
-    that only exist on Voxtral (e.g. de_male) are remapped to the configured
-    fallback voice. This is the practical setup because Voxtral requires too
-    much VRAM to run reliably.
-
-    When `primary_enabled` is True, the original voice-routed behavior applies:
-
-    - Voices in `kokoro_voices` go straight to the fallback (Kokoro) endpoint,
-      with no Voxtral attempt and no breaker interaction.
-    - Any other voice is treated as a primary (Voxtral) voice and goes through
-      the primary → fallback path with a circuit breaker on the primary.
-
-    Breaker behavior (only relevant when `primary_enabled` is True): after
-    PRIMARY_FAILURE_THRESHOLD consecutive failures the primary is "tripped":
-    subsequent synth calls on primary voices skip it entirely and go to the
-    fallback with its own voice for PRIMARY_COOLDOWN_SECONDS. When the cooldown
-    elapses the next primary-voice call probes the primary again ("half-open");
-    a success closes the breaker, a failure re-trips it.
+    A voice the endpoint does not have is sent as the default voice instead:
+    Phonon 400s on unknown names, and the sentence would play silent.
     """
 
-    PRIMARY_FAILURE_THRESHOLD = 3
-    PRIMARY_COOLDOWN_SECONDS = 300.0
-
-    def __init__(
-        self,
-        primary: dict,
-        fallback: dict,
-        response_format: str,
-        kokoro_voices: list[str] | None = None,
-        primary_enabled: bool = True,
-    ):
-        self.primary = primary
-        self.fallback = fallback
+    def __init__(self, url: str, model: str, voice: str, voices: list[str], response_format: str):
+        self.url = url
+        self.model = model
+        self.voice = voice
+        self._voices = set(voices)
         self.response_format = response_format
-        self._kokoro_voices = set(kokoro_voices or [])
-        self._primary_enabled = primary_enabled
-        self._primary_consecutive_failures = 0
-        self._primary_skip_until = 0.0  # monotonic; 0 means breaker closed
-
-    def _primary_is_tripped(self) -> bool:
-        return time.monotonic() < self._primary_skip_until
-
-    def _record_primary_success(self) -> None:
-        if self._primary_consecutive_failures or self._primary_skip_until:
-            log.info("TTS primary recovered, closing breaker")
-        self._primary_consecutive_failures = 0
-        self._primary_skip_until = 0.0
-
-    def _record_primary_failure(self) -> None:
-        self._primary_consecutive_failures += 1
-        if self._primary_consecutive_failures >= self.PRIMARY_FAILURE_THRESHOLD:
-            self._primary_skip_until = time.monotonic() + self.PRIMARY_COOLDOWN_SECONDS
-            log.warning(
-                "TTS primary tripped breaker after %d consecutive failures; "
-                "skipping primary for %.0fs",
-                self._primary_consecutive_failures,
-                self.PRIMARY_COOLDOWN_SECONDS,
-            )
 
     async def synthesize(self, text: str, voice: str | None = None) -> bytes:
         async with httpx.AsyncClient(timeout=CHAIN_TIMEOUT) as client:
-            # When primary (Voxtral) is disabled, route everything to Kokoro:
-            # Kokoro voices speak in their voice; other voices fall back to
-            # the configured fallback voice. The breaker is never touched.
-            if not self._primary_enabled:
-                kokoro_voice = (
-                    voice if voice in self._kokoro_voices else self.fallback["voice"]
-                )
-                resp = await client.post(
-                    self.fallback["url"],
-                    json={
-                        "input": text,
-                        "voice": kokoro_voice,
-                        "model": self.fallback["model"],
-                        "response_format": self.response_format,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.content
-
-            if voice and voice in self._kokoro_voices:
-                resp = await client.post(
-                    self.fallback["url"],
-                    json={
-                        "input": text,
-                        "voice": voice,
-                        "model": self.fallback["model"],
-                        "response_format": self.response_format,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.content
-
-            if not self._primary_is_tripped():
-                try:
-                    resp = await client.post(
-                        self.primary["url"],
-                        json={
-                            "input": text,
-                            "voice": voice or self.primary["voice"],
-                            "model": self.primary["model"],
-                            "response_format": self.response_format,
-                        },
-                    )
-                    resp.raise_for_status()
-                    self._record_primary_success()
-                    return resp.content
-                except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                    self._record_primary_failure()
-                    log.warning("Primary TTS failed (%s), falling back", exc)
-
             resp = await client.post(
-                self.fallback["url"],
+                self.url,
                 json={
                     "input": text,
-                    "voice": self.fallback["voice"],
-                    "model": self.fallback["model"],
+                    "voice": voice if voice in self._voices else self.voice,
+                    "model": self.model,
                     "response_format": self.response_format,
                 },
             )
@@ -987,19 +887,11 @@ class EmbeddingClient:
 
 stt_client = STTClient(settings.stt_url)
 tts_client = TTSClient(
-    primary={
-        "url": settings.tts.url,
-        "model": settings.tts.model,
-        "voice": settings.tts.voice,
-    },
-    fallback={
-        "url": settings.tts.fallback_url,
-        "model": settings.tts.fallback_model,
-        "voice": settings.tts.fallback_voice,
-    },
+    url=settings.tts.url,
+    model=settings.tts.model,
+    voice=settings.tts.voice,
+    voices=settings.tts.voices,
     response_format=settings.tts.format,
-    kokoro_voices=settings.tts.kokoro_voices,
-    primary_enabled=settings.tts.voxtral_enabled,
 )
 llm_client = LLMChainClient(settings.llm_chain)
 subagent_llm_client = LLMChainClient(settings.subagent_llm_chain)

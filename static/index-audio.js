@@ -2,6 +2,7 @@
   function createStreamingAudioPlayer(options) {
     const {
       getPlaybackRate,
+      getMathPlaybackRate, // a formula's speed; never faster than getPlaybackRate
       shouldTrimSilence,
       shouldNormalizeVolume,
       onPlaybackStart,
@@ -13,6 +14,14 @@
     let audioDone = false;
     let isPlaying = false;
     let currentAudio = null;
+    let currentIsMath = false;
+    let analyser = null;
+    let levelBuf = null;
+
+    function currentRate() {
+      const rate = getPlaybackRate ? getPlaybackRate() : 1.0;
+      return currentIsMath && getMathPlaybackRate ? Math.min(rate, getMathPlaybackRate()) : rate;
+    }
 
     function getAudioCtx() {
       if (!audioCtx) audioCtx = new AudioContext();
@@ -28,7 +37,15 @@
       const silenceThreshold = 0.008;
       const windowSize = Math.floor(sampleRate * 0.025);
       const minSilenceDuration = Math.floor(sampleRate * 0.4);
-      const keepSilence = Math.floor(sampleRate * 0.25);
+      // A shortened pause keeps some of its silence on BOTH sides. Phonon's
+      // words start soft: 125-210 ms of onset sit under silenceThreshold
+      // (measured 2026-11-08, every voice), so keeping only the start of a
+      // pause and jumping to the first loud window cut the start of every
+      // sentence. keepBefore covers that onset; keepAfter/keepTail cover the
+      // fade after a word, and keepTail is the clip's own ending.
+      const keepBefore = Math.floor(sampleRate * 0.3);
+      const keepAfter = Math.floor(sampleRate * 0.12);
+      const keepTail = Math.floor(sampleRate * 0.35);
 
       function rms(start, end) {
         let sum = 0;
@@ -68,9 +85,12 @@
       const segments = [];
       let pos = 0;
       for (const region of silentRegions) {
-        if (region.start > pos) segments.push({ start: pos, end: region.start });
-        segments.push({ start: region.start, end: Math.min(region.start + keepSilence, region.end) });
-        pos = region.end;
+        const atEnd = region.end >= len;
+        const head = region.start === 0 ? 0 : (atEnd ? keepTail : keepAfter);
+        const lead = atEnd ? 0 : keepBefore;
+        if (head + lead >= region.end - region.start) continue; // nothing worth cutting
+        segments.push({ start: pos, end: region.start + head });
+        pos = region.end - lead;
       }
       if (pos < len) segments.push({ start: pos, end: len });
 
@@ -184,6 +204,25 @@
       return out;
     }
 
+    // Route a playing <audio> through an AnalyserNode so the UI can follow
+    // the reply's loudness. Only when the AudioContext is already running:
+    // routing through a suspended context would play silence, so in that
+    // case the element plays directly and the level just reads as zero.
+    function attachAnalyser(audio) {
+      try {
+        const ctx = getAudioCtx();
+        if (ctx.state !== 'running') return;
+        if (!analyser) {
+          analyser = ctx.createAnalyser();
+          analyser.fftSize = 1024;
+          analyser.connect(ctx.destination);
+          levelBuf = new Float32Array(analyser.fftSize);
+        }
+        ctx.createMediaElementSource(audio).connect(analyser);
+      } catch (_err) {
+      }
+    }
+
     function setIdle() {
       isPlaying = false;
       currentAudio = null;
@@ -202,7 +241,8 @@
       }
 
       isPlaying = true;
-      let arrayBuffer = audioQueue.shift();
+      const clip = audioQueue.shift();
+      let arrayBuffer = clip.data;
 
       const trimEnabled = shouldTrimSilence && shouldTrimSilence();
       const normalizeEnabled = shouldNormalizeVolume && shouldNormalizeVolume();
@@ -218,12 +258,20 @@
         }
       }
 
+      try {
+        const ctx = getAudioCtx();
+        if (ctx.state === 'suspended') await ctx.resume();
+      } catch (_err) {
+      }
+
       const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.preservesPitch = true;
-      audio.playbackRate = getPlaybackRate ? getPlaybackRate() : 1.0;
+      currentIsMath = clip.math;
+      audio.playbackRate = currentRate();
       currentAudio = audio;
+      attachAnalyser(audio);
 
       audio.onended = () => {
         URL.revokeObjectURL(url);
@@ -241,8 +289,8 @@
     }
 
     return {
-      enqueueAudio(arrayBuffer) {
-        audioQueue.push(arrayBuffer);
+      enqueueAudio(arrayBuffer, math = false) {
+        audioQueue.push({ data: arrayBuffer, math });
         if (onPlaybackStart) onPlaybackStart();
         if (!isPlaying) playNext();
       },
@@ -262,9 +310,19 @@
         }
         setIdle();
       },
+      isActive() {
+        return isPlaying || audioQueue.length > 0;
+      },
+      getLevel() {
+        if (!analyser || !currentAudio || currentAudio.paused) return 0;
+        analyser.getFloatTimeDomainData(levelBuf);
+        let sum = 0;
+        for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
+        return Math.min(1, Math.sqrt(sum / levelBuf.length) * 5);
+      },
       updatePlaybackRate() {
         if (currentAudio) {
-          currentAudio.playbackRate = getPlaybackRate ? getPlaybackRate() : 1.0;
+          currentAudio.playbackRate = currentRate();
         }
       },
     };

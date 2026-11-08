@@ -64,7 +64,9 @@ async def inbox_update(item_id: int, request: Request):
 async def inbox_delete(item_id: int, request: Request):
     try:
         with connect_db(request.app.state.db_path) as conn:
-            conn.execute("DELETE FROM saved_item_embeddings WHERE saved_item_id = ?", (item_id,))
+            # No companion vector delete: the library's sidecars are pruned by
+            # the next `hybrid-corpus run history`, which notices the source row
+            # has vanished. (This used to DELETE FROM saved_item_embeddings.)
             cursor = conn.execute("DELETE FROM saved_items WHERE id = ?", (item_id,))
             conn.commit()
     except sqlite3.IntegrityError:

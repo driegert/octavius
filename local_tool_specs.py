@@ -74,7 +74,7 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path to the document (PDF or markdown).",
+                        "description": "File path to the document (PDF or markdown). Only files under the downloads folders, the media spool, the paper library or ~/school_lab, never hidden files, are allowed.",
                     },
                     "text": {
                         "type": "string",
@@ -103,7 +103,7 @@ TOOLS = [
             "name": "read_note",
             "description": (
                 "Read a note from Dave's vault by its path (as returned by "
-                "save_note or search_vault). Returns the note's title, full "
+                "save_note or vault_search). Returns the note's title, full "
                 "content, and a base_hash you pass back when editing it."
             ),
             "parameters": {
@@ -231,6 +231,65 @@ TOOLS = [
                         "description": "Max documents to return (1-50, default 20).",
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reader_document_outline",
+            "description": (
+                "The outline of a reader document: its title, size, and section "
+                "headings with the chunk index each starts at. Start here when Dave "
+                "asks about a document he is reading."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "Reader document id."},
+                },
+                "required": ["document_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_reader_document",
+            "description": (
+                "Read the text of a reader document, a few chunks (paragraphs) at a "
+                "time, by chunk index from reader_document_outline or "
+                "search_reader_document. Returns up to about 6000 characters and says "
+                "where to continue."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "Reader document id."},
+                    "start_chunk": {"type": "integer", "description": "First chunk to read (0-based)."},
+                    "end_chunk": {"type": "integer", "description": "Last chunk to read (default start_chunk + 2)."},
+                },
+                "required": ["document_id", "start_chunk"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_reader_document",
+            "description": (
+                "Keyword search within one reader document. Returns the best-matching "
+                "chunks with their index and section; read around a hit with "
+                "read_reader_document."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "Reader document id."},
+                    "query": {"type": "string", "description": "Words to look for."},
+                    "limit": {"type": "integer", "description": "Max chunks (1-10, default 5)."},
+                },
+                "required": ["document_id", "query"],
             },
         },
     },

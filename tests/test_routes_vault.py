@@ -25,6 +25,10 @@ class _FakeMCP:
         self.calls.append((name, arguments, max_chars))
         return self.payload
 
+    async def call_server_tool(self, server_name, tool_name, arguments, max_chars=None):
+        self.calls.append((f"{server_name}:{tool_name}", arguments, max_chars))
+        return self.payload
+
 
 @unittest.skipUnless(TestClient, "fastapi not installed")
 class VaultRoutesTests(VaultTestCase):
@@ -116,9 +120,10 @@ class VaultRoutesTests(VaultTestCase):
             [r["path"] for r in results], ["00-zettelkasten/001-Fleeting/hit.md"]
         )
         self.assertEqual(results[0]["title"], "Hit")
-        # Untruncated proxy call against the search_vault MCP tool.
+        # Untruncated proxy call against the vault server's `search` tool
+        # (renamed from `search_vault` 2026-09-23), addressed by server key.
         name, arguments, max_chars = self.app.state.mcp_manager.calls[0]
-        self.assertEqual(name, "search_vault")
+        self.assertEqual(name, "vault-search:search")
         self.assertEqual(arguments["query"], "hit")
         self.assertIsNone(max_chars)
 

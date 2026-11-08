@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -102,8 +102,7 @@ def _role_single(role: str, key: str, env_var: str, default, index: int = 0):
     """One field of a single-endpoint role (reader, summary), same precedence.
 
     index=1 addresses the optional second entry of a role — the reader's
-    failover target. A missing entry yields `default` (None), so a one-entry
-    role keeps its single-endpoint behaviour.
+    failover target. A missing entry yields `default`.
     """
     raw = os.getenv(env_var)
     if raw:
@@ -120,20 +119,95 @@ def _role_single(role: str, key: str, env_var: str, default, index: int = 0):
 class TTSSettings:
     url: str
     model: str
+    # The server's default (the reader's, and any client that sends none).
     voice: str
+    # The agent's default on the main page, until Dave picks one.
+    agent_voice: str
     format: str
     voices: list[str]
-    voxtral_voices: list[str]
-    kokoro_voices: list[str]
-    fallback_url: str
-    fallback_model: str
-    fallback_voice: str
-    # When False (default), Voxtral is never attempted: all synth calls go
-    # straight to Kokoro, with Voxtral-only voices remapped to the fallback
-    # voice. Voxtral's voice quality is fine, but its inconsistent sound levels
-    # make it unsuitable as the live primary. Set OCTAVIUS_TTS_VOXTRAL_ENABLED=1
-    # to restore the primary→fallback path with circuit breaker.
-    voxtral_enabled: bool = False
+    female_voices: list[str]
+
+    def agent_name(self, voice: str | None) -> str:
+        """The agent is Octavja in a female voice, Octavius otherwise."""
+        return "Octavja" if voice in self.female_voices else "Octavius"
+
+
+# lilbuddy 26B 295k, lilripper :8020 262144, workhorse 64K (see docs/pi-backend-design.md).
+DEFAULT_PI_MODEL_CONTEXTS = {
+    "lb-unified/gemma4-26b-a4b": 295000,
+    "lrv-p01/qwen3.8-27b": 262144,
+    "wh-vllm/gemma4-12b": 65536,
+}
+
+# Models Dave can pick in /reader's chat panel; the first is the default. `thinking` is a pi
+# thinking level, or null for the level the process starts with. The 12B without thinking
+# answers a document question in ~1-2 s where the 26B thinks for 8-17 s (measured
+# 2026-10-31), and the document anchors it; the others are there for questions that matter.
+DEFAULT_PI_READER_MODELS = [
+    {"id": "gemma4-12b", "label": "Gemma4 12B (fast)", "model": "wh-vllm/gemma4-12b", "thinking": "off"},
+    {"id": "gemma4-26b", "label": "Gemma4 26B-A4B", "model": "lb-unified/gemma4-26b-a4b", "thinking": None},
+    {"id": "qwen3.8-27b", "label": "Qwen3.8 27B", "model": "lrv-p01/qwen3.8-27b", "thinking": None},
+    {"id": "glm-5.3-flash", "label": "GLM-5.3 Flash", "model": "lr-p23/glm-5.3-flash", "thinking": None},
+]
+
+# Models Dave can pick for the agent's own conversations (`chat_model` WS frame,
+# GET /api/chat-models); the first is the default. "auto" (model null) is the shared
+# failover chain with the process's own thinking level: Dave turned thinking off on the
+# agent once (2026-08-26) and reverted it two days later over answer quality, so the
+# default must not be the Reader menu's thinking-off 12B.
+DEFAULT_PI_CHAT_MODELS = [
+    {"id": "auto", "label": "Auto", "model": None, "thinking": None},
+    *DEFAULT_PI_READER_MODELS,
+]
+
+
+@dataclass(frozen=True)
+class PiBrainSettings:
+    """pi as the turn brain (docs/pi-backend-design.md, rollout step 2).
+
+    ``brain`` is "native" (agent.py's loop, the default) or "pi" (a long-lived
+    ``pi --mode rpc`` process per conversation, see pi_brain.py).
+    """
+    brain: str
+    launcher: str
+    pi_bin: str
+    model: str
+    idle_reap_s: float
+    # Directories put in front of PATH for pi only (colon-separated). The user
+    # service's PATH finds the system's Node 18 first, which cannot run pi 1.4.0.
+    path_prepend: str
+    turn_timeout_s: float
+    confirm_timeout_s: float
+    # /warm cache warming (rollout step 3): fire-and-forget, never on a turn's path.
+    warm: bool = True
+    warm_debounce_s: float = 5.0
+    warm_retry_s: float = 60.0
+    # Failover (rollout step 4): the hops after `model`, in order, as pi provider/model ids.
+    fallback_models: tuple = ("lrv-p01/qwen3.8-27b", "wh-vllm/gemma4-12b")
+    # How long failed-over processes stay on a fallback before the next turn tries `model` again.
+    failover_cooldown_s: float = 300.0
+    # Longest the model may go without a streaming event (thinking deltas count), from the
+    # prompt or from a tool result, before the hop is declared a zombie and the turn moves on.
+    silence_timeout_s: float = 30.0
+    # The first model output after a prompt gets a larger budget: the real request can wait up
+    # to 20 s for an in-flight /warm and then pays a cold prefill. The silence limit takes over
+    # after the first output and after tool results.
+    first_output_timeout_s: float = 60.0
+    # A tool that runs longer than this is cut off with a spoken apology (3x for the subagent tool).
+    tool_timeout_s: float = 120.0
+    # Context window (tokens) per hop, for moving a context-overflow turn to a bigger one.
+    # A hop missing here is never chosen as the bigger one.
+    model_contexts: dict = field(default_factory=lambda: dict(DEFAULT_PI_MODEL_CONTEXTS))
+    # /reader chat's model menu (DEFAULT_PI_READER_MODELS); OCTAVIUS_PI_READER_MODELS overrides.
+    reader_models: list = field(default_factory=lambda: [dict(m) for m in DEFAULT_PI_READER_MODELS])
+    # The agent's model menu (DEFAULT_PI_CHAT_MODELS); OCTAVIUS_PI_CHAT_MODELS overrides.
+    chat_models: list = field(default_factory=lambda: [dict(m) for m in DEFAULT_PI_CHAT_MODELS])
+    # Loopback MCP server exposing Octavius's own tools to pi (pi_tools_server.py).
+    tools_port: int = 8032
+
+    @property
+    def enabled(self) -> bool:
+        return self.brain == "pi"
 
 
 @dataclass(frozen=True)
@@ -178,7 +252,6 @@ class Settings:
     summary_timeout: int
     embedding_chain: list[dict]
     embedding_timeout: int
-    embedding_sweeper_enabled: bool
     result_summary_max_chars: int
     tag_generation_min_messages: int
     memory_service_url: str
@@ -198,54 +271,34 @@ class Settings:
     # (scheme://host:port). Endpoints absent from the map are called without an
     # Authorization header, as before. Set via OCTAVIUS_LLM_API_KEYS.
     llm_api_keys: dict[str, str]
+    pi_brain: PiBrainSettings
 
 
-DEFAULT_VOXTRAL_VOICES = [
-    "de_male",
-    "de_female",
-    "neutral_male",
-    "neutral_female",
-    "casual_male",
-    "casual_female",
-    "cheerful_female",
-    "ar_male",
-    "es_female",
-    "es_male",
-    "fr_female",
-    "fr_male",
-    "hi_female",
-    "hi_male",
-    "it_female",
-    "it_male",
-    "nl_female",
-    "nl_male",
-    "pt_female",
-    "pt_male",
+# Phonon 31m's voices (the TTS since 2026-10-28). Phonon 400s on unknown names,
+# so list only what GET /v1/audio/voices returns; any other voice is sent as the
+# default. The female ones make the agent Octavja (TTSSettings.agent_name).
+DEFAULT_TTS_VOICES = [
+    "Imogen", "Delia", "Hugh", "Edwin", "Spencer", "Teddy", "Sir Bramwell",
+    "Easton", "Everly", "Freya", "Juniper", "Maeve", "Pippa", "Russell", "Trevor", "Zoey",
 ]
-
-DEFAULT_KOKORO_VOICES = [
-    # American English
-    "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica",
-    "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
-    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
-    "am_michael", "am_onyx", "am_puck", "am_santa",
-    # British English
-    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
-    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
-]
+DEFAULT_TTS_FEMALE_VOICES = ["Imogen", "Delia", "Everly", "Freya", "Juniper", "Maeve", "Pippa", "Zoey"]
 
 
 DEFAULT_TOOL_LABELS = {
     "web_search": "Web Search",
-    "search_emails": "Email Search",
-    "semantic_search": "Email Search",
-    "get_email": "Reading Email",
-    "get_emails": "Reading Emails",
-    "get_conversation": "Reading Email Thread",
-    "list_conversations": "Listing Email Threads",
+    # Email tools carry the `email_` tool_prefix (see DEFAULT_MCP_SERVERS);
+    # upstream names were shortened 2026-09-23 (mcp-tools RENAMES-2026-09.md).
+    "email_keyword_search": "Email Search",
+    "email_semantic_search": "Email Search",
+    "email_hybrid_search": "Email Search",
+    "email_get": "Reading Email",
+    "email_get_many": "Reading Emails",
+    "email_get_conversation": "Reading Email Thread",
+    "email_list_conversations": "Listing Email Threads",
     "email_stats": "Email Stats",
-    "find_similar_responses": "Finding Similar Emails",
-    "extract_from_emails": "Extracting from Emails",
+    "email_find_people": "Finding People",
+    "email_find_similar_responses": "Finding Similar Emails",
+    "email_extract": "Extracting from Emails",
     "search_works": "Academic Search",
     "get_work": "Reading Paper",
     "get_related_works": "Finding Related Papers",
@@ -294,15 +347,17 @@ DEFAULT_TOOL_LABELS = {
     "read_note": "Reading Note",
     "edit_note": "Editing Note",
     "commit_edit": "Saving Edit",
-    "search_vault": "Searching Vault",
+    "vault_search": "Searching Vault",
     "search_papers": "Searching Papers",
     "get_paper": "Reading Paper",
     "read_document": "Preparing Document",
     "list_reader_documents": "Listing Reader Docs",
     "append_to_reader_document": "Extending Document",
+    "reader_document_outline": "Reading Outline",
+    "read_reader_document": "Reading Document",
+    "search_reader_document": "Searching Document",
     "process_pdf": "Processing PDF",
     "consult_specialist": "Consulting Specialist",
-    "hybrid_search": "Email Search",
     "read_url": "Reading Web Page",
 }
 
@@ -311,6 +366,19 @@ DEFAULT_MCP_SERVERS = {
     "evangeline-email": {
         "transport": "http",
         "url": "http://triplestuffed:8251/mcp",
+        # Upstream tool names were shortened on 2026-09-23 (keyword_search,
+        # get, get_many, stats, extract, ... — mcp-tools RENAMES-2026-09.md)
+        # because clients prefix them; this prefix makes the model see
+        # email_keyword_search, email_get, email_stats, ... exactly as pi does.
+        "tool_prefix": "email",
+    },
+    "calendar": {
+        "transport": "http",
+        # mcp-tools' server_calendar.py (calendar-mcp.service), split out of the
+        # email server on 2026-09-23. Loopback like web-search; Octavius must not
+        # start before this unit is up (an unreachable server aborts connect_all).
+        "url": "http://127.0.0.1:8208/mcp",
+        "tool_prefix": "calendar",
     },
     "web-search": {
         "transport": "http",
@@ -355,9 +423,13 @@ DEFAULT_MCP_SERVERS = {
         "transport": "http",
         # Vault search (mcp-tools' server_vault.py) — sqlite-vec + FTS5 BM25
         # over the Obsidian vault, RRF-fused. Local client, co-located with the
-        # vault on triplestuffed. Exposes a single `search_vault` tool; the
-        # 03-personal/Journaling/ subtree is excluded server-side.
+        # vault on triplestuffed. Exposes a single upstream tool `search`
+        # (was `search_vault` until 2026-09-23), shown to the model as
+        # `vault_search` via tool_prefix; routes/vault.py calls it by
+        # (server key, "search"). The 03-personal/Journaling/ subtree is
+        # excluded server-side.
         "url": "http://triplestuffed:8254/mcp",
+        "tool_prefix": "vault",
         "tool_description_suffix": (
             " | Search Dave's Obsidian vault (his personal notes and captured "
             "thoughts). Use for 'what did I note about X', 'find my note on Y', "
@@ -422,38 +494,25 @@ DEFAULT_MCP_SERVERS = {
 }
 
 
-VIKUNJA_PROJECTS: dict[str, int] = {
-    "Inbox": 1,
-    "Teaching and Trent": 9,
-    "math1052": 10,
-    "amod5240": 2,
-    "math3560": 3,
-    "Email Tasks": 14,
-    "Personal and Professional": 13,
-    "PhD": 4,
-    "Projects": 5,
-    "AI Projects": 6,
-    "SSC 2026 Workshop": 11,
-    "Exploration": 8,
-}
+# Only the default is pinned. Project names are passed through as Dave says
+# them: the vikunja-tasks server resolves a name against Vikunja's live list on
+# every call, so a hardcoded name -> id table here only goes stale (it had, by
+# 2026-11-08: five of twelve entries renamed or gone, eight projects missing).
 VIKUNJA_DEFAULT_PROJECT = "Inbox"
-
-
-def format_vikunja_projects() -> str:
-    return ", ".join(f"{name} (id={pid})" for name, pid in VIKUNJA_PROJECTS.items())
+VIKUNJA_DEFAULT_PROJECT_ID = 1
 
 
 def format_vikunja_default() -> str:
-    pid = VIKUNJA_PROJECTS[VIKUNJA_DEFAULT_PROJECT]
-    return f"{VIKUNJA_DEFAULT_PROJECT} (id={pid})"
+    return f"{VIKUNJA_DEFAULT_PROJECT} (id={VIKUNJA_DEFAULT_PROJECT_ID})"
 
 
 _RAW_SYSTEM_PROMPT = """You are Octavius, Dave's personal voice assistant. You run
 entirely on Dave's homelab — no cloud, no external APIs, everything local and private.
 
 Your personality: competent, efficient, and dry. You get things done with minimal
-fuss and the occasional understated wit. Think Jarvis, but self-hosted. You know
-your name is Octavius and you're not shy about it.
+fuss and the occasional understated wit. Think Jarvis, but self-hosted. You go by
+two names, Octavius and Octavja, and Dave may use either; both are you (speech
+recognition may write Octavja as "Octavia").
 
 You have access to tools:
 - Web search (Google) for GENERAL web lookups ONLY — news, recipes,
@@ -476,9 +535,8 @@ You have access to tools:
     tool for academic/scholarly queries — do not fall back to web search.
     Include topic details.
   * Tasks: "add a task", "what's on my list", "mark X as done" →
-    consult_specialist(domain="tasks", task="..."). Include project names if
-    Dave specified one. Key projects: {vikunja_projects}.
-    Default to {vikunja_default} if Dave doesn't specify a project.
+    consult_specialist(domain="tasks", task="..."). Include the project name
+    if Dave said one, in his words; otherwise the task goes to {vikunja_default}.
   consult_specialist is SYNCHRONOUS. It returns the specialist's findings as
   the tool result; wait for them and then weave them into a natural, spoken
   reply to Dave. Do NOT just acknowledge and stop — the answer comes back to
@@ -519,7 +577,7 @@ Important guidelines for your responses:
   down", or similar, use save_note. For search results, save your summary (not
   raw results). For notes, save his words verbatim. Always give a clear,
   descriptive title.
-- search_vault to find Dave's existing notes. Use when he asks "what did I note
+- vault_search to find Dave's existing notes. Use when he asks "what did I note
   about X", "find my note on Y", or "did I write anything about Z". It returns
   note paths — read one with read_note. Do NOT use this for email (that lives
   in Evangeline) or web/academic lookups.
@@ -533,14 +591,13 @@ Important guidelines for your responses:
 
 
 DEFAULT_SYSTEM_PROMPT = _RAW_SYSTEM_PROMPT.format(
-    vikunja_projects=format_vikunja_projects(),
     vikunja_default=format_vikunja_default(),
 )
 
 
 # Origins whose bearer token may be supplied by the dedicated
 # OCTAVIUS_LR_API_KEY env var ("LR" = lilripper). The scope is the *host*, not
-# the port: `lilbuddy:8010` (main-chain fallback) and `triplestuffed:8010` also
+# the port: `lilbuddy:8010` (main-chain fallback), `workhorse:8010` and `triplestuffed:8010` also
 # listen on 8010 and are OPEN — they must never receive this header.
 #
 # Both lilripper router ports went behind the same token: `:8020` began
@@ -583,177 +640,91 @@ def _llm_api_keys() -> dict[str, str]:
 
 
 def load_settings() -> Settings:
-    # Both lilripper ports are llama.cpp *routers*, so the model id is
-    # load-bearing: it selects which model the router serves, loading it (and
-    # evicting the incumbent) on demand. The bare "qwen3.6-35b-a3b" alias exists
-    # on NEITHER lilripper port — every alias there carries a variant suffix.
+    # Code defaults mirror the live ~/.config/octavius/models.json as of
+    # 2026-10-28 (models.json and env still override these). The model id is
+    # load-bearing on every endpoint: an alias absent from that endpoint's
+    # catalog hard-400s and silently burns a failover hop, so re-curl /v1/models
+    # (scripts/octavius-models check) after any router rebuild.
     #
-    # Chain shape as of 2026-08-18 (:8010 promoted to primary, was :8020):
-    #  1. :8010 — primary. Served with --parallel 3, and it is already where the
-    #     subagent primary, the vision chain, and the reader live, all naming
-    #     THIS SAME alias. So a normal turn, a consult, and a document read now
-    #     share one resident model on one endpoint: no swap, no eviction, and
-    #     three slots to share. Behind auth — see KEYED_LR_ORIGINS above; a
-    #     missing key 401s the PRIMARY now, so check /health's
-    #     `endpoints_rejecting_credentials` first if the chain looks flaky.
-    #  2. :8020 — second hop, HTTP-level failover only. Deliberately demoted on
-    #     2026-08-18: Dave runs other models there by hand (qwen3.8-27b was
-    #     resident at the time of the swap), and with :8020 as primary every
-    #     Octavius turn evicted whatever he had loaded. As a fallback it only
-    #     pulls the 35B when :8010 is actually broken. It also has --parallel 3
-    #     and is shared with pi-agent, whose 27B contention has produced a live
-    #     `500 model ... failed to load` on this alias.
-    #  3. lilbuddy:8010 — cross-host last resort, and the only entry that keeps
-    #     this chain alive if lilripper is down. A router too, despite older
-    #     notes calling it a single-model server. Reachable again as of
-    #     2026-08-12 (the 08-08 outage was a tailscale fault); costs only the
-    #     connect timeout when it is down.
-    #     Alias was the bare `qwen3.6-35b-a3b` until 2026-08-18, when a real
-    #     completion returned `400 model 'qwen3.6-35b-a3b' not found` — that
-    #     alias is gone from lilbuddy's catalog too, so this hop had been
-    #     silently dead. VERIFY THIS HOP against /v1/models after any lilbuddy
-    #     rebuild: a wrong alias hard-400s instantly and looks like an ordinary
-    #     failover, so the chain reports "tried three endpoints" while only two
-    #     could ever have worked.
-    #     Now `gemma4-26b-a4b` (Dave's pick, 2026-08-18), re-measured on
-    #     lilbuddy 2026-08-21: cold load 9.6 s, warm short reply 0.44 s, warm
-    #     tool call 1.02 s in correct OpenAI shape (finish_reason=tool_calls);
-    #     takes image input.
-    #     SIZING: this hop briefly held `qwen3.6-35b-a3b-mtp-q4-general`, and
-    #     asking lilbuddy to load that 35B took the ENTIRE BOX down for ~2 min —
-    #     :8010 (router), :8020 (bge-m3 embeddings) and :8880 (Kokoro TTS) all
-    #     502'd together. Root cause (2026-08-21): the router ran max_models=3
-    #     with over-generous --ctx-size, so a dense 35B landed on top of two
-    #     incumbents and exhausted 128 GB of unified memory; it is now
-    #     max_models=2. Note what that outage reached: :8020 and :8880 are
-    #     separate processes but BOTH are on Octavius's live path (embedding
-    #     primary, only TTS), so oversizing this rarely-used third LLM hop
-    #     breaks every turn, not just failover. Size against the box, not the
-    #     model; an A4B is the right shape here. Re-tested 2026-08-21 after the
-    #     fix: that same 35B request now returns 200 in 12 s with gemma still
-    #     resident and :8020/:8880 unaffected, so the cascade is fixed — but
-    #     co-resident it answers in ~6 s vs gemma's ~0.6 s, so gemma stays.
-    #     GOTCHA: gemma4 is a THINKING model that returns its reasoning in a
-    #     separate `reasoning_content` field, not inline <think> tags — so the
-    #     <think> stripper never sees it and agent.py's delta.get("content", "")
-    #     ignores it for free. But it thinks *hard*: 714 reasoning deltas against
-    #     30 content deltas on a one-sentence question, ~6.5 s before the first
-    #     visible token. Fine for a third fallback that only runs when lilripper
-    #     is down. It does mean anything that ever sets max_tokens must budget
-    #     for reasoning tokens: at max_tokens=120 this model produced ZERO
-    #     visible content. Octavius sends no max_tokens today, so it is safe.
-    # triplestuffed:8010 was REMOVED: its GPUs serve Positron autocomplete/NES
-    # models, and it currently accepts connections without ever generating, so a
-    # failover into it burned the full 120 s read timeout. See docs/status.md.
+    # Main chain:
+    #  1. lilbuddy:8010 gemma4-26b-a4b — primary (open; --parallel 2, shared with
+    #     the vision primary). A thinking model that returns reasoning in a
+    #     separate `reasoning_content` field, which agent.py ignores; anything
+    #     that sends max_tokens to it must budget for reasoning tokens. Size any
+    #     new lilbuddy alias against the whole box's residency budget: an OOM
+    #     there once took every port on the box down.
+    #  2. lilripper:8020 qwen3.8-27b — vLLM, behind auth, effectively always
+    #     warm. Fallback only: Dave loads other models there by hand, and as a
+    #     primary every turn would evict them. lilripper:8010 now serves only
+    #     glm-5.3-flash and is not used by Octavius.
+    #  3. workhorse:8010 gemma4-12b — third host, so voice survives lilbuddy
+    #     and lilripper both being down. vLLM, open, 64K ctx, text-only (image
+    #     turns use the vision chain). Was triplestuffed:8010 until 2026-10-31,
+    #     when triplestuffed stopped serving gemma4-12b.
     llm_chain = _role_chain(
         "main",
         "OCTAVIUS_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
+            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gemma4-12b"},
         ],
     )
-    # Subagents (inline consult_specialist + backgrounded delegations) run on
-    # lilripper:8010, served with --parallel 5. `capacity` sits one below that
-    # --parallel, letting SubagentDispatcher run four consults at once instead
-    # of serialising them while leaving a slot for the main turn, reader and
-    # summaries, which share this endpoint. :8020 stays the HTTP-level fallback.
-    #
-    # As of 2026-08-18 the MAIN chain's primary is this same endpoint and alias,
-    # so consults no longer sit on a separate endpoint from the turn that spawned
-    # them. That is fine and was the point of the swap: consult_specialist is
-    # INLINE, so the main agent is blocked awaiting it and the two are not
-    # competing for slots at the same instant; sharing the endpoint means the
-    # 35B stays resident across turn -> consult -> turn with no model swap. The
-    # thing to watch is total concurrency on :8010, which is now main turns +
-    # consults + reader against three slots — re-measure if several sessions run
-    # at once, not from first principles.
-    #
-    # capacity: 4 VERIFIED 2026-08-26 against the live server, not assumed:
-    # /v1/models returns each model's full launch argv under status.args, so
-    # `--parallel` is readable directly (see the Runbook recipe in CLAUDE.md).
-    # NOTE :8020 reports --parallel 3 as well, as of 2026-08-13 — Dave raised it
-    # that day. ":8020 is single-slot" was TRUE when the 2026-07-30 tier swap was
-    # made, so that reasoning was sound; it just expired. The split is still worth
-    # keeping (it isolates consults from the main agent's turn, and :8010 no longer
-    # has to swap models for them), but do not reason from :8020 having one slot.
-    # With both endpoints at --parallel 3 the tiers are now near-interchangeable,
-    # which makes collapsing them a live option — measure before assuming it helps.
-    #
-    # Model choice: this was the q4 MTP variant, picked because consult_specialist
-    # is the dominant first-turn latency cost and speculative decoding buys more
-    # there than Q5 weights do on tool-calling work. lilripper was reconfigured on
-    # 2026-08-13 and that alias is gone from both ports (it now lives only on
-    # lilbuddy:8010), so this follows the rest of :8010 onto `mtp-general`.
-    # If consult latency regresses noticeably, the q4 variant on lilbuddy:8010 is
-    # the obvious thing to reach for — but it is a different HOST, so it trades
-    # the --parallel 5 capacity here for a network hop. Measure before switching.
-    # NOTE the model is resolved per ENDPOINT URL (subagent.py::_model_for_url),
-    # not per domain — all three specialist domains on :8010 share this one model.
+    # Subagents (inline consult_specialist) run on workhorse:8010 gemma4-12b
+    # (vLLM). `capacity` 3 leaves room for main hop 3, the reader and summaries,
+    # which share the model, and for pi_harness agents that also use it. :8020 is the HTTP-level fallback
+    # (capacity is a guess: vLLM's limit is not readable from /v1/models); the
+    # dispatcher keeps only the first role=fallback entry. The model is resolved
+    # per ENDPOINT URL (subagent.py::_model_for_url), not per domain.
     subagent_llm_chain = _role_chain(
         "subagent",
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general", "role": "primary", "capacity": 4},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b", "role": "fallback"},
+            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gemma4-12b", "role": "primary", "capacity": 3},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b", "role": "fallback", "capacity": 2},
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS
-    # frames from the Matrix sidecar). Identical to llm_chain's first two hops
-    # since 2026-08-18 (both reordered :8010-first together, for the same
-    # keep-:8020-free reason), and kept as a separate chain anyway: llm_chain
-    # has a THIRD hop, on another host, chosen for AVAILABILITY rather than for
-    # modality. Keeping the chains separate is what stops a future "add another
-    # fallback so voice survives a lilripper outage" edit to llm_chain from
-    # silently widening where an image turn can land. It is a guard against a
-    # future edit, not a claim about today's catalog: as of 2026-08-18 every
-    # alias on both lilripper ports AND lilbuddy's q4 MTP aliases all report
-    # text,image, so a cross-host vision hop is now actually possible (see
-    # docs/status.md). Read architecture.input_modalities before adding one —
-    # lilbuddy does still carry text-only aliases (DEFAULT, nemotron-nano-30b).
+    # frames). Kept separate from llm_chain because that chain's third hop is
+    # chosen for availability, not modality: workhorse's gemma4-12b is
+    # text-only and must never be added here. Check architecture.input_modalities
+    # AND --ubatch-size (>= ~1152 for a gemma4v image) before adding a hop.
     vision_llm_chain = _role_chain(
         "vision",
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
-            {"url": "http://lilripper:8010/v1/chat/completions", "model": "qwen3.6-35b-a3b-mtp-general"},
+            {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
             {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
         ],
     )
-    voxtral_voices = _env_json("OCTAVIUS_TTS_VOXTRAL_VOICES", DEFAULT_VOXTRAL_VOICES)
-    kokoro_voices = _env_json("OCTAVIUS_TTS_KOKORO_VOICES", DEFAULT_KOKORO_VOICES)
-    voxtral_enabled = _env_str("OCTAVIUS_TTS_VOXTRAL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
     tts = TTSSettings(
-        url=_env_str("OCTAVIUS_TTS_URL", "http://lilripper:8030/v1/audio/speech"),
-        model=_env_str("OCTAVIUS_TTS_MODEL", "voxtral-4b-tts"),
-        voice=_env_str("OCTAVIUS_TTS_VOICE", "bm_lewis"),
+        url=_env_str("OCTAVIUS_TTS_URL", "http://lilripper:8881/v1/audio/speech"),
+        model=_env_str("OCTAVIUS_TTS_MODEL", "phonon-31m-en"),
+        voice=_env_str("OCTAVIUS_TTS_VOICE", "Imogen"),
+        agent_voice=_env_str("OCTAVIUS_TTS_AGENT_VOICE", "Delia"),
         format=_env_str("OCTAVIUS_TTS_FORMAT", "wav"),
-        voices=voxtral_voices + kokoro_voices,
-        voxtral_voices=voxtral_voices,
-        kokoro_voices=kokoro_voices,
-        fallback_url=_env_str("OCTAVIUS_TTS_FALLBACK_URL", "http://lilbuddy:8880/v1/audio/speech"),
-        fallback_model=_env_str("OCTAVIUS_TTS_FALLBACK_MODEL", "kokoro"),
-        fallback_voice=_env_str("OCTAVIUS_TTS_FALLBACK_VOICE", "bm_lewis"),
-        voxtral_enabled=voxtral_enabled,
+        voices=_env_json("OCTAVIUS_TTS_VOICES", DEFAULT_TTS_VOICES),
+        female_voices=_env_json("OCTAVIUS_TTS_FEMALE_VOICES", DEFAULT_TTS_FEMALE_VOICES),
     )
+    # The code-default failover applies only when models.json says nothing about
+    # the reader. A file that lists a single reader entry means "no fallback".
+    _reader_in_file = "reader" in _MODEL_ROLES
+    _reader_fb_url = None if _reader_in_file else "http://lilripper:8020/v1/chat/completions"
+    _reader_fb_model = None if _reader_in_file else "qwen3.8-27b"
     reader = ReaderSettings(
         directory=_env_str("OCTAVIUS_READER_DIR", "/home/dave/octavius-reader"),
-        llm_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_URL", "http://lilripper:8010/v1/chat/completions"),
-        # qwen3.5-9b went stale on the lilripper router (still listed in /v1/models,
-        # but completions hang) — every reader math chunk silently fell back to
-        # dollar-stripping. Keep this pointed at a model verified LIVE on :8010.
-        # Deliberately the SAME alias the subagent chain uses on :8010: reading a
-        # document and running a consult otherwise thrash the router between two
-        # resident models.
-        llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "qwen3.6-35b-a3b-mtp-general"),
+        llm_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_URL", "http://workhorse:8010/v1/chat/completions"),
+        # gemma4-12b on workhorse, the same model as that host's other consumers
+        # (subagent, summary, main hop 3). Verify the alias is live after rebuilds.
+        llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "gemma4-12b"),
         # The reader is single-endpoint per call, but the role's second entry is
         # its failover target (reader_text.py tries it before giving up to
         # strip_latex). Generation params are NOT read from here: LLMChainClient.
         # complete() merges per-url params from the MAIN chain, and this url is
-        # also main chain hop 3 — so a fallback attempt inherits whatever params
+        # also a main chain hop (:8020 is hop 2) — so a fallback attempt inherits whatever params
         # that entry carries (none today).
-        llm_fallback_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_FALLBACK_URL", None, index=1),
-        llm_fallback_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_FALLBACK_MODEL", None, index=1),
+        llm_fallback_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_FALLBACK_URL", _reader_fb_url, index=1),
+        llm_fallback_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_FALLBACK_MODEL", _reader_fb_model, index=1),
     )
     if (reader.llm_fallback_url is None) != (reader.llm_fallback_model is None):
         raise ValueError(
@@ -763,7 +734,7 @@ def load_settings() -> Settings:
         "OCTAVIUS_MEDIA_UPLOAD_DIR", "/media/extra_stuff/octavius/client_media/"
     )
     return Settings(
-        stt_url=_env_str("OCTAVIUS_STT_URL", "http://lilripper:8552/api/transcribe"),
+        stt_url=_env_str("OCTAVIUS_STT_URL", "http://127.0.0.1:8502/api/transcribe"),
         llm_chain=llm_chain,
         subagent_llm_chain=subagent_llm_chain,
         vision_llm_chain=vision_llm_chain,
@@ -781,24 +752,16 @@ def load_settings() -> Settings:
         tool_labels=_env_json("OCTAVIUS_TOOL_LABELS", DEFAULT_TOOL_LABELS),
         mcp_servers=_env_json("OCTAVIUS_MCP_SERVERS", DEFAULT_MCP_SERVERS),
         system_prompt=_env_str("OCTAVIUS_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
-        # Both former endpoints (lilbuddy:8010, triplestuffed:8010) were dead on
-        # 2026-08-08, so conversation-end summaries and tags were failing
-        # silently — a failed summary is invisible to the user, it just leaves
-        # history unsummarised and untagged. Moved onto lilripper.
-        # SummaryClient sends ONE model to both URLs, so the alias must exist on
-        # both ports: qwen3.6-35b-a3b-mtp-general does.
-        # Reordered :8010-first on 2026-08-18 with the main and vision chains.
-        # This one matters more than its traffic suggests: summaries fire at
-        # conversation END, long after Dave has moved on, so with :8020 primary
-        # a background summary could silently evict a model he had loaded there
-        # by hand. On :8010 it lands on the already-resident alias — no swap.
-        # SummaryClient is NOT an LLMChainClient but it does send auth_headers,
-        # so the now-primary authed endpoint is fine.
-        summary_url=_role_single("summary", "url", "OCTAVIUS_SUMMARY_URL", "http://lilripper:8010/v1/chat/completions"),
+        # workhorse gemma4-12b primary, lilripper:8020 qwen3.8-27b fallback.
+        # Summaries fire at conversation END, long after Dave has moved on, so
+        # :8020 stays the fallback: a background job must not evict a model he
+        # loaded there by hand. SummaryClient carries a model PER URL and sends
+        # auth_headers, so the authed fallback is fine.
+        summary_url=_role_single("summary", "url", "OCTAVIUS_SUMMARY_URL", "http://workhorse:8010/v1/chat/completions"),
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8020/v1/chat/completions"),
-        summary_model=_role_single("summary", "model", "OCTAVIUS_SUMMARY_MODEL", "qwen3.6-35b-a3b-mtp-general"),
-        # The two routers stopped sharing an alias on 2026-08-26; :8020 serves
-        # qwen3.8-27b now, so the fallback needs its own model or it 400s.
+        summary_model=_role_single("summary", "model", "OCTAVIUS_SUMMARY_MODEL", "gemma4-12b"),
+        # The two endpoints do not share an alias; the fallback needs its own
+        # model or it 400s.
         summary_fallback_model=_env_str("OCTAVIUS_SUMMARY_FALLBACK_MODEL", "qwen3.8-27b"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
         # lilbuddy is primary as of 2026-08-12. It was demoted on 2026-08-10 for
@@ -826,8 +789,6 @@ def load_settings() -> Settings:
             ],
         ),
         embedding_timeout=_env_int("OCTAVIUS_EMBEDDING_TIMEOUT", 5),
-        embedding_sweeper_enabled=_env_str("OCTAVIUS_EMBEDDING_SWEEPER", "1").lower()
-        in {"1", "true", "yes", "on"},
         result_summary_max_chars=_env_int("OCTAVIUS_RESULT_SUMMARY_MAX_CHARS", 500),
         tag_generation_min_messages=_env_int("OCTAVIUS_TAG_GENERATION_MIN_MESSAGES", 4),
         # Shared memory service (v2): Octavius is a loopback HTTP client of the
@@ -841,6 +802,43 @@ def load_settings() -> Settings:
         docproc_inline_char_budget=_env_int("OCTAVIUS_DOCPROC_INLINE_CHAR_BUDGET", 20000),
         docproc_excerpt_chars=_env_int("OCTAVIUS_DOCPROC_EXCERPT_CHARS", 3000),
         llm_api_keys=_llm_api_keys(),
+        pi_brain=PiBrainSettings(
+            brain=_env_str("OCTAVIUS_BRAIN", "native"),
+            launcher=_env_str(
+                "OCTAVIUS_PI_LAUNCHER",
+                os.path.expanduser("~/git_repos/pi_harness/scripts/pi-octavius"),
+            ),
+            # The user service's PATH has no ~/.local/bin, so name pi explicitly.
+            pi_bin=_env_str("OCTAVIUS_PI_BIN", os.path.expanduser("~/.local/bin/pi")),
+            path_prepend=_env_str("OCTAVIUS_PI_PATH", ""),
+            # Passed to the launcher as PI_OCTAVIUS_MODEL; also what history records.
+            model=_env_str("OCTAVIUS_PI_MODEL", "lb-unified/gemma4-26b-a4b"),
+            # Hours, not minutes: a reaped process loses its warm session and the
+            # next turn reseeds from history (see "What /warm can and cannot warm").
+            idle_reap_s=_env_float("OCTAVIUS_PI_IDLE_REAP_S", 4 * 3600),
+            # scholar alone took 228 s in the step-1 run.
+            turn_timeout_s=_env_float("OCTAVIUS_PI_TURN_TIMEOUT_S", 600),
+            # Below octavius-guard's 60 s, so Octavius answers before pi gives up.
+            confirm_timeout_s=_env_float("OCTAVIUS_PI_CONFIRM_TIMEOUT_S", 55),
+            tools_port=_env_int("OCTAVIUS_PI_TOOLS_PORT", 8032),
+            warm=_env_str("OCTAVIUS_PI_WARM", "1") not in ("0", "false", "no", "off"),
+            warm_debounce_s=_env_float("OCTAVIUS_PI_WARM_DEBOUNCE_S", 5.0),
+            # While warms fail (lilbuddy down, model reloading), retry this often: the first
+            # success after an outage is the recovery warm.
+            warm_retry_s=_env_float("OCTAVIUS_PI_WARM_RETRY_S", 60.0),
+            fallback_models=tuple(
+                m.strip() for m in os.getenv(
+                    "OCTAVIUS_PI_FALLBACK_MODELS", "lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b",
+                ).split(",") if m.strip()
+            ),
+            failover_cooldown_s=_env_float("OCTAVIUS_PI_FAILOVER_COOLDOWN_S", 300.0),
+            silence_timeout_s=_env_float("OCTAVIUS_PI_SILENCE_TIMEOUT_S", 30.0),
+            first_output_timeout_s=_env_float("OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S", 60.0),
+            tool_timeout_s=_env_float("OCTAVIUS_PI_TOOL_TIMEOUT_S", 120.0),
+            model_contexts=_env_json("OCTAVIUS_PI_MODEL_CONTEXTS", dict(DEFAULT_PI_MODEL_CONTEXTS)),
+            reader_models=_env_json("OCTAVIUS_PI_READER_MODELS", [dict(m) for m in DEFAULT_PI_READER_MODELS]),
+            chat_models=_env_json("OCTAVIUS_PI_CHAT_MODELS", [dict(m) for m in DEFAULT_PI_CHAT_MODELS]),
+        ),
     )
 
 

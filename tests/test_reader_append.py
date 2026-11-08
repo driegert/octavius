@@ -43,6 +43,8 @@ READER_DOCUMENTS_DDL = """CREATE TABLE reader_documents (
     error TEXT,
     last_chunk INTEGER NOT NULL DEFAULT 0,
     last_sentence INTEGER NOT NULL DEFAULT 0,
+    total_sentences INTEGER,
+    progress_sentences INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT
 )"""
@@ -71,7 +73,7 @@ def _fake_settings(directory: str):
     return SimpleNamespace(reader=SimpleNamespace(directory=directory))
 
 
-async def _identity_convert(chunks):
+async def _identity_convert(chunks, base_dir=None):
     """Stand-in for the math-conversion pass: speech text == chunk text."""
     return [c["text"] for c in chunks]
 

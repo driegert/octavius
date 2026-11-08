@@ -68,8 +68,76 @@ class MathConversionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, strip_latex("$x^2$"))
         self.assertIn("squared", out)
 
+    async def test_rewrite_with_leftover_latex_tries_the_next_endpoint(self):
+        # gemma4-12b once echoed an aligned block, then "Rewritten:", then the rewrite.
+        async def complete(payload, urls=None):
+            if urls[0].startswith("http://primary"):
+                return "$$\\begin{aligned} x^2 \\end{aligned}$$\n\nRewritten:\nx squared"
+            return "x squared"
+
+        out = await self._run(complete, fallback=("http://fallback:2/v1/chat/completions", "fallback-model"))
+        self.assertEqual(out, "x squared")
+
+    async def test_thinking_is_off_for_the_rewrite(self):
+        payloads = []
+
+        async def complete(payload, urls=None):
+            payloads.append(payload)
+            return "x squared"
+
+        await self._run(complete, fallback=None)
+        self.assertEqual(payloads[0]["chat_template_kwargs"], {"enable_thinking": False})
+
 
 class ReaderTests(unittest.TestCase):
+    def test_citation_abbreviations_do_not_end_sentences(self):
+        split = reader_text.split_sentences
+        self.assertEqual(split("Smith et al. (2020) found it. Jones et al. 2021 agreed."),
+                         ["Smith et al. (2020) found it.", "Jones et al. 2021 agreed."])
+        self.assertEqual(split("Methods, e.g. multitaper, i.e. Thomson's, help. See Fig. 3 and Eq. 2. A vs. B."),
+                         ["Methods, e.g. multitaper, i.e. Thomson's, help.", "See Fig. 3 and Eq. 2.", "A vs. B."])
+        # "et al." ending a sentence still breaks before the next one.
+        self.assertEqual(split("Shown by Smith et al. The next differs."),
+                         ["Shown by Smith et al.", "The next differs."])
+        self.assertEqual(split("One. Two! Three? Four."), ["One.", "Two!", "Three?", "Four."])
+
+    def test_initialisms_and_lowercase_continuations_do_not_end_sentences(self):
+        split = reader_text.split_sentences
+        self.assertEqual(
+            split("Tano et al. analyzed releases published by U.S. state governors. Next."),
+            ["Tano et al. analyzed releases published by U.S. state governors.", "Next."])
+        self.assertEqual(split("The U.S. Senate agreed. Thomson, D. J. Spectra. It rose approx. twice. Done."),
+                         ["The U.S. Senate agreed.", "Thomson, D. J. Spectra.", "It rose approx. twice.", "Done."])
+
+    def test_page_break_mid_sentence_is_rejoined(self):
+        join = reader_text.join_page_breaks
+        self.assertEqual(join("The spectrum was estimated with the\n\nmultitaper method. Next."),
+                         "The spectrum was estimated with the multitaper method. Next.")
+        # A caption or page number between the halves moves after the sentence.
+        self.assertEqual(
+            join("We fit the model to the\n\n**Fig. 2.** Residuals.\n\n12\n\nsecond half of the data."),
+            "We fit the model to the second half of the data.\n\n**Fig. 2.** Residuals.\n\n12")
+        self.assertEqual(join("A word split across pages, multi-\n\ntaper."), "A word split across pages, multi-taper.")
+        self.assertEqual(join("Ends on a comma,\n\nThomson showed."), "Ends on a comma, Thomson showed.")
+
+    def test_page_break_join_leaves_real_paragraphs_alone(self):
+        join = reader_text.join_page_breaks
+        for md in ("A finished sentence.\n\nlowercase start.",
+                   "An unpunctuated line\n\nThen a capitalised one.",
+                   "## A heading\n\nbody text.",
+                   "Text before\n## Heading\n\nlowercase body.",
+                   "Intro to the list\n\n- item one",
+                   "Leads into an equation\n\n$$x^2$$",
+                   "```\nif (x) {\n\n  y();\n}\n```",
+                   "if (x) {\n\nreturn y;"):
+            with self.subTest(md=md):
+                self.assertEqual(join(md), md)
+
+    def test_split_into_chunks_keeps_a_page_split_sentence_together(self):
+        paras = ["First paragraph.", "Second one.", "Third runs onto the", "next page here.", "Fifth."]
+        chunks = split_into_chunks("\n\n".join(paras))
+        self.assertIn("Third runs onto the next page here.", [c["text"] for c in chunks])
+
 
     def test_clean_for_speech_strips_links_urls_and_citations(self):
         text = "See [paper](https://example.com) and https://x.test [1] (Smith et al., 2024)."
@@ -105,6 +173,13 @@ class ReaderTests(unittest.TestCase):
         self.assertNotIn("{", stripped)
         self.assertNotIn("frac", stripped)
         self.assertNotIn("tag", stripped)
+
+    def test_strip_latex_leaves_no_commands_behind(self):
+        out = strip_latex(r"$P(A \mid B)$ and $\sum_k \alpha$")
+        self.assertNotIn("\\", out)
+        self.assertIn("given", out)
+        self.assertIn("the sum", out)
+        self.assertIn("alpha", out)
 
     def test_strip_latex_handles_powers_and_subscripts(self):
         self.assertIn("squared", strip_latex("$x^2$"))

@@ -10,6 +10,19 @@ This document holds change-oriented project status that is useful in the short t
 Keep durable architecture and contributor workflow in `AGENTS.md` (`CLAUDE.md` is a
 symlink to it, so Claude Code and Codex read the same file).
 
+## Sweeper switch and `conversations.indexed` removed (2026-09-15)
+
+Two leftovers from the hybrid-corpus cutover earlier the same day, both flagged by that
+session as follow-ups. `OCTAVIUS_EMBEDDING_SWEEPER` was parsed into
+`settings.embedding_sweeper_enabled` and read by nothing (the sweeper is a raising stub);
+field, env parse and `.env.example` entry are gone. `conversations.indexed` was still
+written by `_write_summary` but had no reader in this repo, mcp-tools, hybrid-corpus or
+agent-memory — the library indexes every conversation with a non-empty summary — so the
+column left `schema.sql` and its migration, and the summariser's `index` flag now only
+gates the memory push. The live DB keeps the column; nothing needs to drop it. The
+`search_conversation_history` empty-result hint, which still claimed retrieval-only chats
+were "intentionally not indexed", now says the truth: the index lags by up to 15 minutes.
+
 ## Image turns crashed the gemma4 hop until its ubatch was raised (2026-09-14)
 
 The first real Android image turn came back "I'm not sure how to respond to that." with
@@ -689,9 +702,9 @@ fast-413 before parsing starts and now runs `save_upload` inside `request.form()
 with `max_files=2, max_fields=4`, translating Starlette's `MultiPartException`/
 `HTTPException` to a 400 JSON body instead of a 500. Docs now say plainly that the
 size caps are logical, not an ingress limit: Starlette's parser has already received
-the whole body into its own temp file before `save_upload` ever runs; a real ingress
-guard would be a body-size limit on Caddy's `octavius.riegert.xyz` site block (needs
-sudo; not done). Tests: `tests/test_media_upload.py` (34), plus new/updated cases in
+the whole body into its own temp file before `save_upload` ever runs; the real ingress
+guard is Caddy's `request_body { max_size 52MB }` on `octavius.riegert.xyz` (in place,
+confirmed 2026-10-30). Tests: `tests/test_media_upload.py` (34), plus new/updated cases in
 `tests/test_websocket_session.py`.
 
 ## Reader: pasted text (2026-08-10)
@@ -915,6 +928,22 @@ Likely refactor targets, in rough priority order:
    Keep the `OCTAVIUS_LLM_API_KEYS` line in place: the bare var **wins** over the map (`settings._llm_api_keys`), so leaving the map is a working fallback, not a conflict. Delete it only after step 4 passes. Watch for two traps: a blank/whitespace value is ignored by design rather than sending `Bearer ` (there is a test), and **nothing loads a `.env` file** — a key put there is silently ignored.
 
 6. Transcription/dictation mode (Dave, 2026-07-12): capture speech (Android app first), transcribe, and save the transcript to the `saved_items` stash — deliberately NOT the vault. No agent turn, no TTS. Revives the stash write path for non-note payloads; needs a WS message or REST route for STT-to-stash (the unwired `save_to_stash` helper in `local_tool_inbox.py` is a starting point). App-side sketch in `../octavius-android/docs/HANDOFF.md` NEXT WORK #3.
+
+7. Reader chat: a per-document hybrid search (Dave, 2026-11-01; deferred). Today the
+   chat's pre-turn search and `search_reader_document` are word matching with light
+   stemming and a small synonym list (`local_tool_reader_lookup._rank`), which misses
+   paraphrase. Idea: when the chat panel opens, embed the document's chunks (bge-m3) into
+   a throwaway in-memory index and fuse it with the word ranking; for one document it is
+   near-instant. Only worth it above a size threshold (a 50-line note no; a 50-page PDF
+   yes). Not via `hybrid-corpus`, which is for persistent corpora.
+
+8. Reader Original view (shipped 2026-11-04; see AGENTS.md "Document Reader") — open
+   edges, none urgent: figures show as `[Figure: caption]` because docproc's markdown
+   carries no image links (`docs/HANDOFF-docproc-images.md`); the 12 documents converted
+   before 2026-10-31 have no `source_text` and show only the reading text until retried
+   (Dave chose to leave them); playback highlights the whole chunk in Original view
+   (Dave's call, revisit if it reads badly); and a click inside math picks its sentence by
+   relative position, so it can land one sentence off.
 
 ## Planned: `deep_research` domain via headless pi (2026-08-08)
 

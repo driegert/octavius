@@ -15,7 +15,7 @@ import re
 from typing import TYPE_CHECKING, Callable
 
 from service_clients import subagent_llm_client
-from settings import format_vikunja_default, format_vikunja_projects, settings
+from settings import format_vikunja_default, settings
 
 if TYPE_CHECKING:
     from mcp_manager import MCPManager
@@ -143,7 +143,7 @@ def parse_xml_tool_calls(content: str) -> tuple[list[dict], str]:
 
 SUBAGENT_DOMAINS: dict[str, dict] = {
     "email": {
-        "servers": ["evangeline-email"],
+        "servers": ["evangeline-email", "calendar"],
         "system_prompt": (
             "You are an email assistant for Dave. You have access to email tools "
             "to search, read, and analyze Dave's email. Be thorough but concise — "
@@ -161,19 +161,18 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "nothing in that folder and offer to widen the search. Age is not "
             "scope: 'it's an old one' means drop the date cutoff, NOT switch to "
             "All — keep folder=\"Inbox\" and pass date_after=\"1970-01-01\".\n"
-            "- Pass folder explicitly on EVERY call: hybrid_search defaults to All, "
-            "while search_emails and semantic_search default to Inbox. Relying on a "
-            "tool's own default will sooner or later search the wrong scope.\n"
+            "- Pass folder explicitly on EVERY call: every email tool defaults to All "
+            "(no folder filter), so omitting it silently widens the search past the "
+            "Inbox default above.\n"
             "- Folder names are matched EXACTLY and are case-sensitive; a wrong name "
             "returns zero results rather than an error, which is indistinguishable "
             "from 'no such mail'. 'To Do' and 'INBOX' both match nothing. If a folder "
             "search returns zero results, suspect the name before concluding the mail "
             "does not exist.\n"
-            "- Use hybrid_search to match on body text — search_emails has no body "
-            "search. It fuses semantic meaning with exact keywords.\n"
-            "- search_emails and semantic_search also apply a ~6-month lookback by "
-            "default; pass date_after=\"1970-01-01\" to disable it when Dave's lead is "
-            "older than that.\n"
+            "- To match on body text, prefer email_hybrid_search: it fuses semantic meaning "
+            "with exact keywords. email_keyword_search's body filter is an exact-keyword "
+            "(full-text) match, useful only when you know the words.\n"
+            "- No tool applies a date cutoff; omit date_after to search all dates.\n"
             "- When Dave asks what's in his inbox or what still needs attention, use "
             "folder=\"Inbox\": anything still there is unresolved regardless of read "
             "state, so do NOT pass a seen/unread filter."
@@ -203,13 +202,14 @@ SUBAGENT_DOMAINS: dict[str, dict] = {
             "search_tasks and list-style task calls. Only pass done=true (or omit the filter) "
             "when Dave explicitly asks about completed/done/finished tasks.\n"
             "- Sort by due_date or created when listing tasks so the most relevant appear first.\n"
-            "- When creating tasks, ask which project if not obvious from context.\n"
+            "- When creating tasks, pass the project Dave named as project_id, in "
+            "his words (the server matches names). If he named none, use "
+            f"{format_vikunja_default()}: do not guess a project from the task's "
+            "content and do not ask him which one.\n"
             "- Avoid calling search_tasks more than twice for the same intent. "
             "If two searches haven't surfaced the specific task, stop searching — "
             "summarize what you did find and ask Dave to narrow it down (e.g. by "
-            "project, keyword, or due date) instead of retrying the same query.\n"
-            f"- Key projects: {format_vikunja_projects()}.\n"
-            f"- Default to {format_vikunja_default()} if Dave doesn't specify a project."
+            "project, keyword, or due date) instead of retrying the same query."
         ),
         "max_rounds": 6,
     },

@@ -1,6 +1,5 @@
-import asyncio
 import logging
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
@@ -9,8 +8,10 @@ from fastapi.staticfiles import StaticFiles
 from db import DEFAULT_DB_PATH
 from history import HistoryRecorder, init_db
 from history_enrichment import drain_inflight
-from history_sweeper import run_sweeper
+from history_store import assert_history_serveable
 from mcp_manager import MCPManager
+from pi_brain import PiProcessManager
+from pi_tools_server import PiToolsServer
 from settings import settings
 from routes.conversations import router as conversations_router
 from routes.inbox import router as inbox_router
@@ -21,7 +22,7 @@ from reader_store import fail_stale_processing_documents
 from service_clients import embedding_client, llm_client
 from subagent_dispatcher import SubagentDispatcher
 import tools as local_tools
-from websocket_session import handle_websocket_session
+from websocket_session import chat_models_payload, handle_websocket_session
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +37,6 @@ async def lifespan(app: FastAPI):
     db_path = app.state.db_path
     history = HistoryRecorder(db_path)
     stale_count = fail_stale_processing_documents(history_conn)
-    history_conn.close()
     app.state.mcp_manager = mcp_manager
     app.state.history = history
     app.state.db_path = db_path
@@ -47,6 +47,13 @@ async def lifespan(app: FastAPI):
     )
     if stale_count:
         log.warning("Marked %d stale reader document(s) as failed on startup", stale_count)
+    # Loud, at startup: conversation/inbox search reads sidecar tables that
+    # history-index.timer maintains in the file sites.toml names. If this app
+    # opens a different file, or the sidecars are missing or L2-metric, search
+    # would keep answering with stale or magnitude-ranked results instead of
+    # failing. Injected so tests can run against a throwaway database.
+    app.state.verify_search(history_conn, db_path)
+    history_conn.close()
     log.info("Connecting MCP servers...")
     await mcp_manager.connect_all()
     log.info("MCP ready — %d tools available", len(mcp_manager.tools))
@@ -59,26 +66,89 @@ async def lifespan(app: FastAPI):
             "Local tool name(s) collide with MCP tools (local handler wins): %s",
             sorted(overlap),
         )
-    sweeper_task = None
-    if settings.embedding_sweeper_enabled:
-        sweeper_task = asyncio.create_task(run_sweeper(db_path))
-        app.state.embedding_sweeper_task = sweeper_task
-    else:
-        log.info("Embedding sweeper disabled")
+    # The embedding sweeper started here until 2026-09-15. It backfilled the
+    # legacy vec0 tables; history-index.timer (`hybrid-corpus run history`,
+    # every 15 min) owns freshness and embed-debt healing now, for all three
+    # history collections rather than just two.
+    # OCTAVIUS_BRAIN=pi: voice/text turns run on pi processes (pi_brain.py).
+    app.state.pi_brain = None
+    if settings.pi_brain.enabled:
+        app.state.pi_brain = PiProcessManager(settings.pi_brain)
+        # Octavius's own tools for pi, on a loopback-only port (never on this app).
+        # If it cannot start, pi still runs, without those tools.
+        app.state.pi_tools = PiToolsServer(port=settings.pi_brain.tools_port)
+        try:
+            await app.state.pi_tools.start()
+            app.state.pi_brain.tools_server = app.state.pi_tools
+        except Exception:
+            log.exception("pi tools server failed to start; pi runs without Octavius's tools")
+            app.state.pi_tools = None
+        app.state.pi_brain.start_reaper()
+        # Warm system prompt + tools in the background (pi /warm, never awaited).
+        app.state.pi_brain.warm_static_prefix("startup")
+        log.info("Brain: pi (%s via %s)", settings.pi_brain.model, settings.pi_brain.launcher)
     yield
+    if app.state.pi_brain is not None:
+        await app.state.pi_brain.shutdown()
+    if getattr(app.state, "pi_tools", None) is not None:
+        await app.state.pi_tools.stop()
     log.info("Shutting down MCP...")
     await mcp_manager.disconnect_all()
-    if sweeper_task is not None:
-        sweeper_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await sweeper_task
-    # Give detached embeds a moment to land; anything still pending is picked
-    # up by the sweeper on the next boot.
+    # Nothing spawns detached embeds any more (see history_enrichment), so this
+    # drains an empty set. Kept because it is the shutdown hook's only await on
+    # in-flight background work and costs nothing when there is none.
     await drain_inflight()
 
 
-def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH) -> FastAPI:
+UI_PAGES = {"/", "/inbox", "/reader"}
+
+# Defence in depth for pages that render untrusted text (replies quoting web
+# pages, saved items, reader documents): even if an escaping bug lets markup
+# through, it cannot run script, load remote images, or post anywhere.
+# No 'unsafe-inline' anywhere: the pages have no inline <script>, no on*=
+# handlers and no style="" attributes (JS sets styles through el.style, which
+# CSP allows). Adding an external resource means adding its origin here; see
+# AGENTS.md "Frontend". connect-src 'self' covers same-origin ws:/wss: (CSP3).
+UI_CSP = "; ".join([
+    "default-src 'self'",
+    "script-src 'self'",  # marked is vendored in static/vendor/, so no CDN is trusted
+    "style-src 'self' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",  # 'self': KaTeX's fonts, vendored with it
+    "img-src 'self' data: blob:",
+    "media-src 'self' blob:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+])
+UI_SECURITY_HEADERS = {
+    "Content-Security-Policy": UI_CSP,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
+
+
+def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAULT_DB_PATH,
+               verify_search=assert_history_serveable) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
+
+    @app.middleware("http")
+    async def revalidate_ui(request: Request, call_next):
+        # Pages and their assets change together on disk with no build step, so a
+        # browser must not run a cached old script against new HTML: always
+        # revalidate (StaticFiles/FileResponse answer with ETag + 304).
+        response = await call_next(request)
+        if request.url.path.startswith("/static/") or request.url.path in UI_PAGES:
+            response.headers.setdefault("Cache-Control", "no-cache")
+        # Every HTML response, not just the page routes: the same files are also
+        # reachable as /static/index.html etc., and that copy must not escape the CSP.
+        is_html = response.headers.get("content-type", "").startswith("text/html")
+        if request.url.path in UI_PAGES or is_html:
+            for name, value in UI_SECURITY_HEADERS.items():
+                response.headers.setdefault(name, value)
+        return response
+
     app.mount("/static", StaticFiles(directory="static"), name="static")
     app.include_router(inbox_router)
     app.include_router(conversations_router)
@@ -88,6 +158,7 @@ def create_app(*, mcp_manager_factory=MCPManager, db_init=init_db, db_path=DEFAU
     app.state.mcp_manager_factory = mcp_manager_factory
     app.state.db_init = db_init
     app.state.db_path = db_path
+    app.state.verify_search = verify_search
     return app
 
 
@@ -103,6 +174,7 @@ async def index():
 async def health(request: Request):
     mcp_manager = getattr(request.app.state, "mcp_manager", None)
     history = getattr(request.app.state, "history", None)
+    pi_brain = getattr(request.app.state, "pi_brain", None)
     llm_health = llm_client.get_health()
     mcp_health = (
         mcp_manager.get_health()
@@ -131,6 +203,7 @@ async def health(request: Request):
             "mcp": mcp_health,
             "llm_chain": llm_health,
             "embedding_chain": embedding_client.get_health(),
+            "pi_brain": pi_brain.health() if pi_brain else {"brain": settings.pi_brain.brain},
         }
     )
 
@@ -140,11 +213,15 @@ async def voices():
     return JSONResponse({
         "voices": settings.tts.voices,
         "default": settings.tts.voice,
-        "voices_by_engine": {
-            "voxtral": settings.tts.voxtral_voices,
-            "kokoro": settings.tts.kokoro_voices,
-        },
+        "agent_default": settings.tts.agent_voice,
+        "agent_names": {v: settings.tts.agent_name(v) for v in settings.tts.voices},
     })
+
+
+@app.get("/api/chat-models")
+async def chat_models():
+    """The agent's model menu; a client sends its pick as a `chat_model` WS frame."""
+    return JSONResponse(chat_models_payload())
 
 
 @app.websocket("/ws")

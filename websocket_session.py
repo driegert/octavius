@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ except ModuleNotFoundError:
 import docproc_client
 import media_uploads
 from conversation import Conversation
-from reader_playback import stream_reader_audio
+from reader_playback import ReaderPacer, save_heard_position, stream_reader_audio
 from settings import settings
 from subagent import run_subagent
 from subagent_dispatcher import SubagentTicket
@@ -30,6 +31,39 @@ log = logging.getLogger(__name__)
 
 
 _ITEM_CHAT_MAX_CHARS = 6000
+
+
+def reader_model_label(model: str) -> str:
+    """The Reader chat menu's label for a pi model id, or the id itself."""
+    for m in settings.pi_brain.reader_models:
+        if m.get("model") == model:
+            return m.get("label") or model
+    return model
+
+
+def chat_model_label(model: str) -> str:
+    """The agent menu's label for a pi model id (then the Reader menu's), or the id itself."""
+    for m in settings.pi_brain.chat_models:
+        if m.get("model") and m.get("model") == model:
+            return m.get("label") or model
+    return reader_model_label(model)
+
+
+def chat_model_choice(model_id) -> dict:
+    """The agent menu entry for ``model_id``; unknown or missing: the first (default)."""
+    models = settings.pi_brain.chat_models or [{"id": "auto", "label": "Auto", "model": None}]
+    return next((m for m in models if m.get("id") == model_id), models[0])
+
+
+def chat_models_payload() -> dict:
+    """The agent's model menu, for GET /api/chat-models and the `chat_model` ack."""
+    models = settings.pi_brain.chat_models or [{"id": "auto", "label": "Auto", "model": None}]
+    return {
+        "models": [{"id": m["id"], "label": m.get("label") or m["id"]} for m in models],
+        "default": models[0]["id"],
+        # The menu only does anything on the pi brain; the native loop has one chain.
+        "enabled": settings.pi_brain.enabled,
+    }
 
 
 def build_item_chat_context(item: dict, item_id: int) -> str:
@@ -54,6 +88,7 @@ def create_item_conversation(item: dict, item_id: int) -> Conversation:
 
 
 VAD_SILENCE_SECONDS = 1.5  # auto-stop after this much silence post-speech
+STT_FINAL_WAIT_S = 3.0  # longest wait at stop for an in-flight Whisper run
 
 # Max chars in the per-delegation preview line shown in the UI badge.
 _DELEGATION_PREVIEW_CHARS = 180
@@ -74,16 +109,34 @@ class StreamingSTTState:
     active: bool = False
     pcm_buffer: bytes = b""
     last_text: str = ""
+    last_partial: str = ""
     speech_detected: bool = False
     silence_start: float | None = None
+    # Bytes of pcm_buffer that last_text covers, and the buffer length at the end of
+    # the last chunk VAD heard speech in: speech past last_len is not in last_text yet.
+    last_len: int = 0
+    speech_end: int = 0
+    # Bumped on every reset, so a transcription started for one utterance cannot
+    # write into the next one or send a partial after its transcript.
+    generation: int = 0
     _transcribe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def reset(self):
         self.active = False
         self.pcm_buffer = b""
         self.last_text = ""
+        self.last_partial = ""
         self.speech_detected = False
         self.silence_start = None
+        self.last_len = 0
+        self.speech_end = 0
+        self.generation += 1
+
+
+
+async def _acquire_and_release(lock: asyncio.Lock) -> None:
+    async with lock:
+        pass
 
 
 @dataclass
@@ -114,9 +167,11 @@ class WebSocketSessionState:
     mcp_manager: object
     subagent_dispatcher: object
     conversation: Conversation = field(default_factory=Conversation)
-    voice: str = settings.tts.voice
+    voice: str = settings.tts.agent_voice
     tts_enabled: bool = True
     reader_task: asyncio.Task | None = None
+    reader_seq: int | None = None
+    reader_pacer: ReaderPacer | None = None
     item_conversations: dict[int, Conversation] = field(default_factory=dict)
     item_history_sessions: dict[int, object] = field(default_factory=dict)
     history_session: object | None = None
@@ -132,6 +187,19 @@ class WebSocketSessionState:
     # record and the UI shows a non-intrusive badge instead of speaking
     # results aloud. Flip to True to restore the old interrupt-and-speak path.
     proactive_speak_enabled: bool = False
+    renders_math: bool = True  # False on a Matrix thread, which shows a reply's LaTeX raw
+    # Set while a pi turn waits on Dave to answer a confirmation (pi_brain); his
+    # next transcript or text input resolves it instead of starting a turn.
+    pending_confirm: asyncio.Future | None = None
+    # The Reader chat panel: the document this connection's conversation is about, and
+    # the place Dave was hearing when he last asked (doc_chat_position).
+    doc_chat_id: int | None = None
+    doc_chat_position: dict | None = None
+    # The pi model the current turn's attempt is on (pi_brain sets it); None before one starts.
+    pi_hop: str | None = None
+    # The agent model Dave picked (`chat_model`, a chat_models menu id). None: the client has
+    # never sent one, and its conversations behave exactly as before the menu existed.
+    chat_model: str | None = None
 
 
 class WebSocketSessionHandler:
@@ -234,11 +302,17 @@ class WebSocketSessionHandler:
             "reader_play": self.handle_reader_play,
             "reader_pause": self.handle_reader_pause,
             "reader_stop": self.handle_reader_stop,
+            "reader_heard": self.handle_reader_heard,
             "item_chat_load": self.handle_item_chat_load,
             "item_chat": self.handle_item_chat,
             "item_chat_reset": self.handle_item_chat_reset,
+            "doc_chat_open": self.handle_doc_chat_open,
+            "doc_chat_position": self.handle_doc_chat_position,
+            "doc_chat_model": self.handle_doc_chat_model,
+            "chat_model": self.handle_chat_model,
             "stt_start": self.handle_stt_start,
             "stt_stop": self.handle_stt_stop,
+            "typing_start": self.handle_typing_start,
             "delegation_list": self.handle_delegation_list,
             "delegation_pull": self.handle_delegation_pull,
             "delegation_dismiss": self.handle_delegation_dismiss,
@@ -260,6 +334,12 @@ class WebSocketSessionHandler:
         if msgs:
             self.state.conversation.load_from_history(msgs)
             log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
+            pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+            if pi_brain is not None:
+                pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
+                self._apply_chat_model()
+                # A live re-attached process has history the slot may have lost.
+                self._request_pi_warm("restore_session")
             await self.send_payload(
                 {
                     "type": "session_id",
@@ -280,6 +360,7 @@ class WebSocketSessionHandler:
         if not key:
             return
         await self.state.history_session.end_async()  # retire the empty connect-time record
+        self.state.renders_math = False
         self.state.history_session = self.state.history.resume_or_start_conversation(
             key,
             source="matrix",
@@ -299,11 +380,11 @@ class WebSocketSessionHandler:
             }
         )
 
-    async def handle_reset(self, _data: dict):
-        # Mirror handle_stt_start: a reset must actually kill any in-flight turn, or it
-        # keeps streaming into (and its reply gets recorded under) the fresh conversation
-        # created below. Cancelling BEFORE end_async() also means the interrupted turn's
-        # partial reply is persisted into the conversation it belongs to — the old one.
+    async def _abandon_turn(self) -> None:
+        # Mirror handle_stt_start: switching conversations must actually kill any
+        # in-flight turn, or it keeps streaming into (and its reply gets recorded under)
+        # the next conversation. Cancelling BEFORE end_async() also means the interrupted
+        # turn's partial reply is persisted into the conversation it belongs to.
         turn = self.state.turn_task
         if turn and not turn.done():
             turn.cancel()
@@ -312,17 +393,23 @@ class WebSocketSessionHandler:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                log.debug("In-flight turn ended during reset", exc_info=True)
-        # A reset also abandons any open streaming-STT capture (e.g. the Android client
+                log.debug("In-flight turn ended during a conversation switch", exc_info=True)
+        # It also abandons any open streaming-STT capture (e.g. the Android client
         # tearing down a live mic for New Chat) — don't leave the stream armed.
         self.state.stt_stream.reset()
         self.state.stt_stream.active = False
+
+    async def handle_reset(self, _data: dict):
+        await self._abandon_turn()
+        self.state.doc_chat_id = None
+        await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.reset()
         self.state.history_session = self.state.history.start_conversation(
             source="voice",
             model=settings.llm_chain[0]["model"],
         )
+        self._apply_chat_model()
         await self.send_payload(
             {
                 "type": "session_id",
@@ -331,6 +418,141 @@ class WebSocketSessionHandler:
         )
         await self.send_json("status", "Conversation reset.")
         log.info("Conversation reset by client")
+
+    async def handle_doc_chat_open(self, data: dict):
+        """Bind this connection to a Reader document's chat (/reader's chat panel).
+
+        One chat per document: the conversation is keyed `reader-doc:<id>` and resumed
+        on every open. `new: true` renames the old key aside (it stays in history under
+        `reader-doc:<id>:<conversation id>`) and starts a fresh one.
+        """
+        from contextlib import closing
+
+        from history import get_conversation_messages
+        from reader_store import get_document
+        try:
+            doc_id = int(data.get("doc_id"))
+        except (TypeError, ValueError):
+            await self.send_payload({"type": "doc_chat_error", "doc_id": data.get("doc_id"), "error": "No document id."})
+            return
+        with closing(self.state.history.connect()) as conn:
+            doc = get_document(conn, doc_id)
+        if not doc:
+            await self.send_payload({"type": "doc_chat_error", "doc_id": doc_id, "error": "Document not found."})
+            return
+        await self._abandon_turn()
+        await self._discard_pi_process()
+        await self.state.history_session.end_async()
+        key = f"reader-doc:{doc_id}"
+        if data.get("new") is True:
+            with closing(self.state.history.connect()) as conn:
+                conn.execute(
+                    "UPDATE conversations SET session_id = session_id || ':' || id WHERE session_id = ?",
+                    (key,),
+                )
+                conn.commit()
+        self.state.history_session = self.state.history.resume_or_start_conversation(
+            key,
+            source="reader",
+            model=settings.llm_chain[0]["model"],
+        )
+        conv_id = self.state.history_session.conv_id
+        msgs = get_conversation_messages(self.state.history_session.conn, conv_id)
+        if msgs:
+            self.state.conversation.load_from_history(msgs)
+        else:
+            self.state.conversation.reset()
+        self.state.doc_chat_id = doc_id
+        self.state.doc_chat_position = None
+        choice = self._choose_reader_model(data.get("model"))
+        self._request_pi_warm("doc_chat_open", start=True)
+        await self.send_payload(
+            {
+                "type": "doc_chat_opened",
+                "doc_id": doc_id,
+                "title": doc["title"],
+                "conversation_id": conv_id,
+                "messages": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in msgs
+                    if m["role"] in ("user", "assistant") and m.get("content")
+                ],
+                "models": [{"id": m["id"], "label": m.get("label") or m["id"]} for m in settings.pi_brain.reader_models],
+                "model": choice["id"] if choice else None,
+            }
+        )
+        log.info("Reader chat for document %d on conversation %d (%d messages)", doc_id, conv_id, len(msgs))
+
+    def _choose_reader_model(self, model_id) -> dict | None:
+        """Point this Reader chat's turns at a menu model (unknown or missing: the default)."""
+        models = settings.pi_brain.reader_models
+        if not models:
+            return None
+        choice = next((m for m in models if m.get("id") == model_id), models[0])
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is not None and self.state.history_session is not None:
+            pi_brain.prefer(self.state.history_session.conv_id, choice["model"], choice.get("thinking"))
+        return choice
+
+    async def handle_doc_chat_model(self, data: dict):
+        """Dave picked another model in the Reader chat's menu."""
+        if self.state.doc_chat_id is None:
+            return
+        choice = self._choose_reader_model(data.get("model"))
+        if choice is None:
+            return
+        self._request_pi_warm("doc_chat_model")
+        await self.send_payload({"type": "doc_chat_model", "doc_id": self.state.doc_chat_id, "model": choice["id"]})
+        log.info("Reader chat for document %d now on %s", self.state.doc_chat_id, choice["model"])
+
+    def _apply_chat_model(self) -> None:
+        """Point the current agent conversation's pi turns at Dave's chosen model.
+
+        `prefer` is keyed by conversation id, and the id changes on reset, load, restore
+        and delegation pulls, so this runs after each of those and again before every pi
+        turn. A Reader chat keeps its own choice (doc_chat_model); a client that never
+        sent `chat_model` is left alone.
+        """
+        if self.state.chat_model is None or self.state.doc_chat_id is not None:
+            return
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is None or self.state.history_session is None:
+            return
+        choice = chat_model_choice(self.state.chat_model)
+        pi_brain.prefer(self.state.history_session.conv_id, choice.get("model"), choice.get("thinking"))
+
+    async def handle_chat_model(self, data: dict):
+        """Dave picked a model for the agent (`{"type": "chat_model", "model": <menu id>}`).
+
+        The choice belongs to the connection, not the conversation: it carries over New
+        chat, loading a past conversation and reconnect-restore. The ack names what is
+        now in effect (an unknown id falls back to the default) and repeats the menu.
+        """
+        choice = chat_model_choice(data.get("model"))
+        self.state.chat_model = choice["id"]
+        self._apply_chat_model()
+        if self.state.doc_chat_id is None and settings.pi_brain.enabled:
+            self._request_pi_warm("chat_model")
+        await self.send_payload({
+            "type": "chat_model",
+            "model": choice["id"],
+            "label": choice.get("label") or choice["id"],
+            **chat_models_payload(),
+        })
+        log.info("Agent model set to %s (%s)", choice["id"], choice.get("model") or "shared chain")
+
+    async def handle_doc_chat_position(self, data: dict):
+        """Where Dave was listening when he asked: the reader chat's "this"."""
+        if self.state.doc_chat_id is None or data.get("doc_id") != self.state.doc_chat_id:
+            return
+        ci, si = data.get("chunk_index"), data.get("sentence_index")
+        if isinstance(ci, int) and isinstance(si, int):
+            position = {"chunk_index": ci, "sentence_index": si}
+            # A selection: place_context rebuilds its text from the document by index.
+            ec, es = data.get("end_chunk_index"), data.get("end_sentence_index")
+            if isinstance(ec, int) and isinstance(es, int):
+                position.update(end_chunk_index=ec, end_sentence_index=es)
+            self.state.doc_chat_position = position
 
     async def handle_load_conversation(self, data: dict):
         from history import get_conversation_messages
@@ -342,17 +564,29 @@ class WebSocketSessionHandler:
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
+        self.state.doc_chat_id = None
+        await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.load_from_history(msgs)
         self.state.history_session = self.state.history.start_conversation(
             source="voice",
             model=settings.llm_chain[0]["model"],
         )
-        history_pairs = [
-            {"role": message["role"], "content": message["content"]}
-            for message in msgs
-            if message["role"] in ("user", "assistant") and message.get("content")
-        ]
+        self._apply_chat_model()  # before the warm, so it warms the chosen model
+        # The loaded thread runs on a new process; start it now and warm the template.
+        self._request_pi_warm("load_conversation", start=True)
+        history_pairs = []
+        for message in msgs:
+            if message["role"] not in ("user", "assistant") or not message.get("content"):
+                continue
+            pair = {"role": message["role"], "content": message["content"]}
+            # pi turns record the model that actually answered as "pi:<model>"; native
+            # turns record the chain's first model whether or not it answered, so only
+            # pi turns get a caption.
+            model = message.get("model") or ""
+            if message["role"] == "assistant" and model.startswith("pi:") and model[3:]:
+                pair["answered_by"] = chat_model_label(model[3:])
+            history_pairs.append(pair)
         await self.send_payload(
             {
                 "type": "conversation_loaded",
@@ -620,6 +854,11 @@ class WebSocketSessionHandler:
 
     async def handle_reader_play(self, data: dict):
         await self.cancel_reader_task()
+        self.state.reader_seq = data.get("seq", 0)
+        # `download` (strict, like `paced`): the client caches the audio without playing it, so the
+        # stream must not touch the reading place. No pacer either: nothing would send reader_heard.
+        download = data.get("download") is True
+        self.state.reader_pacer = ReaderPacer(self.state.reader_seq) if data.get("paced") is True and not download else None
         self.state.reader_task = asyncio.create_task(
             stream_reader_audio(
                 self.ws,
@@ -629,14 +868,38 @@ class WebSocketSessionHandler:
                 sentence_index=data.get("sentence_index", 0),
                 voice=data.get("voice", self.state.voice),
                 seq=data.get("seq", 0),
+                pacer=self.state.reader_pacer,
+                save_place=not download,
             )
         )
 
-    async def handle_reader_pause(self, _data: dict):
-        await self.cancel_reader_task()
+    async def handle_reader_heard(self, data: dict):
+        # Sent by a paced client as each sentence starts playing. Stale frames from
+        # an earlier play (after a seek) are dropped so they can't move the place back.
+        # Only a live paced stream takes them: once it has ended (and written "finished")
+        # a late or duplicate frame must not move the place back.
+        task = self.state.reader_task
+        if not self.state.reader_pacer or data.get("seq") != self.state.reader_seq or not task or task.done():
+            return
+        # Save before waking the stream: on the last sentence it then writes "finished" after this.
+        self._save_heard_position(data)
+        if self.state.reader_pacer:
+            self.state.reader_pacer.report(data.get("seq"), data.get("sentence_global"))
 
-    async def handle_reader_stop(self, _data: dict):
+    async def handle_reader_pause(self, data: dict):
         await self.cancel_reader_task()
+        self._save_heard_position(data)
+
+    async def handle_reader_stop(self, data: dict):
+        await self.cancel_reader_task()
+        self._save_heard_position(data)
+
+    def _save_heard_position(self, data: dict) -> None:
+        # Optional fields (2026-10-30): the sentence the client was hearing. Saved after
+        # the cancel, so it replaces the further-ahead place the stream recorded.
+        if "chunk_index" in data:
+            save_heard_position(self.state.history.db_path, data.get("doc_id"),
+                                data.get("chunk_index"), data.get("sentence_index"))
 
     async def handle_item_chat_load(self, data: dict):
         from history import (
@@ -828,7 +1091,10 @@ class WebSocketSessionHandler:
         # turn is already finished by the time the mic reopens, so this is a
         # no-op; it only bites when the user talks over a still-streaming reply.
         turn = self.state.turn_task
-        if turn and not turn.done():
+        pending = self.state.pending_confirm
+        # A turn waiting on a confirmation is not talking: Dave is opening the mic
+        # to answer it, and his transcript resolves it in _spawn_turn.
+        if turn and not turn.done() and (pending is None or pending.done()):
             turn.cancel()
             try:
                 await turn
@@ -839,6 +1105,8 @@ class WebSocketSessionHandler:
 
         self.state.stt_stream.reset()
         self.state.stt_stream.active = True
+        # Dave is speaking: warm pi's cache while he does (never blocks the capture).
+        self._request_pi_warm("stt_start", start=True)
         if self.state.vad is None:
             self.state.vad = SileroVAD()
         else:
@@ -859,6 +1127,7 @@ class WebSocketSessionHandler:
             if has_speech:
                 stream.speech_detected = True
                 stream.silence_start = None
+                stream.speech_end = len(stream.pcm_buffer)
             elif stream.speech_detected:
                 # Silence after speech — track duration
                 now = time.monotonic()
@@ -891,45 +1160,63 @@ class WebSocketSessionHandler:
             if not stream.active:
                 return
             buf = stream.pcm_buffer
+            generation = stream.generation
             try:
                 text = await transcribe_pcm(buf)
-                if text and text != stream.last_text:
-                    stream.last_text = text
-                    await self.send_payload({"type": "transcript_partial", "text": text})
             except Exception:
                 log.debug("Streaming STT chunk transcription failed", exc_info=True)
+                return
+            if not text or stream.generation != generation:
+                return  # empty, or the utterance was reset while Whisper ran
+            stream.last_text, stream.last_len = text, len(buf)
+            # Once the capture has stopped, handle_stt_stop owns the text: a partial
+            # sent now would land after the transcript and show as a second line.
+            if stream.active and text != stream.last_partial:
+                stream.last_partial = text
+                await self.send_payload({"type": "transcript_partial", "text": text})
 
     async def handle_stt_stop(self, _data: dict):
         """Finalize streaming transcription and start agent turn.
 
-        If we already have a partial transcription, use it immediately without
-        waiting for any in-flight Whisper call (which is likely just processing
-        silence). Only waits/re-transcribes if no partial was captured yet.
+        The latest partial usually lags the audio: Whisper was still working on a
+        newer buffer when the capture stopped, and that run is the one that heard
+        the last words. So wait (briefly) for an in-flight run instead of using a
+        stale partial, then transcribe once more only if VAD heard speech past
+        what the text covers. Nothing is sent as a partial after this point.
         """
         from stt import transcribe_pcm
 
         stream = self.state.stt_stream
         stream.active = False
-        last_text = stream.last_text
+        generation = stream.generation
 
-        if last_text:
-            # Already have good text from partials — use it immediately
-            stream.reset()
-        else:
-            # No partials yet (very short recording) — wait and transcribe
-            buf = stream.pcm_buffer
+        if stream._transcribe_lock.locked():
+            try:
+                await asyncio.wait_for(_acquire_and_release(stream._transcribe_lock), STT_FINAL_WAIT_S)
+            except asyncio.TimeoutError:
+                log.info("STT: in-flight transcription still running after %.1fs; using what we have", STT_FINAL_WAIT_S)
+        if stream.generation != generation:
+            return  # a new capture started while we waited
+
+        last_text = stream.last_text
+        buf = stream.pcm_buffer
+        if (not last_text or stream.speech_end > stream.last_len) and len(buf) >= 1600 * 4:
             async with stream._transcribe_lock:
-                last_text = stream.last_text
-                if not last_text and len(buf) >= 1600 * 4:
+                if not last_text:
                     await self.send_json("status", "Transcribing...")
-                    try:
-                        last_text = await transcribe_pcm(buf)
-                    except Exception as exc:
-                        log.exception("Streaming STT final transcription failed")
+                try:
+                    text = await transcribe_pcm(buf)
+                except Exception as exc:
+                    log.exception("Streaming STT final transcription failed")
+                    if not last_text:
                         await self.send_json("status", f"Transcription failed: {exc}")
                         stream.reset()
                         return
-            stream.reset()
+                    text = ""
+                if stream.generation != generation:
+                    return
+                last_text = text or last_text
+        stream.reset()
 
         if not last_text:
             await self.send_json("status", "Couldn't hear anything. Try again.")
@@ -937,6 +1224,34 @@ class WebSocketSessionHandler:
 
         await self.send_json("transcript", last_text)
         self._spawn_turn(last_text, source="voice")
+
+    async def handle_typing_start(self, _data: dict):
+        """A client saw Dave start typing: warm pi while he types (text turns)."""
+        self._request_pi_warm("typing_start", start=True)
+
+    def _request_pi_warm(self, reason: str, *, start: bool = False) -> None:
+        """Fire-and-forget /warm for this conversation's pi process (pi brain only).
+
+        Never raises and never awaits: warming must not delay or fail anything.
+        Vision threads stay native, so they are not warmed.
+        """
+        try:
+            pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+            if (
+                pi_brain is None
+                or self.state.history_session is None
+                or getattr(self.state.conversation, "has_images", False)
+            ):
+                return
+            pi_brain.request_warm(self.state.history_session.conv_id, start=start, reason=reason)
+        except Exception:
+            log.debug("pi warm request failed", exc_info=True)
+
+    async def _discard_pi_process(self) -> None:
+        """The conversation is ending (reset, load): stop its pi process, if any."""
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is not None and self.state.history_session is not None:
+            await pi_brain.discard(self.state.history_session.conv_id)
 
     def _spawn_turn(
         self,
@@ -963,6 +1278,15 @@ class WebSocketSessionHandler:
         "title"}`` recorded against the persisted user message via the
         ``attachments`` table (image_input / file_input turns only).
         """
+        pending = self.state.pending_confirm
+        if pending is not None and not pending.done():
+            from pi_brain import is_yes
+            pending.set_result(is_yes(user_text))
+            if self.state.history_session:
+                # The answer is a turn of its own in history, between the question and the result.
+                self._confirm_answer_task = asyncio.create_task(
+                    self.state.history_session.add_message_async(role="user", content=user_text))
+            return
         if self.state.turn_task and not self.state.turn_task.done():
             log.warning("Turn already in flight; dropping new turn request")
             return
@@ -992,16 +1316,20 @@ class WebSocketSessionHandler:
         attachment: dict | None = None,
     ):
         from agent import stream_agent_turn
-        from tts import synthesize
+        from pi_brain import stream_pi_turn, wants_pi
+        from tts import speech_audio
         async with self.state.turn_lock:
             turn_start = time.monotonic()
             await self.send_json("status", "Thinking...")
 
+            # OCTAVIUS_BRAIN=pi sends voice/text turns to pi (pi_brain.py).
             # Image turns route through the vision chain; everything else
             # (including file_input's synthetic instruction turns) uses the
             # default text chain unchanged.
+            use_pi = wants_pi(source, user_content, self.state.conversation)
             turn_model = (
-                settings.vision_llm_chain[0]["model"] if user_content is not None
+                f"pi:{settings.pi_brain.model}" if use_pi
+                else settings.vision_llm_chain[0]["model"] if user_content is not None
                 else settings.llm_chain[0]["model"]
             )
 
@@ -1024,10 +1352,16 @@ class WebSocketSessionHandler:
                 await self.send_json("status", text)
 
             full_reply_parts = []
+            self.state.pi_hop = None
+            # commit_reply_so_far (pi's confirm question) sends and clears these mid-turn.
+            self._turn_reply = (full_reply_parts, turn_model)
             first_sentence = True
             agent_error: Exception | None = None
-            try:
-                async for sentence in stream_agent_turn(
+            if use_pi:
+                self._apply_chat_model()
+                stream = stream_pi_turn(self, user_text, source=source, status_callback=status_cb)
+            else:
+                stream = stream_agent_turn(
                     self.state.conversation,
                     self.state.mcp_manager,
                     user_text,
@@ -1036,23 +1370,36 @@ class WebSocketSessionHandler:
                     session=self,
                     user_content=user_content,
                     source=source,
-                ):
-                    full_reply_parts.append(sentence)
-                    # Text-side streaming: emit each sentence as it lands so a
-                    # client can render progressively instead of waiting for the
-                    # final `response`. The Matrix sidecar edits its reply in
-                    # place from these; the browser ignores unknown frame types.
-                    # Sent before TTS so text isn't gated on audio synthesis.
-                    await self.send_json("response_delta", sentence)
-                    if self.state.tts_enabled:
-                        if first_sentence:
-                            await self.send_json("status", "Speaking...")
-                            first_sentence = False
-                        try:
-                            wav_bytes = await synthesize(sentence, voice=self.state.voice)
-                            await self.send_bytes(wav_bytes)
-                        except Exception:
-                            log.exception("TTS failed for chunk")
+                )
+            try:
+                # aclosing: a cancelled turn (barge-in, reset) must close the
+                # generator now, so the pi path aborts pi before the next prompt.
+                async with aclosing(stream) as sentences:
+                    async for sentence in sentences:
+                        full_reply_parts.append(sentence)
+                        # Text-side streaming: emit each sentence as it lands so a
+                        # client can render progressively instead of waiting for the
+                        # final `response`. The Matrix sidecar edits its reply in
+                        # place from these; the browser ignores unknown frame types.
+                        # Sent before TTS so text isn't gated on audio synthesis.
+                        await self.send_json("response_delta", sentence)
+                        if self.state.tts_enabled:
+                            if first_sentence:
+                                await self.send_json("status", "Speaking...")
+                                first_sentence = False
+                                if use_pi and self.state.pi_hop:
+                                    turn_model = f"pi:{self.state.pi_hop}"
+                                log.info(
+                                    "First sentence after %.2fs (%s, %s)",
+                                    time.monotonic() - turn_start, source, turn_model,
+                                )
+                            try:
+                                async for wav_bytes, is_math in speech_audio(sentence, voice=self.state.voice):
+                                    if is_math:
+                                        await self.send_payload({"type": "speech_clip", "math": True})
+                                    await self.send_bytes(wav_bytes)
+                            except Exception:
+                                log.exception("TTS failed for chunk")
             except Exception as exc:
                 # Capture but do NOT early-return — the finally block must
                 # send audio_done so continuous mode re-arms. Without it,
@@ -1072,7 +1419,16 @@ class WebSocketSessionHandler:
                 # On the happy path, send the response and persist it. On the
                 # error path, agent_error is set and we skip these — the
                 # history record was already written above.
+                if use_pi and self.state.pi_hop:
+                    turn_model = f"pi:{self.state.pi_hop}"  # the model that actually answered
                 if full_reply and agent_error is None:
+                    if use_pi and self.state.doc_chat_id is not None and self.state.pi_hop:
+                        await self.send_payload({"type": "doc_chat_answered_by", "model": self.state.pi_hop,
+                                                 "label": reader_model_label(self.state.pi_hop)})
+                    elif use_pi and self.state.chat_model is not None and self.state.pi_hop:
+                        # Only for clients using the menu, so others see no new frame type.
+                        await self.send_payload({"type": "answered_by", "model": self.state.pi_hop,
+                                                 "label": chat_model_label(self.state.pi_hop)})
                     await self.send_json("response", full_reply)
                     if self.state.history_session:
                         latency_ms = int((time.monotonic() - turn_start) * 1000)
@@ -1088,6 +1444,25 @@ class WebSocketSessionHandler:
                 # and continuous mode re-arms recording. This must run on
                 # every path: success, empty reply, or exception.
                 await self.send_json("status", "audio_done")
+
+    async def commit_reply_so_far(self) -> None:
+        """Send and record what this turn has said so far as a reply of its own.
+
+        pi_brain calls it after speaking a confirm question, so the question shows (and is
+        stored) before Dave's yes/no and the turn's final `response` holds only what came
+        after, instead of repeating the question under his answer.
+        """
+        reply = getattr(self, "_turn_reply", None)
+        if not reply:
+            return
+        parts, model = reply
+        text = "".join(parts).strip()
+        parts.clear()
+        if not text:
+            return
+        await self.send_json("response", text)
+        if self.state.history_session:
+            await self.state.history_session.add_message_async(role="assistant", content=text, model=model)
 
     async def cancel_reader_task(self):
         if self.state.reader_task and not self.state.reader_task.done():
@@ -1111,7 +1486,7 @@ class WebSocketSessionHandler:
 
     async def _proactive_speak(self, msg: ProactiveMessage) -> None:
         from agent import SENTENCE_END
-        from tts import synthesize
+        from tts import speakable, synthesize
 
         spoken = msg.text.split("\n\n===TOOL DATA", 1)[0].strip()
         if not spoken:
@@ -1145,7 +1520,7 @@ class WebSocketSessionHandler:
             if not sentence:
                 continue
             try:
-                wav_bytes = await synthesize(sentence, voice=self.state.voice)
+                wav_bytes = await synthesize(await speakable(sentence), voice=self.state.voice)
                 await self.send_bytes(wav_bytes)
             except Exception:
                 log.exception("TTS failed for proactive chunk")

@@ -12,9 +12,37 @@ from local_tool_inbox import _format_age
 from reader_store import create_document, list_documents
 from reader_text import ingest_document
 from reader_ingest_handlers import ingest_pdf_document, start_text_ingest
+from media_uploads import resolve_spooled_media
 from reader_ingest_service import ReaderIngestError, append_reader_document
+from settings import settings
 
 log = logging.getLogger(__name__)
+
+PAPERS_DIR = "/media/extra_stuff/papers"
+SOURCE_REFUSED = (
+    "Error: I can only read files from the downloads folders, the media spool, the "
+    "paper library or ~/school_lab, and never a hidden file or folder. Ask Dave to add "
+    "it from the Reader page instead."
+)
+
+
+def _tool_source_roots() -> list:
+    home = Path.home()
+    return [settings.downloads_dir, *settings.media_spool_dirs, home / "Downloads", PAPERS_DIR, home / "school_lab"]
+
+
+def tool_source_path(path: str) -> Path | None:
+    """A file the model may load into the Reader, resolved; None if it may not.
+
+    The model's reader tools can now read a document back (reader chat look-ups) and
+    have the open web, so a file path from an injected instruction (say
+    ~/.config/secrets.env) must not load. Paths Dave types into /reader or the Android
+    app go through the REST routes, which keep accepting any path.
+    """
+    resolved = resolve_spooled_media(str(Path(path).expanduser()), _tool_source_roots())
+    if resolved is None or any(part.startswith(".") for part in resolved.parts):
+        return None
+    return resolved
 
 
 def _load_trafilatura():
@@ -64,9 +92,9 @@ async def read_document(args: dict, session=None, mcp_manager=None) -> str:
             f"(document #{result['id']}). It'll be available at /reader shortly."
         )
 
-    source_path = Path(path)
-    if not source_path.exists():
-        return f"Error: file not found: {path}"
+    source_path = tool_source_path(path)
+    if source_path is None:
+        return SOURCE_REFUSED
 
     title = args.get("title", source_path.stem)
 
@@ -132,6 +160,11 @@ async def append_to_reader_document(args: dict, session=None, _mcp_manager=None)
         return "Error: document_id (an integer, from list_reader_documents) is required."
     if not args.get("text") and not args.get("path"):
         return "Error: provide either text (the content to add) or path (a file to add)."
+    if args.get("path"):  # checked even beside text, though the append then uses the text
+        source_path = tool_source_path(str(args["path"]))
+        if source_path is None:
+            return SOURCE_REFUSED
+        args = {**args, "path": str(source_path)}
 
     try:
         result = await append_reader_document(Path(session.db_path), doc_id, args)
@@ -156,9 +189,9 @@ async def process_pdf_background(args: dict, session=None, mcp_manager=None) -> 
     if not file_path:
         return "Error: file_path is required."
 
-    source_path = Path(file_path)
-    if not source_path.exists():
-        return f"Error: file not found: {file_path}"
+    source_path = tool_source_path(file_path)
+    if source_path is None:
+        return SOURCE_REFUSED
     if source_path.suffix.lower() != ".pdf" and not is_pdf_file(source_path):
         return f"Error: {file_path} is not a PDF file."
     if source_path.suffix.lower() != ".pdf":

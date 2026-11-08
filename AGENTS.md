@@ -71,7 +71,7 @@ for every `LLMChainClient` request path (`stream_chat`, `complete`,
 - **`OCTAVIUS_LR_API_KEY`** (preferred; `LR` = lilripper) — a bare token applied
   to **both** lilripper router ports. This is the value that rotates, so it
   **wins** over the JSON map. The var name is stable across rotations by design.
-  It is scoped to lilripper, *not* to a port: `lilbuddy:8010` and
+  It is scoped to lilripper, *not* to a port: `lilbuddy:8010`, `workhorse:8010` and
   `triplestuffed:8010` also listen on 8010 and are open, so they must never
   receive the header (`settings.KEYED_LR_ORIGINS` pins this; there are tests).
   **Widened from `:8010`-only on 2026-08-26**, when `:8020` was found to have
@@ -85,12 +85,20 @@ for every `LLMChainClient` request path (`stream_chat`, `complete`,
 
 Endpoints absent from both are called with no `Authorization` header. Keys are
 held per origin, not per chain entry, because one endpoint is reached from
-several chains — as of 2026-09-10 `lilripper:8010` serves the **main chain
-primary**, the subagent and vision *fallbacks*, the reader LLM (reached through
-the main-chain client's `urls=` override), and the summary primary; the
-subagent and vision *primaries* sit on `triplestuffed:8010`, which is open.
-Its position as main-chain primary means an unset or stale key breaks the
-*first* hop of every turn, not a fallback.
+several chains — as of 2026-10-28 `lilripper:8020` is the **fallback of every
+role** (main, subagent, vision, reader, summary), and Octavius no longer uses
+`lilripper:8010` at all (it serves only `glm-5.3-flash`). Every *primary* sits on
+an open endpoint (lilbuddy or workhorse), so an unset or stale key no longer
+breaks the first hop of a turn — it silently removes the safety net instead,
+which is harder to notice. Watch `/health`'s `endpoints_rejecting_credentials`.
+
+**Sourcing the key by hand:** every line of `~/.config/secrets.env` must be an
+`export` line. `OCTAVIUS_LR_API_KEY` was a bare assignment until 2026-10-28, so
+`source ~/.config/secrets.env` set it in the shell but not in child processes:
+`${OCTAVIUS_LR_API_KEY:+yes}` said yes while `scripts/octavius-models check` saw
+no key and reported every lilripper entry as a 401. (The service was unaffected —
+its wrapper echoes the value out of a subshell.) To run `check` by hand:
+`set -a; source ~/.config/octavius/env; source ~/.config/secrets.env; set +a`.
 
 **This is not hypothetical — it happened.** Until 2026-08-26,
 `~/.config/octavius/env` carried a *stale* token inside `OCTAVIUS_LLM_API_KEYS`
@@ -159,10 +167,9 @@ runs thinking on** (the Qwen3 template default, so no `params` are needed for
 it); speed is bought on the fallbacks instead. Cost of that choice, measured
 end-to-end: first audio ~2.2-4.0 s with thinking, ~1.5-1.8 s without. If it is
 ever traded back, prefer `reasoning_effort: "low"`/`"medium"` — a dial rather
-than the `enable_thinking` switch. The gemma4 entries (main hop 3, subagent
-primary, vision primary, reader fallback) run **uncapped**: `reasoning_effort:
-"low"` was tried on them on 2026-09-10 and removed the same day. Measured on
-triplestuffed, warm: a trivial prompt answers in ~0.2-0.3 s either way; a real
+than the `enable_thinking` switch. The gemma4 entries (since 2026-10-28, every
+primary) run **uncapped**: `reasoning_effort: "low"` was tried on the 26B on
+2026-09-10 and removed the same day. Measured then, warm: a trivial prompt answers in ~0.2-0.3 s either way; a real
 paragraph-length question takes ~4.6-5.7 s uncapped (~3500-4300 reasoning
 chars) against ~3.6-3.9 s capped (~2800 chars). The cap trims a quarter to a
 third, not an order of magnitude — gemma4 is fast because it is an A4B, not
@@ -287,7 +294,61 @@ orchestrator. Re-enabling it is one tool spec + one registry line. Quick
 domains (email/tasks/research) deliberately stay inline (low voice latency,
 warm MCP sessions); only long-running deep research is backgrounded.
 
-The email subagent prompt uses evangeline's `hybrid_search` (RRF fusion of
+**pi brain (opt-in, `OCTAVIUS_BRAIN=pi`, default `native`).** Voice and text
+turns can instead run on a long-lived `pi --mode rpc` process per conversation,
+launched through `pi_harness/scripts/pi-octavius` (the `octavius` profile:
+email/calendar/vault/vikunja/web tools direct, `scholar` as the only subagent).
+`pi_brain.stream_pi_turn` has `stream_agent_turn`'s contract, so `run_turn`
+picks one or the other per turn (`pi_brain.wants_pi`). Image turns, vision
+threads, item chat and file turns stay native. SQLite stays authoritative: a
+fresh or crashed process is seeded with a compact transcript of the in-memory
+`Conversation`. pi has no round cap, so `pi_brain` counts `turn_end`, steers
+at 5 and aborts at `max_tool_rounds`. Vikunja writes are **not** confirmed (since
+2026-10-31; pi_harness `octavius-guard.ts` instead refuses description replacement
+and over-long writes, and the profile exposes no delete tool). The confirm relay
+stays for any extension that asks: an RPC `confirm` is spoken, sent as
+`confirm_request` + `audio_done`, and Dave's next transcript or `text_input`
+answers it (`_spawn_turn`; opening the mic then is not a barge-in).
+A process seeded from history is marked private for the guard when the conversation read private data earlier (`conversation_read_private` over `tool_calls`, using pi_harness's `private-data.json` beside the launcher, fail closed; the seed carries `TAINT_MARKER`), since the replayed transcript has no tool results the guard could see. Processes are reaped after `OCTAVIUS_PI_IDLE_REAP_S` (4 h), killed on reset,
+load and shutdown, and re-keyed on `restore_session`. **Cache warming**
+(pi_harness `octavius-warm.ts`, RPC prompt `/warm`): `stt_start`, a new
+`typing_start` WS frame (no client sends it yet), `load_conversation` (these
+three start the process if needed) and `restore_session` warm the conversation's
+process; startup and recovery (after a failed warm or turn, retried with backoff
+until one succeeds) warm system + tools through a short-lived `--no-session`
+process. All fire-and-forget (`PiProcessManager.request_warm`); a process with no
+turns yet is still seeded. **Live since 2026-10-31** (`OCTAVIUS_BRAIN=pi` in
+`~/.config/octavius/env`; roll back by setting `native` and restarting). pi's own key
+for lilripper `:8020` is `PI_AGENT_LR_API_KEY` (pi_harness models.json, provider
+`lrv-p01`), exported by the service drop-in the same way as `OCTAVIUS_LR_API_KEY`;
+without it the `:8020` failover hop is invisible to pi. Knobs:
+`OCTAVIUS_PI_LAUNCHER`, `OCTAVIUS_PI_BIN` (the user service's PATH lacks
+`~/.local/bin`), `OCTAVIUS_PI_PATH` (prepended to pi's PATH only: the service's PATH
+finds `/usr/bin/node` 18, which cannot run pi 1.4.0 — the live env points it at nvm's
+Node 24, so bump it when nvm's version changes; without it every pi start fails with
+`enableCompileCache` and every warm reports "pi process exited"), `OCTAVIUS_PI_MODEL`, `OCTAVIUS_PI_TURN_TIMEOUT_S` (600),
+`OCTAVIUS_PI_CONFIRM_TIMEOUT_S` (55), `OCTAVIUS_PI_WARM` (on),
+`OCTAVIUS_PI_WARM_DEBOUNCE_S` (5), `OCTAVIUS_PI_WARM_RETRY_S` (60), `OCTAVIUS_PI_TOOLS_PORT` (8032). `/health` → `pi_brain`.
+**Failover** (Octavius-driven over RPC, `set_model`): hops `OCTAVIUS_PI_MODEL` then `OCTAVIUS_PI_FALLBACK_MODELS`
+(`lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b`), pi's own auto-retry off. A turn moves on a provider error (5xx, 401, 400/404,
+refused connect) or when the model is silent for `OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S` (60, before its first output)
+or `OCTAVIUS_PI_SILENCE_TIMEOUT_S` (30, after; thinking counts, tool runs do not); a context overflow instead moves that
+turn alone to a bigger-window hop (`OCTAVIUS_PI_MODEL_CONTEXTS`), never touching the shared hop. It then resumes in the same pi session with a short note (a tool that already ran is not re-run). One shared
+current hop (`FailoverState`): new processes start on it, live ones `set_model` before their turn, and
+`OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300) later the next turn tries the primary again. `/health` → `pi_brain.failover`;
+each failover logs at WARNING.
+**Octavius's own tools for pi** (`pi_tools_server.py`): 16 of the local tools (notes, memory,
+conversation history, reader, reader look-ups; not `download_file`/`process_pdf`/`check_document_status`) are served to pi
+as the `octavius` MCP server, dispatched through `tools.call_tool`. It listens on its own socket on
+`127.0.0.1:8032`, never on the FastAPI app (Caddy publishes that), started in `main.py`'s lifespan only
+when the pi brain is on. Each pi process gets a random token in `PI_OCTAVIUS_TOOLS_TOKEN` (not an
+`OCTAVIUS_*` name, which `child_env` strips); `stream_pi_turn` binds it to the turn's
+`history_session`/`mcp_manager`/session for the turn and unbinds in `finally`, so a call outside a
+turn is a tool error. pi never gets
+`OCTAVIUS_*` env vars. `/health` → `pi_brain.warm` has warm counts and the last
+result (`prompt_n` = tokens prefilled, `cache_n` = from cache). Design and status: `docs/pi-backend-design.md`.
+
+The email subagent prompt uses evangeline's `email_hybrid_search` (RRF fusion of
 semantic + BM25) for anything matching on body text. **Folder scope is a closed
 set of five values** — `"Inbox"` (the default), `"Read Later"`, `"Follow-Up"`,
 `"Todo"`, or All (`folder=null`) — and All requires Dave to ask for it
@@ -304,42 +365,79 @@ Two traps the prompt now names, both of which cost real turns:
   mail". The prompt used to say `folder="INBOX"`, which matches **nothing**
   (the folder is `Inbox`). A zero-result folder search should be read as a
   suspected typo first.
-- The tools disagree on their own defaults (`hybrid_search` defaults to all
-  folders; `search_emails` / `semantic_search` default to Inbox *and* a 6-month
+- The tools disagree on their own defaults (`email_hybrid_search` defaults to all
+  folders; `email_keyword_search` / `email_semantic_search` default to Inbox *and* a 6-month
   lookback), so the prompt requires `folder` to be passed explicitly on every
   call rather than relying on any tool's default.
 
 External services currently expected:
 
-- **STT**: faster-whisper at `lilripper:8552/api/transcribe` (large-v3, int8_float16, CUDA)
-- **LLM chain (main agent)**: via `OCTAVIUS_LLM_CHAIN`, defaulting to:
-  - primary: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general` — a llama.cpp **router**, so the model id selects the model (see "Router model ids" below). `--parallel 4` (re-verified 2026-09-10; was 5 as of 08-26). Accepts image input. **Behind auth**, which means a missing/stale key now 401s the *primary* rather than a fallback — check `/health`'s `endpoints_rejecting_credentials` first when the chain looks flaky. **Promoted from second hop on 2026-08-18** (see the `:8020` bullet for why); it still names the same alias as the subagent and vision *fallbacks*, the reader, and the summary primary, so a turn → consult → document read keeps one model resident with no router swap (the consult and image *primaries* now sit on triplestuffed — see below).
-  - first fallback: `lilripper:8020/v1/chat/completions` (**`qwen3.8-27b`**) — repointed 2026-08-26: the `qwen3.6-35b-a3b-mtp-general` alias left this port's catalog, so the entry named a model that no longer existed and every failover into it hard-400'd. This port also **went behind the same auth as `:8010`** (it is no longer open), which is why `OCTAVIUS_LR_API_KEY` now covers both. **As of 2026-09-10 it is a vLLM server, not a llama.cpp router** — it serves `Qwen3.8-27B-AWQ-INT4` (a 4-bit quant, 262k ctx), is effectively always warm (0.3 s, measured 2026-09-10; the old ~26 s cold load is gone), and has no `status.args` in `/v1/models`, so the inspection recipe below does not apply to it. **Demoted from primary on 2026-08-18**: `:8020` is the port Dave loads other models onto by hand, and as the primary, every Octavius turn evicted whatever was there. As a fallback it only answers when `:8010` is genuinely broken. (Under the old llama.cpp setup it was also shared with pi-agent, whose 27B contention produced a live `500 model ... failed to load`; the vLLM replacement changes that failure mode.)
-  - second fallback: `triplestuffed:8010/v1/chat/completions` (`gemma4-26b-a4b`) — the only hop on another host, so the only thing keeping this chain alive if lilripper is down. **Re-added after the 2026-08-08 removal** (the Positron-era zombie that accepted connections without generating is gone): it is now a working llama.cpp router — `gemma4-26b-a4b` loaded (`--parallel 4`, 262k ctx, image input) plus `zeta-2.1` — and open (no auth). Verified 2026-09-10.
-    - **Why not lilbuddy for this hop: the OOM-cascade rule.** An OOM on lilbuddy takes the *live* voice path down with it, not just a fallback: `:8020` (bge-m3 embeddings) and `:8880` (Kokoro, the only TTS) are separate processes on the same box and both sit on every turn. On 2026-08-18, asking lilbuddy to load `qwen3.6-35b-a3b-mtp-q4-general` produced **502 on every alias and every port on the box** for ~2 min; root-caused by Dave 2026-08-21 — the router ran `max_models=3` with over-generous `--ctx-size` (now 2), so a dense 35B on top of two incumbents exhausted the 128 GB of unified memory. Size any future lilbuddy hop against the whole box's residency budget, not the model alone.
-    - **gemma4 is a thinking model that returns reasoning in a separate `reasoning_content` field**, not inline <think> tags — the <think> stripper never sees it and `agent.py`'s `delta.get("content", "")` drops it for free. Measured 2026-09-10 on this host, warm: ~0.2-0.3 s on a trivial prompt, ~4.6-5.7 s on a paragraph-length question (~3500-4300 reasoning chars); the ~28 s figure in `docs/status.md` was lilbuddy end-to-end during the 08-26 auth incident, not this hop. **The trap is still `max_tokens`:** a budget spent on reasoning returns `finish_reason: length` with **empty** `content` — anything that starts sending `max_tokens` here must budget for reasoning tokens.
-  - `triplestuffed:8010` was removed from this chain on 2026-08-08 (the Positron zombie) and **re-added as the second fallback** — see the bullet above. The removal was real at the time: it listed fine and never generated, so a failover into it burned the full 120 s read timeout.
-- **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN`, defaulting to:
-  - primary: `triplestuffed:8010/v1/chat/completions` running `gemma4-26b-a4b`, `capacity: 3` — moved off `lilripper:8010`, which had dropped to `--parallel 4`: a capacity-4 subagent primary would have consumed the whole endpoint, leaving no slot for the main turn, reader, and summaries sharing it. Capacity 3 of triplestuffed's `--parallel 4` deliberately leaves one slot for the vision primary, the main chain's hop 3, and the reader fallback — all the same model on the same host. Chosen for speed and simplicity: `consult_specialist` runs *inline* against the user's turn (the dominant first-turn cost, ~15 s average / 50 s worst on the 35B), and gemma4 answers a real question in ~5 s warm, thinking on. What goes through it is only the three specialist domains — email, research, tasks. `web_search` / `read_url` are direct tools of the main agent and never touch this chain. The old primary — `lilripper:8010` `qwen3.6-35b-a3b-mtp-general`, capacity 4, thinking on — is fallback 1 below.
-  - fallback: `lilripper:8010/v1/chat/completions` running `qwen3.6-35b-a3b-mtp-general`, `capacity: 4` — HTTP-level failover, active only when the gemma4 primary is down. Capacity 4 equals `:8010`'s full `--parallel 4`: fine in practice because while a consult runs inline the main turn is blocked awaiting it, not holding a slot. **The dispatcher keeps only the first `fallback` entry** (`subagent_dispatcher.py` — `elif ep.role == "fallback" and fallback is None`), so a second one is dead config; a `:8020` entry was removed for that reason on 2026-09-10.
+- **STT**: faster-whisper on **triplestuffed** (this host; moved from lilripper 2026-11-03), large-v3, int8_float16, CUDA. The server listens on `127.0.0.1:8502` and Caddy exposes it at `triplestuffed:8552`. Octavius reaches it on loopback, `http://127.0.0.1:8502/api/transcribe`: that is the code default and what `~/.config/octavius/env` sets. Running Octavius on another host means setting `OCTAVIUS_STT_URL` to `http://triplestuffed:8552/api/transcribe`.
+**Routing below is what `models.json` loads as of 2026-10-28.** The code defaults in
+`settings.py` (and `.env.example`) match it (updated 2026-10-30), so a missing or
+unreadable `models.json` falls back to the same routing — `scripts/octavius-models show`
+says which file loaded. A models.json that lists a single `reader` entry still means
+"no reader fallback"; the default fallback applies only when the file omits `reader`.
+
+**2026-10-28 reshuffle (Dave):** `lilripper:8010` now serves **only `glm-5.3-flash`**
+(text-only), so the five roles that shared `qwen3.6-35b-a3b-mtp-general` there — main
+hop, subagent fallback, vision fallback, reader primary, summary primary — had to
+move, and `gemma4-26b-a4b` had already left triplestuffed (it now serves
+`gemma4-12b`). Octavius no longer touches `lilripper:8010` at all. The main agent
+and vision run on lilbuddy's `gemma4-26b-a4b`; everything non-interactive runs on
+triplestuffed's `gemma4-12b`; `lilripper:8020` `qwen3.8-27b` is every role's
+fallback. Verified before `apply`: both gemma4 hops make well-formed `web_search`
+tool calls (~0.5-1 s), the 12B returns a correct summary with `enable_thinking:
+false`, and `:8020` answers an image prompt.
+
+**2026-10-31 (Dave): triplestuffed → workhorse.** triplestuffed stopped serving
+`gemma4-12b` on 2026-10-30 (pi_harness moved its agents to workhorse) and its router
+502'd, so the four roles on it were silently failing over to `:8020`. They now use
+**`workhorse:8010` `gemma4-12b`** — vLLM, open, **64K ctx**, text-only, shared with
+pi_harness's research agents. Verified: plain answer 0.4 s, well-formed tool call,
+`enable_thinking: false` honoured, `octavius-models check` all ok. Backup of the old
+file: `~/.config/octavius/models.json.bak-2026-10-31-pre-workhorse`.
+
+- **LLM chain (main agent)**: via `OCTAVIUS_LLM_CHAIN` / `models.json` `main`:
+  - primary: `lilbuddy:8010/v1/chat/completions` running `gemma4-26b-a4b` — a llama.cpp **router**, so the model id selects the model (see "Router model ids" below). `--parallel 2`, 295k ctx, text+image+video, open (no auth). **It shares those two slots with the vision primary**: fine for one user, but a voice turn plus two concurrent image threads queue.
+    - **The OOM-cascade rule, and why lilbuddy is now acceptable here.** An OOM on lilbuddy takes everything on the box down with it. On 2026-08-18, asking lilbuddy to load `qwen3.6-35b-a3b-mtp-q4-general` produced **502 on every alias and every port on the box** for ~2 min; root-caused by Dave 2026-08-21 — the router ran `max_models=3` with over-generous `--ctx-size` (now 2), so a dense 35B on top of two incumbents exhausted the 128 GB of unified memory. For the 2026-10-28 move Dave re-sized what lilbuddy serves so this cannot recur (and TTS has since left the box for Phonon on lilripper). Still size any new lilbuddy alias against the whole box's residency budget, not the model alone — its `:8020` bge-m3 embedder serves search.
+    - **gemma4 is a thinking model that returns reasoning in a separate `reasoning_content` field**, not inline <think> tags — the <think> stripper never sees it and `agent.py`'s `delta.get("content", "")` drops it for free. Measured 2026-09-10 on the 26B, warm: ~0.2-0.3 s on a trivial prompt, ~4.6-5.7 s on a paragraph-length question (~3500-4300 reasoning chars). **The trap is `max_tokens`:** a budget spent on reasoning returns `finish_reason: length` with **empty** `content` — anything that starts sending `max_tokens` to a gemma4 hop must budget for reasoning tokens.
+  - first fallback: `lilripper:8020/v1/chat/completions` (**`qwen3.8-27b`**) — **a vLLM server, not a llama.cpp router** (since 2026-09-10): `Qwen3.8-27B-AWQ-INT4`, 262k ctx, takes images, effectively always warm (0.3 s). **Behind the same auth as `:8010`**, which is why `OCTAVIUS_LR_API_KEY` covers both. Its `/v1/models` has no `status.args`, so the inspection recipe does not apply. **Never the primary of anything**: `:8020` is the port Dave loads other models onto by hand, and as a primary every Octavius turn would evict whatever was there (demoted for exactly that on 2026-08-18).
+  - second fallback: `workhorse:8010/v1/chat/completions` (`gemma4-12b`, vLLM, since 2026-10-31) — the third host, so voice survives lilbuddy *and* lilripper both being down. 64K ctx, **text-only** (fine here: image turns use the vision chain). It was `triplestuffed:8010` until that host stopped serving the model; triplestuffed was also pulled once before, 2026-08-08, as a zombie (listed fine, never generated, so failover burned the full 120 s read timeout).
+- **Subagent LLM chain**: separate routing for delegated subagents via `OCTAVIUS_SUBAGENT_LLM_CHAIN` / `models.json` `subagent`:
+  - primary: `workhorse:8010/v1/chat/completions` running `gemma4-12b` (vLLM), `capacity: 3` — leaves room for main hop 3, the reader, summaries and pi_harness's agents, which share the model (pi_harness measured 6 concurrent requests with none queued). `consult_specialist` runs *inline* against the user's turn (the dominant first-turn cost — ~15 s average / 50 s worst on the old 35B), so speed matters here. Only the three specialist domains go through it — email, research, tasks; `web_search` / `read_url` are direct tools of the main agent and never touch this chain.
+  - fallback: `lilripper:8020/v1/chat/completions` running `qwen3.8-27b`, `capacity: 2` (a guess — vLLM's concurrency limit is not readable from `/v1/models`; it only matters during failover). **The dispatcher keeps only the first `fallback` entry** (`subagent_dispatcher.py` — `elif ep.role == "fallback" and fallback is None`), so a second one is dead config.
   - The dispatcher (`subagent_dispatcher.py`) routes by `role`. Only two roles matter per call: `primary` (first-try / concurrency routing, with `secondary` as an optional concurrency-overflow tier) and `fallback` (the single per-call HTTP-failover target passed alongside the assigned URL). Per-endpoint `capacity` controls how many concurrent subagents may share an endpoint.
-  - **Model is per endpoint, not per domain.** `subagent.py::_model_for_url` resolves the model from the chain entry matching the assigned URL, so all three specialist domains share one model per endpoint (today, gemma4 on triplestuffed). Per-domain models would need a `model` key on `SUBAGENT_DOMAINS` overriding that lookup.
-  - **Router model ids (the alias is load-bearing).** `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so an alias absent from that endpoint's catalog hard-400s and silently burns a failover hop. **The catalogs churn — Dave rebuilds them. Re-curl `/v1/models` before trusting anything below, and treat a config referencing a missing alias as the first suspect after any router work.** The bare `qwen3.6-35b-a3b` alias exists on **no host in the fleet**. Catalogs re-curled 2026-09-10:
-    - `:8010` (9 aliases, same set as 08-26): `qwen3.6-35b-a3b-mtp-{code,general}`, `gemma4-26b-a4b`, `gemma4-31b`, `ministral-14b`, `muse-glimmer-30b`, `qwen3.5-9b`, `qwen3.8-27b`, `qwen3.8-27b-non-thinking`. `qwen3.6-35b-a3b-mtp-general` is resident, `--parallel 4` (down from 5), `--ctx-size 614400`. `qwen3.5-9b` is the known zombie (lists, never generates) — do not point anything at it.
-    - `:8020` (**vLLM, not a llama.cpp router**): `qwen3.8-27b` = `Qwen3.8-27B-AWQ-INT4`, `max_model_len` 262144, behind auth. No `status.args` in its `/v1/models`.
-    - `triplestuffed:8010` (llama.cpp router, open): `gemma4-26b-a4b` (loaded, `--parallel 4`, 262k ctx, image) and `zeta-2.1` (text-only). Carries the subagent primary, the vision primary, the main chain's hop 3, and the reader fallback.
-    - `lilbuddy:8010` (llama.cpp router, open, 8 aliases): `DEFAULT` (text), `gemma4-26b-a4b`, `ling-3.0-flash` (loaded; text-only, 262k ctx, `--parallel 1`), `muse-glimmer-30b`, `qwen3.5-4b`, `qwen3.5-9b`, `qwen3.6-35b-a3b-mtp-q4-{code,general}` (loaded). Image input on everything except `DEFAULT` and `ling-3.0-flash`. The q4 MTP aliases live here. **`ling-3.0-flash` is deliberately off the routing**: it is the designated model for the future `deep_research` domain when the async path is revived — 262k ctx for long tool-heavy loops, `--parallel 1` (one deep-research job at a time is exactly right), async so no live-path latency; keeping it off the voice path also keeps a lilbuddy hop out of the OOM-cascade risk (main chain's second-fallback bullet).
-    - **Modalities churn too.** As of 2026-09-10 most lilripper aliases report `text,image`, but `ministral-14b` and `qwen3.5-9b` are text-only, and so are triplestuffed's `zeta-2.1` and lilbuddy's `DEFAULT` / `ling-3.0-flash`. Read `architecture.input_modalities` before assuming a hop can take images, in either direction.
-  - **Keep `:8010`'s consumers on one alias.** As of 2026-09-10 that is still nearly everything on that endpoint — main chain primary, subagent fallback 1, vision fallback 1, reader, summary primary — and they all name `qwen3.6-35b-a3b-mtp-general`. If any one of them disagrees, interleaving a document read with a consult thrashes the router between resident models. Same discipline on `triplestuffed:8010`, whose four gemma4 consumers (subagent primary, vision primary, main hop 3, reader fallback) must keep naming `gemma4-26b-a4b`.
-  - **Cross-host failover exists now:** the subagent primary sits on triplestuffed, so consults survive a lilripper outage (they fail over to `:8010`, which is up by definition in that scenario). The remaining hole is the two-host case: lilripper *and* triplestuffed both down leaves consults — and the main chain's hop 3 and the vision primary, which share triplestuffed — with nowhere to go. `lilbuddy:8010` is the candidate third host, but see the OOM-cascade rule before putting anything of its on the live path.
-- **TTS**: Kokoro at `lilbuddy:8880/v1/audio/speech` (voice `bm_lewis`) — the live
-  default. `TTSSettings.voxtral_enabled` is **False**, so every synth call goes
-  straight to Kokoro (Voxtral-only voices remap to the fallback voice). Voxtral 4B
-  (`OCTAVIUS_TTS_URL`) is wired but disabled — its inconsistent output levels make
-  it unsuitable as the live primary. Set `OCTAVIUS_TTS_VOXTRAL_ENABLED=1` to restore
-  the Voxtral-primary → Kokoro-fallback path (with circuit breaker).
-- **Reader LLM**: `qwen3.6-35b-a3b-mtp-general` at `lilripper:8010/v1/chat/completions` (**behind auth** — needs a bearer token; see "Configuration and secrets"), with `gemma4-26b-a4b` at `triplestuffed:8010` as fallback (added 2026-09-10). The reader is single-endpoint *per call* but the role's second `models.json` entry is its failover target: `reader_text.py::_llm_convert_math` tries each endpoint in turn before degrading to local `strip_latex`, which is what a dead `:8010` used to do to every math chunk (dollar-stripping, silently). `ReaderSettings.llm_fallback_url/model` read the second entry via `_role_single(..., index=1)`; a half-configured entry raises. Note that `LLMChainClient.complete()` merges per-url `params` from the **main** chain, and the fallback URL *is* main-chain hop 3 — so any `params` set on that main-chain entry silently apply to reader fallback calls too (none today). `qwen3.5-9b` is still in `:8010`'s catalog but went stale — it lists in `/v1/models` and then hangs on completion; do not point anything at it. The primary alias deliberately matches the subagent's `:8010` fallback entry.
-- **Summary/tag generation**: `lilripper:8010` with fallback `lilripper:8020`, model `qwen3.6-35b-a3b-mtp-general` (moved off the then-dead lilbuddy/triplestuffed pair 2026-08-08 — triplestuffed is back, see the main chain bullet; reordered `:8010`-first 2026-08-18). The order matters more than the traffic volume suggests: summaries fire at conversation *end*, long after Dave has moved on, so with `:8020` primary a background job could quietly evict a model he had loaded there by hand. `SummaryClient` is **not** an `LLMChainClient`, but as of 2026-08-26 it carries a model **per URL** (`summary_model` / `summary_fallback_model`, the latter defaulting to `qwen3.8-27b`). It previously sent one model to both URLs, which became a guaranteed 400 on the fallback the moment the two routers stopped sharing an alias. It does attach `auth_headers` (added 2026-08-08 — previously it sent none, so any authed endpoint here would have 401'd silently). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
+  - **Model is per endpoint, not per domain.** `subagent.py::_model_for_url` resolves the model from the chain entry matching the assigned URL, so all three specialist domains share one model per endpoint (today, gemma4-12b on workhorse). Per-domain models would need a `model` key on `SUBAGENT_DOMAINS` overriding that lookup.
+  - **Router model ids (the alias is load-bearing).** `complete_with_tools` uses each chain *entry's* model (the payload model is ignored) and fails over on any 4xx/5xx, so an alias absent from that endpoint's catalog hard-400s and silently burns a failover hop. **The catalogs churn — Dave rebuilds them. Re-curl `/v1/models` before trusting anything below, and treat a config referencing a missing alias as the first suspect after any router work** (it was the cause on 2026-08-26 and again on 2026-10-28). Catalogs re-curled 2026-10-28:
+    - `lilripper:8010`: `glm-5.3-flash` only (loaded, text-only, behind auth; no `--parallel`/`--ctx-size` in its `status.args`). **Unused by Octavius.**
+    - `lilripper:8020` (**vLLM**): `qwen3.8-27b` = `Qwen3.8-27B-AWQ-INT4`, `max_model_len` 262144, behind auth, takes images.
+    - `workhorse:8010` (**vLLM**, open, since 2026-10-31): `gemma4-12b`, `max_model_len` 65536, **text-only**. Carries the subagent primary, reader and summary primaries, and main hop 3.
+    - `triplestuffed:8010`: no longer serves `gemma4-12b` (2026-10-30) and returned 502 on 2026-10-31. **Unused by Octavius.**
+    - `lilbuddy:8010` (llama.cpp router, open, 12 aliases, everything `--parallel 2`): loaded are `gemma4-26b-a4b` (295k ctx, `--ubatch-size 2048`, text+image+video) and `nemotron-3.5-super` (307k ctx, text+image+video); unloaded are `DEFAULT`, `agents-a1-4b`, `gemma4-12b` (text+image+audio — a different build from triplestuffed's text-only one), `muse-glimmer-30b`, `neohorse-1-9b`, `ornith-1.5-9b`, `qwen3.5-4b`, `qwen3.5-9b`, `qwen3.6-35b-a3b-mtp-q4-{code,general}`. Carries the main and vision primaries. (`ling-3.0-flash`, once earmarked for the future async `deep_research` domain, is no longer in the catalog.)
+    - **Modalities churn too.** Today the text-only hops are `lilripper:8010` `glm-5.3-flash` and workhorse's `gemma4-12b`, which is why neither appears in the vision chain. Read `architecture.input_modalities` before assuming a hop can take images, in either direction.
+  - **Keep each endpoint's consumers on one alias.** If two roles on one router name different models, interleaving a document read with a consult thrashes the router between resident models. Today that means workhorse's four consumers (subagent primary, reader primary, summary primary, main hop 3) all name `gemma4-12b` (vLLM serves one model, so it cannot thrash, but keep the rule for router hosts), and lilbuddy's two (main primary, vision primary) both name `gemma4-26b-a4b`.
+  - **Failover now spans three hosts.** Every role falls back to lilripper `:8020`; the main chain also has workhorse as a third hop. The remaining hole: lilripper down plus workhorse down leaves consults, reader and summaries with nowhere to go, and lilbuddy plus lilripper down leaves image turns stranded.
+- **TTS**: **Phonon 31m** at `lilripper:8881/v1/audio/speech` (CPU, open), the only
+  TTS endpoint since 2026-10-31 (Voxtral, disabled since August, was retired from the
+  code then, with its voices and circuit breaker). Env: `OCTAVIUS_TTS_URL`, `_MODEL`,
+  `_VOICE` (the server and reader default, `Imogen`), `_AGENT_VOICE` (the agent's
+  default on `/` until Dave picks one, `Delia`), `_VOICES` (16 of Phonon's voices) and
+  `_FEMALE_VOICES` (8 of those); code defaults match `~/.config/octavius/env`.
+  A voice not in `_VOICES` is sent as `_VOICE`: Phonon **400s on unknown voices** and
+  the sentence would play silent (`TTS failed for chunk`), so list only names
+  `GET /v1/audio/voices` returns. **The agent's name follows its voice:** Octavja in a
+  female voice, Octavius in a male one (`TTSSettings.agent_name`; `/api/voices` returns
+  `agent_names`, and `/`'s wordmark, title and placeholder follow the picked voice).
+  Both system prompts (native, and pi_harness's octavius profile) only say it answers
+  to either name. Per request Phonon is ~0.09 s + ~0.011 s/word (p50 0.27-0.31 s, p90
+  0.4 s over 1-31 words, measured 2026-10-30) against Kokoro-GPU's ~0.07 s; later
+  sentences synth while earlier ones play, so only the first sentence of a reply pays
+  it. **Rollback:** Kokoro is still up on `lilripper:8880`: set `OCTAVIUS_TTS_URL` to
+  it, `_MODEL=kokoro`, and `_VOICE`/`_AGENT_VOICE`/`_VOICES`/`_FEMALE_VOICES` to
+  Kokoro names, then restart.
+- **Reader LLM**: `gemma4-12b` at `workhorse:8010/v1/chat/completions` (open; triplestuffed until 2026-10-31), with `qwen3.8-27b` at `lilripper:8020` (**behind auth**; see "Configuration and secrets") as fallback — both since 2026-10-28, replacing the retired `lilripper:8010` 35B. The reader is single-endpoint *per call* but the role's second `models.json` entry is its failover target: `reader_text.py::_llm_convert_math` tries each endpoint in turn before degrading to local `strip_latex`, which is what a dead primary used to do to every math chunk (dollar-stripping, silently). `ReaderSettings.llm_fallback_url/model` read the second entry via `_role_single(..., index=1)`; a half-configured entry raises. It sends `chat_template_kwargs.enable_thinking: false` (since 2026-10-31: with thinking on, gemma4-12b spent all 8192 `max_tokens` reasoning and returned null content after ~53 s on every math chunk, so each one fell through to `:8020`; off, it answers correctly in ~1 s). Note that `LLMChainClient.complete()` merges per-url `params` from the **main** chain, and **both** reader URLs are also main-chain hops (workhorse is hop 3, `:8020` hop 2) — so any `params` set on those main-chain entries silently apply to reader calls too (none today). The primary alias deliberately matches the other workhorse consumers (see "Keep each endpoint's consumers on one alias").
+- **Summary/tag generation**: `workhorse:8010` (`gemma4-12b`; triplestuffed until 2026-10-31) with fallback `lilripper:8020` (`qwen3.8-27b`), since 2026-10-28. The order matters more than the traffic volume suggests: summaries fire at conversation *end*, long after Dave has moved on, so with `:8020` primary a background job could quietly evict a model he had loaded there by hand. Both payloads send `chat_template_kwargs.enable_thinking: false` with `max_tokens` 1024 (summary) / 768 (tags); the 12B honours the switch (0 reasoning chars, verified 2026-10-28) — a model that ignored it could spend the budget thinking and return empty content. `SummaryClient` is **not** an `LLMChainClient`, but it carries a model **per URL** (`summary_model` / `summary_fallback_model`); before 2026-08-26 it sent one model to both URLs, a guaranteed 400 on the fallback once the routers stopped sharing an alias. It attaches `auth_headers` (since 2026-08-08). A failed summary is invisible to the user; history just ends up unsummarised and untagged.
 - **Embeddings**: bge-m3 chain via `OCTAVIUS_EMBEDDING_CHAIN`, defaulting to:
   - primary: `lilbuddy:8020/v1/embeddings` (standalone llama.cpp bge-m3 server → Caddy :8020 → 127.0.0.1:8002, OpenAI schema)
   - fallback: `workhorse:11434/api/embeddings` (Ollama schema)
@@ -356,49 +454,60 @@ External services currently expected:
     `/health`'s `embedding_chain` shows per-endpoint `tripped` / `consecutive_failures` /
     `cooldown_remaining`. It deliberately does **not** feed the top-level `degraded`:
     every search path falls back to keyword matching, so Octavius still answers.
-  - **Message embeds are detached from the turn path.** `add_message_async` commits the
-    row and then *spawns* the embed (`history_enrichment.spawn_embedding`) instead of
-    awaiting it — awaiting put a network round-trip in front of the LLM call for the
-    user message and in front of `audio_done` for the assistant message, which is what
-    made a dead embedder cost ~10 s twice per turn. The spawned task is a **root** task,
-    so cancelling a turn (`handle_reset`) cannot lose it, and it does its sqlite write
-    via `asyncio.to_thread` on its own connection. Cap: 8 in flight;
-    `drain_inflight()` runs at shutdown. Consequence: message-level semantic search is
-    **eventually consistent**.
-  - **Embed input is capped at `EMBED_MAX_CHARS` (4000)** in `history_enrichment`, the
-    choke point every embed call goes through. The cap is sized for the *weakest*
-    endpoint in the chain, not the primary. Embedders reject over-long input
-    outright — Ollama's default `num_ctx` is 2048 tokens and workhorse 500s somewhere
-    between 4000 and 6000 characters. Raising `num_ctx` is not a fix: bge-m3 tops out at
-    8192 tokens (a 20k-char input still 500s), and a full-context embed took 4.5 s versus
-    0.25 s.
-  - **`history_sweeper.py`** re-embeds anything that never landed (startup + every
-    15 min, behind `OCTAVIUS_EMBEDDING_SWEEPER`). The pending marker is simply the
-    absence of a row in the vec0 table. Three non-obvious rules: the `role IN
-    ('user','assistant')` filter is load-bearing (tool results are never embedded, and
-    without it the sweeper re-selects the whole tool-call history forever); a pass gives
-    up when the breaker reports every endpoint tripped, or after
-    `MAX_CONSECUTIVE_FAILURES`, rather than burning the timeout budget row by row; but a
-    *single* failing row is **skipped, not fatal**. That last one is load-bearing too —
-    aborting on the first `None` meant one unembeddable row at the head of the
-    newest-first batch blocked every row behind it, pass after pass, forever.
-  - **`conversations.indexed`** (added 2026-08-10, additive migration) records the
-    summariser's index decision, which was previously unpersisted — so "skipped on
-    purpose" and "the embedder was down" looked identical and the summary sweeper
-    couldn't tell which rows to repair. `NULL` = legacy/unknown, never swept.
-    `_write_summary` also **deletes any existing summary vector** in the same
-    transaction: conversations are resumed in place (every Matrix thread), so a rewrite
-    whose re-embed fails would otherwise leave a vector for superseded text that looks
-    complete forever.
-- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN`, defaulting (2026-09-10) to `triplestuffed:8010` (`gemma4-26b-a4b`) as **primary**, with `lilripper:8010` (`qwen3.6-35b-a3b-mtp-general`) and `lilripper:8020` (`qwen3.8-27b`) as fallbacks, all thinking on. The cross-host primary closes the old lilripper-only limitation — if lilripper is down, image turns still work — and keeps image turns off lilripper's four `:8010` slots, which the voice path owns. The chain stays separate from `llm_chain` because the main chain's third hop is chosen for *availability* rather than for modality — separate chains are what stop a future "add another fallback so voice survives a lilripper outage" edit to `llm_chain` from silently widening where an image turn can land. Check `architecture.input_modalities` before trusting any hop with images: gemma4 takes them, but `ling-3.0-flash`, `zeta-2.1`, `ministral-14b`, and `qwen3.5-9b` do not. **Modality is not enough — check the hop's micro-batch too.** A gemma4v image encodes to 70-1120 tokens by resolution and llama.cpp decodes the whole image chunk as one non-causal ubatch, so a hop launched with the default `-ub 512` *aborts* (`GGML_ASSERT ... n_ubatch >= n_tokens`) on any image bigger than a thumbnail, the router reloads it, and the turn comes back empty ("I'm not sure how to respond to that."). Found 2026-09-14 on the first real Android image turn; fixed with `ubatch-size = 1152` in triplestuffed's `~/.config/llama-router/preset.ini` (`[gemma4-26b-a4b]`), which cost ~1.7 GB of the 3090's headroom (2505 → ~820 MiB). `/v1/models` reports `--ubatch-size` in `status.args` — read it before pointing image turns at any llama.cpp hop. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
+  - **The app no longer embeds at all (2026-09-15).** Message, summary and
+    saved-item embedding all moved to the `hybrid-corpus` library.
+    `history-index.timer` runs `hybrid-corpus run history` every 15 minutes,
+    fingerprints `messages` / `conversations` / `saved_items`, and writes the
+    library's sidecars into the same database file. Gone with it: the inline
+    `store_embedding` write in `add_message`, the detached `spawn_embedding`
+    root task in `add_message_async` (and its 8-in-flight cap), the summary
+    embed in `end`/`end_async`, and `history_sweeper`'s repair loop. Recording
+    a turn is pure SQLite now, so there is no embedder round-trip anywhere near
+    the voice path to detach in the first place. `history_sweeper.run_sweeper`
+    / `sweep_once` and `history_enrichment`'s `store_embedding*` /
+    `spawn_embedding` are kept as stubs that **raise `RuntimeError`** — a
+    silent no-op would let a stale caller look healthy while nothing indexed.
+    `drain_inflight()` still runs at shutdown and drains an empty set.
+    Consequence: semantic search is **eventually consistent** with a 15-minute
+    worst case, except for `saved_items`, which `history_store.save_item`
+    indexes inline through the library's `Indexer` (an embed failure there is
+    logged and swallowed — the row is committed and keyword-searchable
+    immediately, and only the vector is owed).
+  - **Embed input cap.** `EMBED_MAX_CHARS` (4000) in `history_enrichment` is now
+    only relevant to `embed_text`/`embed_text_async`, which survive as plain
+    client wrappers. The library enforces its own `embed_cap` (8000 in
+    sites.toml) as a **refusal, not a trim**, and chunks long sources instead
+    of truncating them — which is the real fix for the old behaviour where a
+    20k-char message was silently indexed by its first 4000 characters.
+  - **`conversations.indexed` is gone from the schema** (added 2026-08-10 for
+    the sweeper, dropped 2026-09-15). The summariser's `index` flag is no
+    longer persisted — it only decides the push to the memory service — because
+    the library indexes every conversation with a non-empty summary and nothing
+    in the fleet read the column. The live database keeps the column
+    harmlessly. `_write_summary` also no longer deletes a stale vector: the
+    library re-fingerprints `(service, summary)` on every sync and re-embeds a
+    rewrite by itself. The `OCTAVIUS_EMBEDDING_SWEEPER` switch went the same
+    day; the retired sweeper never read it.
+- **Vision LLM chain**: image-input turns (Matrix `image_input` frames) via `OCTAVIUS_VISION_LLM_CHAIN` / `models.json` `vision`: `lilbuddy:8010` (`gemma4-26b-a4b`, `--ubatch-size 2048`, text+image+video) as **primary** and `lilripper:8020` (`qwen3.8-27b`, takes images — verified 2026-10-28) as the only fallback, both thinking on. The primary shares lilbuddy's two slots with the main chain's primary. workhorse's `gemma4-12b` is text-only, so it must not be added here even though it is the main chain's third hop. The chain stays separate from `llm_chain` because the main chain's third hop is chosen for *availability* rather than for modality — separate chains are what stop a future "add another fallback so voice survives a lilripper outage" edit to `llm_chain` from silently widening where an image turn can land. Check `architecture.input_modalities` before trusting any hop with images: gemma4-26b-a4b takes them, but workhorse's `gemma4-12b`, `zeta-2.1` and `glm-5.3-flash` do not. **Modality is not enough — check the hop's micro-batch too.** A gemma4v image encodes to 70-1120 tokens by resolution and llama.cpp decodes the whole image chunk as one non-causal ubatch, so a hop launched with the default `-ub 512` *aborts* (`GGML_ASSERT ... n_ubatch >= n_tokens`) on any image bigger than a thumbnail, the router reloads it, and the turn comes back empty ("I'm not sure how to respond to that."). Found 2026-09-14 on the first real Android image turn; fixed then with `ubatch-size = 1152` in triplestuffed's `~/.config/llama-router/preset.ini` (`[gemma4-26b-a4b]`, since retired from that host); today's lilbuddy primary runs `--ubatch-size 2048`. `/v1/models` reports `--ubatch-size` in `status.args` — read it before pointing image turns at any llama.cpp hop. Separate `LLMChainClient` instance (`vision_llm_client` in `service_clients.py`); see `agent.py`'s `use_vision` routing in `stream_agent_turn`. Vision routing is sticky per thread (`Conversation.has_images`): after the first image the whole thread stays on the vision chain and image content arrays stay in memory; on thread re-attach they re-hydrate from the spool via the `attachments` table when the file still exists. Persisted history/memory only ever see text placeholders.
 - **PDF → markdown conversion**: driven through the `document-processing` MCP server already registered in `DEFAULT_MCP_SERVERS` (mcp-tools' documents wrapper: scp to lilripper, convert at `lilripper:8251/mcp`, download the .md back to local paths). `docproc_client.py` wraps its `convert_pdf_to_md` / `get_conversion_result` tools via `MCPManager.call_tool`; poll pacing via `OCTAVIUS_DOCPROC_POLL_INTERVAL`/`_TIMEOUT`. Triggered by Matrix `file_input` frames with `mime=application/pdf`; see `docs/ws-media-contract.md`.
 
 Configured MCP servers:
 
-- `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`
+**Tool naming (2026-09-23).** `MCPManager` keys every tool by its model-facing name and routes it to
+(server, upstream name). A server with `tool_prefix` in `DEFAULT_MCP_SERVERS` exposes its tools as
+`<prefix>_<tool>` (not doubled if the upstream name already starts with it — pi-mcp-adapter's rule).
+On a name collision the **first** registered server keeps the bare name and the later one is exposed as
+`<server key>_<name>` with a warning — before 2026-09-23 the later server silently overwrote the earlier.
+Code that targets one server (e.g. `routes/vault.py`) uses `call_server_tool(server, upstream_name, ...)`
+so it never depends on display names. Upstream renames: mcp-tools `RENAMES-2026-09.md`.
+
+- `evangeline-email`: streamable HTTP at `triplestuffed:8251/mcp`, `tool_prefix: "email"` → `email_hybrid_search`,
+  `email_keyword_search` (was `search_emails`), `email_get` / `email_get_many` (were `get_email` / `get_emails`),
+  `email_stats`, `email_extract` (was `extract_from_emails`), ... The calendar tools that used to live on this
+  server moved to mcp-tools' `server_calendar.py` (:8258); Octavius does not register the calendar server.
 - `web-search`: stdio subprocess (mcp-tools' `server_serper.py`, run via its own venv). Exposes a single `web_search` tool — the "search" half of the search → read → reason pipeline. **Serper.dev (Google) is primary; self-hosted SearXNG (`searxng.riegert.xyz`) is a backstop that answers only when Serper *errors*** — an empty Serper result is a valid answer to an obscure query and is not retried against a weaker index. Surfaced directly to the main agent, not behind a specialist. The order was inverted 2026-08-20: SearXNG's `bing` engine was returning topic-unrelated pages while reporting HTTP 200 success (`unresponsive_engines: []`), so roughly two results in three were junk and the old "SearXNG returned nothing" fallback trigger never fired. The backstop is now pinned to `engines=duckduckgo,wikipedia` (`SEARX_ENGINES`). When it answers, the JSON carries `fallback_reason` and `provider: "searxng"`. `server_serper.py` reads `SERPER_API_KEY` from `mcp-tools/.env` and trusts the system CA bundle for SearXNG's Caddy cert on its own (no env needed in the server config). **Without `SERPER_API_KEY` the primary arm is inert — web search runs permanently on the degraded backstop.** Mirrors `pi_harness/extensions/web-search/src/index.ts`; change one, change the other. Replaced the old varlabz `searxng-mcp` (`search` tool, SearXNG-only, no fallback).
 - `web-reader`: streamable HTTP at `lilripper:8254/mcp` (mcp-tools' `server_reader.py`, wrapping a self-hosted Crawl4AI `/md` endpoint; same deployed instance the pi agents use). Exposes `read_url` — the "read" half of the search → read → reason pipeline. Surfaced directly to the main agent (like `web-search`), not behind a specialist.
-- `vault-search`: streamable HTTP at `triplestuffed:8254/mcp` (mcp-tools' `server_vault.py` — sqlite-vec + FTS5 BM25 over the Obsidian vault, RRF-fused; co-located with the vault). Exposes a single `search_vault` tool, surfaced directly to the main agent. The `03-personal/Journaling/` subtree is excluded server-side. Search is the only vault operation that goes through MCP — note reads/writes are local file I/O (see "Vault" under Feature Notes).
+- `vault-search`: streamable HTTP at `triplestuffed:8254/mcp` (mcp-tools' `server_vault.py` — sqlite-vec + FTS5 BM25 over the Obsidian vault, RRF-fused; co-located with the vault). Exposes a single upstream tool `search` (was `search_vault` until 2026-09-23), shown as `vault_search` via `tool_prefix: "vault"`, surfaced directly to the main agent. The `03-personal/Journaling/` subtree is excluded server-side. Search is the only vault operation that goes through MCP — note reads/writes are local file I/O (see "Vault" under Feature Notes).
 - `paper-search`: streamable HTTP at `127.0.0.1:8206/mcp` (mcp-tools'
   `server_papers.py` — sqlite-vec + FTS5 BM25 over Dave's converted Paperpile
   library at `/media/extra_stuff/papers/`, RRF-fused; runs as the
@@ -426,6 +535,7 @@ Configured MCP servers:
   and give a complete answer. The base `settings.system_prompt` is
   channel-neutral; the directive (`VOICE_STYLE`/`TEXT_STYLE` in `agent.py`) is
   the tuning knob. Defaults to `"voice"` if a caller omits it.
+- **A reply has two forms: LaTeX on screen, words in the voice** (since 2026-11-07). `VOICE_MATH_STYLE`/`TEXT_MATH_STYLE` in `agent.py` ask for LaTeX unless the client cannot show it (a Matrix thread, `state.renders_math` False, set when it attaches; the Inbox). The text sent to clients and history keeps it; `run_turn` hands TTS `tts.speakable(sentence)`, which rewrites only sentences holding math, through the reader's `_llm_convert_math` (0.1-0.4 s on workhorse's 12B, measured 2026-11-07). Past `SPEECH_MATH_TIMEOUT_S` (4) it uses the local `strip_latex` and skips the LLM for 60 s. `breaks_outside_math` keeps both sentence splitters out of equations. Phrasing lives in `MATH_TO_SPEECH_PROMPT` (commas after "the integral"/"the sum", after the limits and before the differential are the pauses Dave asked for; Phonon gives a comma ~0.3 s and has no pause control or SSML); `speakable` forces "zed" in code and `speechify` respells pi as "pie". `/` and `/reader`'s chat typeset replies with `static/math-render.js` (KaTeX, shared with the Original view); Android already did.
 - Spoken text is markdown-normalized before TTS. `tts.synthesize` runs every
   string through `speechify` (the single choke point all TTS callers share),
   stripping `**bold**`/`*italic*`/`` `code` ``/links/headings and line-leading
@@ -443,8 +553,21 @@ WebSocket message families:
 - Voice: `status`, `transcript`, `transcript_partial`, `response`, `reset`, `restore_session`, `session_id`, `load_conversation`, `conversation_loaded`, `stt_start`, `stt_stop`, `stt_auto_stop`
 - Text streaming (server→client): `response_delta` — one sentence of the reply as it streams, emitted before the final `response` (which stays authoritative). The Matrix sidecar edits its thread message in place from these; the browser ignores the frame.
 - Matrix media (client→server, same session/threading semantics as `text_input`): `image_input`, `file_input` — frozen contract, see `docs/ws-media-contract.md`. Both repos (`octavius`, `matrix-agent-sidecar`) implement against that doc.
-- Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`
+- Reader: `reader_play`, `reader_pause`, `reader_stop`, `reader_position`, `reader_audio_done`. Since 2026-10-30
+  `reader_pause`/`reader_stop` may carry `doc_id`/`chunk_index`/`sentence_index` — the sentence the client was
+  *hearing*. Playback synthesizes far ahead of the audio, so the server saves that (`save_heard_position`, after
+  the cancel) instead of its own run-ahead place. Older clients omit them and get the old behaviour.
+  **Paced playback (2026-10-30):** `reader_play` with `paced: true` makes the stream wait so it is at most
+  `READER_AHEAD` (3) sentences past the last one the client reported in `reader_heard {seq, doc_id, chunk_index,
+  sentence_index, sentence_global}` (sent as each sentence *starts* playing). A paced stream writes no position of
+  its own — the heard reports are the place — and marks the document finished only once the last sentence is heard.
+  `/reader` always paces; the Android client does not and keeps the old run-ahead behaviour.
+  **Download (2026-11-02):** `reader_play` with `download: true` (strict `is True`) streams exactly as before but writes nothing to the document's place/progress (no per-sentence save, no finished/rewind, no save on cancel), and ignores `paced`. For clients caching audio offline without playing it.
+- Speech clips (server→client, since 2026-11-07): `speech_clip {math: true}` — the next binary frame is a large formula. `tts.speech_audio` makes a large formula (`$$`, an integral, sum, product, fraction or root, or 15+ characters) its own clip, with the silence at its joins shortened, so `/` and `/reader`'s chat can play it at "Formula speed" (`mathSpeed` in `octavius-prefs`, default 1.2, never faster than the speaking speed). A client that ignores the frame plays every clip at one speed.
 - Item chat: `item_chat`, `item_chat_load`, `item_chat_reset`, `item_chat_response`, `item_chat_loaded`, `item_chat_status`
+- Reader chat (client→server; `/reader`'s chat panel on its own `/ws` connection, otherwise the normal voice/text turn frames): `doc_chat_open {doc_id, new?}` → `doc_chat_opened {doc_id, title, conversation_id, messages}` or `doc_chat_error {doc_id, error}`; `doc_chat_position {doc_id, chunk_index, sentence_index[, end_chunk_index, end_sentence_index]}` (Dave's place or selection, sent before each turn); `doc_chat_model {model}` (menu id) → `doc_chat_model {doc_id, model}`; server→client `doc_chat_answered_by {model, label}` just before a reply's `response`
+- Agent model menu (pi brain; since 2026-11-02): `GET /api/chat-models` → `{models:[{id,label}], default, enabled}`; client→server `chat_model {model}` (menu id; unknown → default) → `chat_model {model, label, models, default, enabled}`. The choice belongs to the **connection**: `_apply_chat_model` re-applies it (`PiProcessManager.prefer`, keyed by conversation id) after reset, load, restore and before every pi turn, and skips Reader chats (they keep `doc_chat_model`). A client that never sends `chat_model` is untouched; one that does also gets `answered_by {model, label}` before each pi reply. Menu: `PiBrainSettings.chat_models` (env `OCTAVIUS_PI_CHAT_MODELS`, same shape as the Reader menu); the first entry, `auto` (`model: null`), is the shared failover chain with thinking on — not the Reader menu's thinking-off 12B, because Dave reverted thinking-off on the agent over answer quality. A choice applies to voice and text turns alike. The web `/` shows it (with the voice) in the page header (since 2026-11-04): hidden unless `enabled` and more than one entry, saved as `chatModel` in `octavius-prefs`, and sent on every connect even when never picked (null = default), so `/` always gets `answered_by`. `/` captions each reply with it ("— Qwen3.8 27B"), in coral with "(X failed)" when a picked non-Auto model was not the one that answered; `conversation_loaded` carries `answered_by` on assistant messages recorded as `pi:<model>` (native turns record the chain's first model regardless, so they get none).
+- Confirmation (server→client, pi brain only): `confirm_request` (`title`, `message`) — the agent is waiting for Dave's next transcript/`text_input` as a yes/no; sent with the spoken question and an `audio_done`
 - Delegations (DORMANT — reserved for future `deep_research`, not currently emitted): `delegation_update` (server→client; status running/ready/failed + preview), `delegation_removed` (server→client; record cleared), `delegation_list` (client→server; resync request), `delegation_pull` (client→server; mode=merge|new), `delegation_dismiss` (client→server)
 
 ## Code Map
@@ -454,6 +577,7 @@ Core runtime:
 - `main.py` - FastAPI app creation, startup wiring, shared top-level routes, WebSocket entrypoint
 - `db.py` - SQLite connection helpers and short-lived connection context manager
 - `settings.py` - env-backed runtime settings and defaults; also loads `models.json` model routing (`_role_chain` / `_role_single`, precedence: defaults < file < env; the reader's second entry is its fallback, read via `_role_single(..., index=1)`)
+- `scripts/octavius-media-gc` - retention sweep of the media spool dirs (dry run by default); timer units in `deploy/`
 - `scripts/octavius-models` - show / check / apply model routing; `check` probes every endpoint's catalog and auth before `apply` will restart
 - `service_clients.py` - core HTTP clients for STT, TTS, the main LLM chat chain, summary generation, and embeddings
 - `media_uploads.py` - streaming/sanitizing/cap logic for `POST /api/media/upload` (client media, e.g. Android), pure functions plus `save_upload`; FastAPI-free and unit-testable on its own
@@ -467,7 +591,7 @@ Route modules:
 - `routes/conversations.py` - conversation history API routes
 - `routes/media.py` - `POST /api/media/upload` for non-sidecar clients (Android); thin adapter over `media_uploads.py`
 - `routes/reader_api.py` - reader page and reader REST API routes
-- `routes/vault.py` - vault REST API (`/api/vault/{recent,note,search}`); search proxies the `search_vault` MCP, everything else is local file I/O via `vault_files.py`
+- `routes/vault.py` - vault REST API (`/api/vault/{recent,note,search}`); search proxies the vault server's `search` tool via `call_server_tool("vault-search", "search", ...)`, everything else is local file I/O via `vault_files.py`
 
 Conversation and tool loop:
 
@@ -476,6 +600,8 @@ Conversation and tool loop:
 - `websocket_session.py` - WebSocket session state, message dispatch, item-chat lifecycle, and STT/TTS turn handling
 - `mcp_manager.py` - MCP client lifecycle, routing, truncation, reconnect handling
 - `tools.py` - local tool schemas and dispatch entrypoint used by the agent loop
+- `pi_tools_server.py` - loopback MCP server for the pi brain: Octavius's local notes/memory/history/reader tools, per-process bearer tokens, per-turn context binding
+- `pi_brain.py` - opt-in pi turn brain: RPC process per conversation, manager (reaping, re-key), `stream_pi_turn`, confirm relay
 - `subagent.py` - internal scoped subagent for specialist domains (email, research, tasks); invoked inline via `consult_specialist` (`run_inline_subagent`)
 - `local_tool_specs.py` - local tool schemas
 - `local_tool_registry.py` - compatibility wrapper for older local-tool imports
@@ -485,6 +611,7 @@ Conversation and tool loop:
 - `local_tool_inbox.py` - legacy stash save/read helpers (`save_to_stash` / `list_stash_items` — retired/unwired, no longer registered as tools)
 - `stash_to_obsidian.py` - watermark-based one-way exporter of `saved_items` rows to the vault inbox (run via the `obsidian-stash-export.timer` user unit)
 - `local_tool_reader.py` - local reader handoff (file, and raw text via `read_document(text=...)`) and background PDF-processing helpers
+- `local_tool_reader_lookup.py` - reader chat look-ups over the speech JSON (`reader_document_outline`, `read_reader_document`, `search_reader_document`) and `place_context`, the per-turn note naming the open document and Dave's place
 - `local_tool_documents.py` - `check_document_status` local tool (polls a docproc job by id)
 - `docproc_client.py` - loopback HTTP client for the docproc web queue (submit/poll a PDF conversion job); Octavius never imports the `docproc` package
 
@@ -500,22 +627,30 @@ Reader pipeline:
 History and inbox:
 
 - `history.py` - DB bootstrap, conversation/session recording, and compatibility re-exports for history/inbox helpers
-- `history_enrichment.py` - embeddings, summaries, topic tags; also the detached-embed helpers (`spawn_embedding` / `drain_inflight`)
-- `history_sweeper.py` - background re-embed of rows whose inline embed never landed
-- `history_store.py` - conversation queries, inbox CRUD/search, memory-push watermarks, stats
-- `schema.sql` - SQLite+vec schema
+- `history_enrichment.py` - summaries and topic tags; the embed-write helpers are retired stubs that raise (`drain_inflight` still live)
+- `history_sweeper.py` - RETIRED 2026-09-15; both entry points raise. Kept so the retirement is visible from the import graph
+- `history_store.py` - conversation queries, inbox CRUD, hybrid search over the library's `history_summaries` / `history_saved_items` collections, `assert_history_serveable`, memory-push watermarks
+- `schema.sql` - SQLite schema for the app-owned tables only; the library owns and creates its own sidecars
 
 Frontend:
 
 - `static/app-common.js` - shared browser helpers for WebSocket setup, HTML escaping, and voice-list loading
 - `static/index-audio.js` - streamed TTS queue, silence trimming, and browser audio playback helper for the main voice UI
-- `static/index-app.js` - main voice UI controller, settings/history overlays, transcript rendering, and WebSocket client logic
-- `static/inbox-app.js` - inbox page behavior, filtering, expansion, and item-chat client logic
-- `static/reader-app.js` - reader page behavior, document list, retry flow, and playback client logic
+- `static/index-app.js` - main voice UI controller: conversation sidebar, settings, transcript rendering, `confirm_request` card, keyboard shortcuts, and WebSocket client logic
+- `static/index-orb.js` - the eight-lobed voice orb (canvas, driven by mic and playback levels); the talk button on `/` and play/pause on `/reader`
+- `static/octavius.css` - shared design tokens, base styles and components (colours, Newsreader/Spline Sans, switch, slider, dropdown) used by every page
+- `static/index.css` / `static/reader.css` / `static/inbox.css` - page layouts (desktop-first; the side panel becomes a drawer on phones). `main.py` sends `Cache-Control: no-cache` on the UI pages and `/static`, so browsers revalidate (ETag/304) and no `?v=` cache-busting is needed
+- `static/inbox-app.js` - inbox page: item list with search/filters, item view, item chat panel, keyboard shortcuts; renders untrusted item markdown with raw HTML escaped, non-http(s)/mailto links neutralised and images never loaded
+- `static/reader-app.js` - reader page behavior: document library, reading column with sentence highlight and follow, Original/Reading view, resizable side panels, edit panel, retry flow, keyboard shortcuts, and playback client logic
+- `static/math-render.js` - `OctaviusMath`: pulls LaTeX out before markdown runs (not from code) and typesets it with KaTeX; used by `/`, `/reader`'s chat and the Original view
+- `static/reader-original.js` - `OctaviusReaderOriginal.render`: a chunk's `source_text` to a DocumentFragment (a private `marked` instance plus `OctaviusMath`; raw HTML escaped except bare `sub`/`sup`/`br`/emphasis tags, Quarto `{#...}` attributes and `:::` fences dropped, images named rather than loaded)
+- `static/reader-chat.js` - the reader's "Chat" pull tab and side panel: its own `/ws`, opened lazily; `doc_chat_open` on each document change; typed turns silent (`tts:false`), spoken ones voiced in the main page's voice (`octavius-prefs`); pauses reading before a turn; `c` opens it (or focuses its box), as in the Inbox. Talks to `reader-app.js` only through `window.OctaviusReader` (`currentDoc`, `heardPlace`, `pause`, `onDocChange`)
+- `static/voice-capture.js` - `OctaviusVoiceCapture.createCapture`: mic → 16 kHz Float32 PCM frames between `stt_start`/`stt_stop`. Used by the reader chat; `index-app.js` still has its own copy
 - `static/index.html` - main voice UI shell
 - `static/inbox.html` - inbox review UI with inline item chat
 - `static/reader.html` - reader UI with playback controls and polling
 - `static/manifest.json` - PWA manifest
+- **Content-Security-Policy** (since 2026-10-30): `main.py`'s `UI_CSP` / `UI_SECURITY_HEADERS` go on `/`, `/inbox`, `/reader` only (plus `nosniff`, `Referrer-Policy: same-origin`) — defence in depth for pages that render untrusted text. No `'unsafe-inline'` or `'unsafe-eval'`: never add inline `<script>`, `on*=` handlers, `style="..."` (in HTML, `innerHTML` templates or `setAttribute('style')` — `el.style.x = ...` is fine), `eval`/`new Function`, or `javascript:` URLs. `script-src` is `'self'` only: third-party scripts are vendored into `static/vendor/` (today `marked-15.0.12.min.js` and `katex-0.16.22/` — `katex.min.js`, `katex.min.css` and the woff2 fonts, which is why `font-src` has `'self'` — each the byte-identical npm/jsdelivr build, with its `integrity` hash kept on the tag — recompute it when bumping). KaTeX must be called as `katex.render` into a node, never `renderToString`: the string form carries `style="..."` attributes this policy blocks, and fractions and sizes then render wrong. A new external stylesheet, font, image or fetch origin must be added to the matching directive in `UI_CSP`; `tests/test_main.py` checks the pages against it. Remote images in markdown are blocked by `img-src` on purpose; `/` and `/inbox` render them as links instead. Browser-verify with headless Chrome and a `securitypolicyviolation` listener (note Playwright's `wait_for_function` itself needs eval and fails under this policy — poll with `page.evaluate`).
 
 Tests:
 
@@ -526,13 +661,17 @@ Tests:
 - `tests/test_reader_ingest_handlers.py`
 - `tests/test_reader_ingest_service.py`
 - `tests/test_reader_append.py` - appending to an existing document: incremental chunk append, position preservation, `replace`, retry folding appendices, status rules, tool/route wiring
+- `tests/test_reader_pacing.py` - paced playback: `ReaderPacer`, the stream waiting on `reader_heard`, finished-when-heard, wiring
+- `tests/test_reader_progress.py` - per-document progress (playback, append/replace, lazy backfill, migration) and heading levels
+- `tests/test_reader_figures.py` - tables and figures: caption parsing, caption kept with its float, overview/description calls, failover and degradation
 - `tests/test_reader_edit.py` - renaming a document: DB + speech JSON title update, missing speech file, validation, any-status rename, route wiring
+- `tests/test_reader_chat.py` - reader chat: look-up tools, `place_context`, `build_prompt`'s context slot, one keyed chat per document (resume, `new`), position scoping
 - `tests/test_document_sources.py`
 - `tests/test_websocket_session.py`
 - `tests/test_history_attach.py`
-- `tests/test_history_enrichment.py` - also detached-embed lifecycle (survives turn cancellation and the session connection closing)
-- `tests/test_history_sweeper.py` - sweeper filters/convergence, the `indexed` migration, and summary stale-vector invalidation
-- `tests/test_history_store.py`
+- `tests/test_history_enrichment.py` - also asserts the retired embed path: recording a message embeds nothing, leaves nothing in flight, and the retired helpers raise
+- `tests/test_history_sweeper.py` - the sweeper's retirement contract, plus the `last_extracted_message_id` migration tests (which never concerned the sweeper)
+- `tests/test_history_store.py` - includes library-backed search tests over a throwaway DB with `FakeEmbedder`: service/source/since filters, result shape, dismissed-item exclusion, and the lexical-only degradation when the embedder is down
 - `tests/test_local_tool_handlers.py`
 - `tests/test_local_tool_history.py` - search filters/list mode and `read_conversation` paging
 - `tests/test_local_tool_reader.py`
@@ -543,6 +682,8 @@ Tests:
 - `tests/test_vault_files.py`
 - `tests/test_media_upload.py` - `media_uploads.save_upload` (sanitization, mime resolution, streaming caps) and the `/api/media/upload` route
 - `tests/test_subagent.py`
+- `tests/test_pi_tools_server.py` - tool list equals the specs, auth, no-turn error, per-turn binding (including a raising turn), loopback-only bind
+- `tests/test_pi_brain.py` - pi_brain against `tests/fake_pi_rpc.py` (a scripted `pi --mode rpc` subprocess): speaking rule, tool recording, seeding, round cap, abort on close, crash restart, confirm yes/no, reaping, and `/warm` (triggers, debounce, pre-started processes still seeded, unhandled `/warm` aborted, recovery, `/health` counts)
 - `tests/test_subagent_dispatcher.py`
 - `tests/test_agent.py` - vision-chain routing and image-turn history downgrade in `stream_agent_turn`
 - `tests/test_service_clients.py` - LLM chain failover/health, TTS circuit breaker, embedding schemas, LLM endpoint auth headers, and per-entry `params` merging
@@ -564,11 +705,22 @@ Three talk modes, selectable in the settings panel:
   Octavius responds via TTS, then the mic automatically reopens for the next
   turn. Press "End Conversation" to exit the loop.
 
+**One turn** (`T`, or the dock's "One turn" button; web `/` only, whatever the talk
+mode): a pause ends the capture, the reply plays, and the mic stays closed. Pressing
+it again, or Space or the orb, sends early; `Esc` cancels. During hands-free it makes
+the current turn the last. Pure silence never auto-stops (see "Native Android client"),
+so the mic stays open until one of those keys if nothing is said.
+
 Streaming STT: the browser captures PCM at 16kHz via Web Audio API
 ScriptProcessor and sends binary chunks every 250ms over the WebSocket. The
 server accumulates a buffer, runs background faster-whisper transcription, and
 sends `transcript_partial` messages. On stop (manual or VAD auto-stop), the
-server uses the latest partial text immediately — no re-transcription needed.
+server waits up to `STT_FINAL_WAIT_S` (3 s) for an in-flight Whisper run —
+the latest partial usually lags the audio by one run and misses the last
+words — and transcribes once more only if VAD heard speech past what the text
+covers. No partial is sent after stop (a late one used to show as a second,
+"ghost" line under the reply); `StreamingSTTState.generation` keeps a run from
+one capture out of the next.
 
 Server-side VAD: Silero VAD v6 ONNX model (`models/silero_vad.onnx`) runs on
 CPU via onnxruntime. Each 512-sample window (32ms at 16kHz) is prepended with
@@ -584,7 +736,7 @@ notes; the DB stash write path is retired. The vault (`VAULT_PATH`, default
 
 - Agent tools (local, in `local_tool_vault.py` over `vault_files.py`):
   `save_note`, `read_note`, `edit_note`, `commit_edit`. Search is the
-  `search_vault` MCP tool (vault-search server), which reads a derived
+  `vault_search` MCP tool (vault-search server, upstream `search`), which reads a derived
   sqlite-vec + FTS5 index, never the files directly.
 - Frozen vault API contract rules, enforced in `vault_files.py`: new notes
   land in `00-zettelkasten/001-Fleeting/` only (filename frozen at creation);
@@ -626,9 +778,35 @@ Still live:
 - Converts PDF, markdown, and extracted HTML content into speech-oriented JSON.
 - HTML extraction uses trafilatura.
 - Math-heavy paragraphs are sent to the reader LLM; non-math paragraphs are cleaned locally.
+- Before chunking, `reader_text.join_page_breaks` rejoins a paragraph a PDF page break split mid-sentence (it ends
+  in a word, comma or hyphen and the next prose paragraph starts lower case, or it ended on a comma), moving any
+  caption/image/table/page number found between the halves after it. Documents converted before 2026-10-31 keep their splits.
 - Playback is streamed sentence-by-sentence over WebSocket with position sync.
 - Document list auto-polls while any document is still `processing`.
 - Failed reader documents can be retried from the stored source metadata via `POST /api/reader/documents/{id}/retry`.
+- Tables and figures (since 2026-10-31, `reader_text.py`): a markdown table is spoken as its caption ("Table 2:
+  ...", from the adjacent `Table N`/`Tab. N` paragraph, or a caption line directly above it) plus one sentence of
+  overview from the reader LLM (same endpoints/failover as math, thinking off; it answers `NONE` when the caption
+  suffices). No caption: "A table." + overview; every endpoint down: caption only, or "A table with N rows.". An
+  image `![...](...)` is never read as its filename: it is spoken as its `Figure N`/`Fig. N` caption plus a 1-2
+  sentence description from the **vision chain** when the file resolves (absolute, or relative to the source
+  markdown's folder: `source_dir` / `original_md_path`'s parent; image types only, at most 4 MB; remote URLs are
+  never fetched). No file or a vision failure: caption only; neither: silence. The caption paragraph is consumed
+  (`group_floats` keeps it in its float's chunk) and is not read twice. `source_text` keeps the raw table and link.
+  Documents converted earlier keep their old speech until retried. **Converted PDFs get captions only**: docproc's
+  markdown carries no image links (see `docs/HANDOFF-docproc-images.md`).
+- Reading progress: `reader_documents.total_sentences` / `progress_sentences` (sentences before the saved place,
+  blanks included; equal to the total once read to the end, while `last_chunk`/`last_sentence` rewind to 0 so the
+  next play starts over). Playback writes them per sentence; `_write_speech` recomputes them on ingest/append/replace;
+  rows from before 2026-10-30 are backfilled lazily by `list_documents` (and derived in `GET /documents/{id}`).
+  `POST /api/reader/documents/{id}/finished {"finished": true|false}` (`reader_store.set_finished`, ready documents
+  only, strict bool) marks a document finished or unread without playing it; both rewind the place to the start.
+  `/reader` has a header button and a row action for it; the open document's playback is stopped first.
+- **Original view** (since 2026-11-04): `GET /api/reader/documents/{id}` includes each chunk's `source_text` where stored, and `/reader` shows it rendered (tables, KaTeX math) by default, with a header Original/Reading switch (`V`, remembered) and a per-chunk pill to flip one chunk to the other view. There is no sentence map from the original to the spoken text, so in Original view the place and playback are highlighted per chunk, a click moves the place to the sentence it most likely means (`OctaviusReaderOriginal.sentenceAt`: the words around the click matched against the spoken sentences, else the click's relative position in the chunk, which is what happens inside math), and a selection there names whole chunks for the reader chat. Documents converted before 2026-10-31 have no `source_text` and show only the reading text; the switch is hidden for them. The rail and the chat panel are resizable on wide screens (drag the edge, arrow keys on the focused handle, double-click to reset; `railW`/`chatW` in `octavius-reader-prefs`). `/`'s rail resizes the same way (`railW` in `octavius-prefs`).
+- Sections carry `level` (1-3 from `#`/`##`/`###`) for the page's table of contents. Documents converted earlier
+  have none (clients treat that as 1); `scripts/reader-backfill-heading-levels [--apply]` restores it where the
+  source markdown still exists.
+- **Chat about a document** (`/reader`'s chat panel, since 2026-10-31): the panel opens its own `/ws` and sends `doc_chat_open`; the conversation is keyed `reader-doc:<id>` (`source` `reader`), so each document has one chat that resumes; "New chat" renames the key to `reader-doc:<id>:<conv id>`. Turns run on the pi brain with `place_context` in the per-turn prompt and three look-up tools over the speech JSON (in a Reader chat they read only its own document). The document is never sent whole: `place_context` gives the paragraph (chunk) before, Dave's place, and the paragraph after, each capped and quoted inside `<document_excerpt>` with `<`/`>`/`"` neutralised. The place comes from the page (`doc_chat_position`): a selection in the document if he made one since the place last moved (`end_chunk_index`/`end_sentence_index`; the panel shows "About your selection"), else the marked sentence, which a click while paused moves without telling the server; the passage text is rebuilt on the server by index, never taken from the browser. Without a position, the saved place. **Citations** (since 2026-11-01): the passage note and the look-ups label each chunk `§N`, and `place_context` ends with `CITE_RULE`, which has the model end document-based sentences with `[§N]` (last, just before Dave's message: placed earlier, the 12B ignored it); look-up results repeat a one-line reminder. The panel turns each tag into a button that calls `OctaviusReader.peek(N)`: scroll to that chunk and highlight it, leaving the place and playback alone (follow turns off, so "Back to the current sentence" returns); a number the document lacks renders struck out. `tts.speechify` drops the tags from spoken replies. Checked 2026-11-01 on a synthetic paper: all four models cited the right chunk on 12 of 12 questions. A citation is chunk-level, and a chunk can be up to three paragraphs. **Pre-turn search** (since 2026-11-01): the note also carries the section outline, a rule never to call something absent without searching, and the three chunks outside the passage that best match the words of Dave's message (stop words dropped, light stemming, a small synonym list such as response/target/outcome); his previous message only breaks ties, or stands in when the new one has no words of its own (since 2026-11-02: counted equally, a follow-up's leftover words pushed the paragraph defining "HILs" out of the three). The 12B without thinking otherwise answered from the passage alone: a real question whose answer sat 6-12 chunks from his place got "not mentioned", then a half answer. A per-document embedding search is deferred (`docs/status.md`, Near-Term Work). **Model menu** (`PiBrainSettings.reader_models`, env `OCTAVIUS_PI_READER_MODELS`, JSON `[{id, label, model, thinking}]`): default **gemma4-12b with thinking off** (first word in ~1-2 s where the 26B thought for 8-17 s, measured 2026-10-31; the document anchors it), then gemma4-26b-a4b, qwen3.8-27b and glm-5.3-flash with the process's own thinking level. The panel remembers the choice (localStorage) and sends it on `doc_chat_open`; `PiProcessManager.prefer` makes that conversation's turns try it first (hop index `PREFERRED`) and its warms use it. A failure on the chosen model moves the turn to the shared chain without counting against the shared hop. `set_thinking_level` switches thinking per attempt and restores the process's starting level (read via `get_state`) for shared hops. The model that answered (`state.pi_hop`) is what history records for pi turns and what the panel captions. A model only warms once it has a per-model template (pi_harness `octavius-warm.ts`), i.e. after its first real turn. A Reader chat turn carries **no memory block**: the document never taints, so memory facts beside it would be private data the guard cannot see. Chunks converted since 2026-10-31 carry `source_text` (the chunk's markdown, LaTeX and citations intact), which the look-ups prefer; older documents give the speech text. Reader documents do not taint the pi guard (Dave's choice: scholar and web stay available while chatting about any document). Because the chat can read a document back, the model's file-path tools (`read_document`, `append_to_reader_document`, `process_pdf`) only accept files under the downloads folders, the media spool, `/media/extra_stuff/papers` or `~/school_lab`, with no hidden path component (`local_tool_reader.tool_source_path`); paths Dave types into `/reader` or the Android app (REST) are unrestricted as before. **Known limitation:** the same document's chat open in two tabs shares one pi process, and switching documents in one tab discards it under the other's running turn (noted 2026-10-31; not worth cross-tab coordination yet). The native brain gets no document context.
 
 Reader storage:
 
@@ -708,8 +886,8 @@ with one `file` part, streamed in chunks (never buffered whole) into
 `<12-hex>-<name>` filename. The 20 MB/50 MB caps are logical, not an ingress
 limit — Starlette's parser has already received the whole body into its own
 spooled temp file before `save_upload` sees it — so a `Content-Length`-based
-413 before parsing is the only pre-receipt bound (a real guard needs a Caddy
-body-size limit on `octavius.riegert.xyz`, sudo, not done). The response
+413 before parsing is the only pre-receipt bound (the real guard is Caddy's
+52 MB `request_body` limit on `octavius.riegert.xyz`). The response
 (`path`/`mime`/`filename`/`size_bytes`) is what the client then sends
 verbatim in the existing `image_input`/`file_input` WS frame below, but
 those handlers no longer trust it outright: `path` is resolved against the
@@ -717,8 +895,14 @@ those handlers no longer trust it outright: `path` is resolved against the
 symlinks resolved before the containment check) and `handle_image_input`
 re-stats the file against `IMAGE_MAX_BYTES` rather than trusting
 `size_bytes`; every rejection sends `status: audio_done` too, so a rejected
-frame can't leave a client's turn hanging. Like the Matrix spool, this
-directory is **not garbage-collected yet** — a follow-up.
+frame can't leave a client's turn hanging. Both this
+directory and the Matrix spool (the sidecar does no cleanup of its own) are
+swept by `scripts/octavius-media-gc` (45-day mtime retention, dry run unless
+`--apply`; daily via `deploy/octavius-media-gc.{service,timer}`, not installed
+by default). A re-attached thread whose image was swept just loses the pixels
+(`_rehydrate_image_content` falls back to the text placeholder). The Caddy
+body-size limit exists already: `request_body { max_size 52MB }` in the
+`octavius.riegert.xyz` block of `/etc/caddy/Caddyfile`.
 
 - **Images** (`image_input`): `websocket_session.handle_image_input`
   base64-reads the spool file and builds an OpenAI-style multimodal content
@@ -762,20 +946,35 @@ directory is **not garbage-collected yet** — a follow-up.
   one in the repo**: the service unit sets `OCTAVIUS_DB_PATH=/media/extra_stuff/octavius/octavius_history.db`,
   and the repo-local file is a stale leftover. Query the former when inspecting real
   state — `systemctl --user show octavius -p Environment` is the authority.
+- **Indexing is not the app's job (since 2026-09-15).** Octavius writes
+  `messages`, `conversations.summary` and `saved_items` and stops there.
+  `history-index.timer` runs `hybrid-corpus run history` every 15 minutes,
+  fingerprints those three tables, and embeds what changed into the library's
+  sidecars (`history_messages_*`, `history_summaries_*`,
+  `history_saved_items_*`) in the same database file. The legacy vec0 tables,
+  the inline/detached embed writes and `history_sweeper` are all gone; the
+  sweeper and `history_enrichment`'s store/spawn helpers survive as stubs that
+  raise. `main.py`'s lifespan calls `history_store.assert_history_serveable`,
+  which refuses to start if `OCTAVIUS_DB_PATH` and sites.toml's
+  `[corpora.history] database` disagree, or if the sidecars are missing or
+  not cosine-metric.
 - Summaries and topic tags are generated when a conversation ends. The summary
   prompt asks for a one-sentence, action-oriented summary *and* an `index`
-  flag; conversations the LLM judges as purely read-only retrieval (e.g.
-  listing emails/tasks, weather lookups) get the summary stored but skip the
-  embedding write, so they don't pollute semantic search results. Tags are
+  flag. The flag decides only whether the conversation is pushed to the
+  memory service; it is not persisted, and it gates no embedding — the
+  library indexes every conversation with a non-empty summary. Tags are
   still generated for all conversations.
 - The main agent can search prior Octavius conversations via the
   `search_conversation_history` local tool, which wraps
-  `history_store.search_conversations()` (semantic-first against
-  `summary_embeddings`, with a text-LIKE fallback). Filtered to
-  `service="octavius"` and excludes the current conversation. Optional
-  `source` (`voice`/`matrix`/`text`) and `since` filters; with a filter and
-  no query it becomes a recency listing (`history_store.list_conversations`),
-  which also surfaces retrieval-only chats that skip embedding.
+  `history_store.search_conversations()`. That is hybrid search over the
+  `history_summaries` collection now: a vec0 KNN arm and an FTS5/BM25 arm
+  fused with RRF. An embedding outage degrades to lexical-only rather than
+  raising or returning nothing. Filtered to `service="octavius"` and excludes
+  the current conversation. Optional `source` (`voice`/`matrix`/`text`) and
+  `since` filters are composed onto the adapter's own `service` filter; with a
+  filter and no query it becomes a recency listing
+  (`history_store.list_conversations`), which also surfaces conversations with
+  no summary at all.
 - The `read_conversation` local tool returns the full transcript of a prior
   conversation by id (user/assistant turns only), channel-agnostic — this is
   what lets a Matrix thread pull in a past voice conversation and continue it

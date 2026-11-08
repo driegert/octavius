@@ -5,6 +5,9 @@ from fastapi.responses import JSONResponse
 
 import vault_files
 
+# Key of the vault server in settings.DEFAULT_MCP_SERVERS.
+VAULT_MCP_SERVER = "vault-search"
+
 router = APIRouter()
 
 
@@ -70,11 +73,16 @@ async def vault_update(request: Request):
 
 
 async def _proxy_search(mcp, q: str, limit: int) -> list[dict]:
-    """Proxy the search_vault MCP; map to the API shape and drop journaling."""
+    """Proxy the vault MCP server's `search` tool (named `search_vault` until
+    2026-09-23); map to the API shape and drop journaling. Addressed by
+    (server key, upstream name) so the model-facing `tool_prefix` naming
+    can change without breaking this route."""
     if mcp is None:
         return []
     limit = max(1, min(int(limit), 50))
-    raw = await mcp.call_tool("search_vault", {"query": q, "limit": limit}, max_chars=None)
+    raw = await mcp.call_server_tool(
+        VAULT_MCP_SERVER, "search", {"query": q, "limit": limit}, max_chars=None,
+    )
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):

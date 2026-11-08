@@ -3,7 +3,8 @@
     if (value == null) return '';
     const div = document.createElement('div');
     div.textContent = String(value);
-    return div.innerHTML;
+    // innerHTML escapes & < > only; callers also put this inside attributes.
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function websocketUrl(path) {
@@ -123,7 +124,8 @@
   async function loadVoices(selectEl, options) {
     const {
       currentVoice,
-      fallbackVoice = 'bm_lewis',
+      fallbackVoice = 'Imogen',
+      agent = false, // the agent's voice (main page), not the reader's
       onLoaded,
     } = options || {};
 
@@ -138,22 +140,22 @@
     }
 
     selectEl.innerHTML = '';
-    const byEngine = data.voices_by_engine || null;
-    if (byEngine) {
-      const engineLabels = { kokoro: 'Kokoro (fast, reliable)', voxtral: 'Voxtral (expressive)' };
-      for (const engine of ['kokoro', 'voxtral']) {
-        const voices = byEngine[engine] || [];
-        if (!voices.length) continue;
-        const group = document.createElement('optgroup');
-        group.label = engineLabels[engine] || engine;
-        for (const voice of voices) group.appendChild(makeOption(voice));
-        selectEl.appendChild(group);
-      }
-    } else {
-      for (const voice of data.voices || []) selectEl.appendChild(makeOption(voice));
+    // Grouped under the name the agent goes by in each voice (TTSSettings.agent_name).
+    const names = data.agent_names || {};
+    for (const name of ['Octavius', 'Octavja']) {
+      const voices = (data.voices || []).filter((voice) => names[voice] === name).sort();
+      if (!voices.length) continue;
+      const group = document.createElement('optgroup');
+      group.label = name;
+      for (const voice of voices) group.appendChild(makeOption(voice));
+      selectEl.appendChild(group);
+    }
+    // A voice with no known name still has to be offered.
+    for (const voice of data.voices || []) {
+      if (names[voice] !== 'Octavius' && names[voice] !== 'Octavja') selectEl.appendChild(makeOption(voice));
     }
 
-    let resolvedVoice = data.default || fallbackVoice;
+    let resolvedVoice = (agent && data.agent_default) || data.default || fallbackVoice;
     if (currentVoice && (data.voices || []).includes(currentVoice)) {
       resolvedVoice = currentVoice;
     }

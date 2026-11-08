@@ -1,9 +1,66 @@
+import asyncio
+import io
+import re
 import unittest
+import wave
+from unittest.mock import AsyncMock, patch
 
+import numpy as np
+
+import tts
 from tts import speechify
 
 
 class SpeechifyTests(unittest.TestCase):
+    def test_et_al_loses_its_period(self):
+        self.assertEqual(speechify("Smith et al. (2020) and Jones Et Al., 1982."),
+                         "Smith et al (2020) and Jones Et Al, 1982.")
+        self.assertEqual(speechify("Thomson et al."), "Thomson et al")
+        self.assertEqual(speechify("pet al. fetal."), "pet al. fetal.")
+
+    def test_multiplier_x_is_read_as_times(self):
+        self.assertEqual(speechify("a 4.6x speedup"), "a 4 point 6 times speedup")
+        self.assertEqual(speechify("It is 10x faster, about 1,000x."), "It is 10 times faster, about 1,000 times.")
+        self.assertEqual(speechify("roughly 3×"), "roughly 3 times")
+        self.assertEqual(speechify("4.6 x 2"), "4 point 6 x 2")  # a spaced x is not "times"
+        for text in ("a 2x2 matrix", "1920x1080", "address 0x1F", "the x axis"):
+            self.assertEqual(speechify(text), text)
+
+    def test_dash_ranges_are_read_with_to(self):
+        cases = {
+            "2– 8%": "2 to 8%",
+            "rose 2–8% last year": "rose 2 to 8% last year",
+            "2 – 8": "2 to 8",
+            "1990–2000": "1990 to 2000",
+            "pp. 12–15": "pp. 12 to 15",
+            "2.5—3.5 kg": "2 point 5 to 3 point 5 kg",
+            "2–3x faster": "2 to 3 times faster",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(speechify(text), expected)
+
+    def test_hyphen_ranges_only_where_unambiguous(self):
+        cases = {
+            "a 5-10% drop": "a 5 to 10% drop",
+            "5 - 10%": "5 to 10%",
+            "see pp. 12-15": "see pp. 12 to 15",
+            "from 1990-2000": "from 1990 to 2000",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(speechify(text), expected)
+
+    def test_hyphens_that_are_not_ranges_are_kept(self):
+        for text in ("COVID-19", "x-1", "-5", "from -3 to 4", "2026-10-31", "1-800-555",
+                     "1-800-555-1234", "5 - 3 = 2", "-2-8%", "v1.2-3%", "2020-2021-2022",
+                     "ages 3-5", "1990-95", "temp –5"):
+            self.assertEqual(speechify(text), text)
+
+    def test_dotted_initialisms_lose_their_dots(self):
+        self.assertEqual(speechify("published by U.S."), "published by US.")
+        self.assertEqual(speechify("by U.S. state governors"), "by US state governors")
+        self.assertEqual(speechify("the U.K., and U.S.A.)"), "the UK, and USA)")
+        self.assertEqual(speechify("e.g. D. J. Thomson"), "e.g. D. J. Thomson")
+
     def test_strips_bold_and_leading_list_marker(self):
         # The motivating case: "**Important news:** \n1) the weather ..."
         out = speechify("**Important news:**\n1) the weather looks clear")
@@ -59,6 +116,47 @@ class SpeechifyTests(unittest.TestCase):
         self.assertEqual(speechify("call foo_bar_baz please"), "call foo_bar_baz please")
         self.assertEqual(speechify("compute 3 * 4 exactly"), "compute 3 * 4 exactly")
 
+    def test_words_joined_by_a_hyphen_are_read_as_two(self):
+        # Phonon said "document dash level" and "domain dash and" (docs/pronunciation.md).
+        self.assertEqual(speechify("document-level sentiment"), "document level sentiment")
+        self.assertEqual(speechify("domain- and task-specific"), "domain and task specific")
+        self.assertEqual(speechify("aspect–sentiment pairs"), "aspect sentiment pairs")
+        for kept in ("COVID-19", "1-800-555", "a - b", "-5 degrees", "well -- no"):
+            self.assertEqual(speechify(kept), kept)
+
+    def test_housing_is_respelled(self):
+        self.assertEqual(
+            speechify("including Public Housing and Rent Supplement."),
+            "including Public Howzing and Rent Supplement.",
+        )
+        self.assertEqual(speechify("Housing is expensive; rental housings too."),
+                         "Howzing is expensive; rental howzings too.")
+        self.assertEqual(speechify("A Rousing speech, arousing interest"), "A Rowzing speech, arowzing interest")
+        self.assertEqual(speechify("HOUSING"), "Howzing")  # "HOWZING" is heard as "pausing"
+        # These read fine, and "rehousing"/"mousing" are left alone.
+        self.assertEqual(speechify("Houses, rehousing, mousing"), "Houses, rehousing, mousing")
+
+    def test_quarter_before_a_year_gets_of(self):
+        # Phonon read "Q1 2019" as "Q one two zero one nine".
+        self.assertEqual(speechify("quarters from Q1 2019 to Q2 2026, with no gaps"),
+                         "quarters from Q1 of 2019 to Q2 of 2026, with no gaps")
+        self.assertEqual(speechify("Q4, 2025 was weak."), "Q4 of 2025 was weak.")
+        # Already fine, or not a quarter and a year: left alone.
+        for text in ("2023 Q3", "in Q3.", "Q3 of 2023", "Q5 2019", "Q1 20 units", "SQ1 2019"):
+            self.assertEqual(speechify(text), text)
+
+    def test_decimals_are_read_with_point(self):
+        # In a long sentence Phonon read "57.7%" as "57. 7%".
+        self.assertEqual(speechify("in our data: 57.7% of the 241,309"), "in our data: 57 point 7% of the 241,309")
+        self.assertEqual(speechify("at the 0.05 level"), "at the 0 point 0 5 level")
+        for kept in ("costs $3.50", "version 1.2.3", "v1.2 shipped", "in 2020. 5 people", "241,309 reviews"):
+            self.assertEqual(speechify(kept), kept)
+
+    def test_reader_chat_citations_are_silent(self):
+        self.assertEqual(speechify("They compare three classes [§14]."), "They compare three classes.")
+        self.assertEqual(speechify("Both [§3, §7] agree [§2–5]."), "Both agree.")
+        self.assertEqual(speechify("Under § 4 of the act [1]."), "Under § 4 of the act [1].")
+
     def test_idempotent(self):
         s = "**Bold** and `code` and [link](http://x.test)\n- one\n- two"
         once = speechify(s)
@@ -78,3 +176,101 @@ class SpeechifyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PiRespellingTests(unittest.TestCase):
+    def test_pi_is_respelled_where_it_is_the_word(self):
+        self.assertEqual(speechify("from negative pi to pi of e"), "from negative pie to pie of e")
+        self.assertEqual(speechify("Pi is about 3, and so is π."), "pie is about 3, and so is pie.")
+        for text in ("The PI signed it.", "a pig and a pin", "pi_harness runs"):
+            self.assertEqual(speechify(text), text)
+
+
+class SpeechClipTests(unittest.IsolatedAsyncioTestCase):
+    async def clips(self, sentence):
+        async def spoken(text):
+            return f"<{text}>" if "$" in text else text
+
+        with patch("tts.speakable", spoken):
+            return [(c.text, c.math) for c in await tts.speech_clips(sentence)]
+
+    async def test_a_large_formula_is_its_own_clip_with_its_punctuation(self):
+        self.assertEqual(
+            await self.clips(r"It says: $X = \int_0^1 f(x) dx$, where $f$ is smooth."),
+            [("It says", False), (r"<$X = \int_0^1 f(x) dx$,>", True), ("<where $f$ is smooth.>".replace("<", "").replace(">", ""), False)]
+            if False else
+            [("It says", False), (r"<$X = \int_0^1 f(x) dx$,>", True), ("<where $f$ is smooth.>", False)],
+        )
+
+    async def test_a_small_formula_stays_in_its_sentence(self):
+        self.assertEqual(await self.clips("Here $n$ and $x_i$ are small."), [("<Here $n$ and $x_i$ are small.>", False)])
+        self.assertEqual(await self.clips("No math at all."), [("No math at all.", False)])
+
+    async def test_nothing_is_spoken_for_a_tail_of_punctuation_or_a_citation(self):
+        self.assertEqual(await self.clips(r"$$a + b$$ [§4]."), [("<$$a + b$$>", True)])
+        self.assertEqual(await self.clips(r"So $\frac{a}{b}$."), [("So", False), (r"<$\frac{a}{b}$.>", True)])
+
+    async def test_two_formulas_keep_the_words_between_them(self):
+        self.assertEqual(
+            await self.clips(r"$\sum_i a_i$ and then $\sum_j b_j$"),
+            [(r"<$\sum_i a_i$>", True), ("and then", False), (r"<$\sum_j b_j$>", True)],
+        )
+
+    async def test_seams_are_trimmed_only_at_joined_ends(self):
+        def make(lead, voiced, tail, rate=24000):
+            samples = np.concatenate([np.zeros(int(lead * rate)), 0.3 * np.ones(int(voiced * rate)), np.zeros(int(tail * rate))])
+            out = io.BytesIO()
+            with wave.open(out, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                w.writeframes((samples * 32767).astype(np.int16).tobytes())
+            return out.getvalue()
+
+        def seconds(data):
+            with wave.open(io.BytesIO(data)) as r:
+                return r.getnframes() / r.getframerate()
+
+        clip = make(0.5, 1.0, 0.6)
+        self.assertAlmostEqual(seconds(tts.trim_seam(clip, lead=True, tail=True)), 1.25, delta=0.05)
+        self.assertAlmostEqual(seconds(tts.trim_seam(clip, lead=True, tail=False)), 1.75, delta=0.05)
+        self.assertAlmostEqual(seconds(tts.trim_seam(clip, lead=False, tail=True)), 1.6, delta=0.05)
+        self.assertEqual(tts.trim_seam(b"not a wav", lead=True, tail=True), b"not a wav")
+
+
+class SpeakableTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        tts._speech_math_down_until = 0.0
+        self.addCleanup(setattr, tts, "_speech_math_down_until", 0.0)
+
+    async def test_text_without_math_never_reaches_the_llm(self):
+        convert = AsyncMock()
+        with patch("reader_text._llm_convert_math", convert):
+            for text in ("Plain words.", "It costs $5 and then $10.", "Use `$HOME` here."):
+                self.assertEqual(await tts.speakable(text), text)
+        convert.assert_not_called()
+
+    async def test_math_is_rewritten_without_its_citation(self):
+        convert = AsyncMock(return_value="x squared is fine.")
+        with patch("reader_text._llm_convert_math", convert):
+            self.assertEqual(await tts.speakable("$x^2$ is fine [§4]."), "x squared is fine.")
+        self.assertNotIn("§", convert.call_args.args[1])
+
+    async def test_the_letter_z_is_zed_only_in_a_math_sentence(self):
+        convert = AsyncMock(return_value="where Z has mean z, for Gen Zs.")
+        with patch("reader_text._llm_convert_math", convert):
+            self.assertEqual(await tts.speakable("where $Z$ has mean $z$, for Gen Zs."), "where zed has mean zed, for Gen Zs.")
+            self.assertEqual(await tts.speakable("Gen Z likes it."), "Gen Z likes it.")
+
+    async def test_slow_rewrite_falls_back_and_later_sentences_skip_the_wait(self):
+        async def hang(_client, _text):
+            await asyncio.sleep(30)
+
+        convert = AsyncMock(side_effect=hang)
+        with patch("reader_text._llm_convert_math", convert), patch.object(tts, "SPEECH_MATH_TIMEOUT_S", 0.01):
+            self.assertEqual(await tts.speakable(r"So $\mu$ here."), "So mu here.")
+            self.assertEqual(await tts.speakable(r"And $\sigma$ there."), "And sigma there.")
+        self.assertEqual(convert.call_count, 1)
+
+    def test_breaks_skip_equations(self):
+        pattern = re.compile(r"(?<=[.!?])\s+")
+        text = "See $a. b$ and $$c. d$$ here. Next."
+        self.assertEqual([text[m.end():] for m in tts.breaks_outside_math(pattern, text)], ["Next."])

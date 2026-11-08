@@ -9,9 +9,9 @@ streaming/sanitizing/cap logic lives in `media_uploads.py`.
 Starlette's multipart parser reads the entire request body into its own
 spooled temp file before this handler ever runs, so `media_uploads.save_upload`'s
 size cap is logical (enforced while copying out of that temp file), not an
-ingress limit. The `Content-Length` check below is the only pre-receipt
-bound — a real ingress guard would be a body-size limit on Caddy's
-`octavius.riegert.xyz` site block (needs sudo; not done).
+ingress limit. The `Content-Length` check below is the app's only pre-receipt
+bound; the real ingress guard is Caddy's `request_body { max_size 52MB }` in
+the `octavius.riegert.xyz` site block.
 """
 from pathlib import Path
 

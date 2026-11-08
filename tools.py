@@ -17,6 +17,7 @@ from local_tool_reader import (
     process_pdf_background,
     read_document,
 )
+from local_tool_reader_lookup import read_reader_document, reader_document_outline, search_reader_document
 from local_tool_specs import TOOLS
 
 if TYPE_CHECKING:
@@ -71,6 +72,9 @@ def get_local_tool_handlers() -> dict[str, Callable]:
         "read_document": read_document,
         "list_reader_documents": list_reader_documents,
         "append_to_reader_document": append_to_reader_document,
+        "reader_document_outline": reader_document_outline,
+        "read_reader_document": read_reader_document,
+        "search_reader_document": search_reader_document,
         "process_pdf": process_pdf_background,
         "check_document_status": check_document_status,
         "search_conversation_history": search_conversation_history,

@@ -283,3 +283,13 @@ class StyleDirectiveTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StyleDirectiveMathTests(unittest.TestCase):
+    def test_math_is_asked_for_only_where_it_is_typeset(self):
+        from agent import TEXT_MATH_STYLE, TEXT_STYLE, VOICE_MATH_STYLE, VOICE_STYLE, _style_directive
+        self.assertIn(VOICE_MATH_STYLE, _style_directive("voice", math=True))
+        self.assertIn(TEXT_MATH_STYLE, _style_directive("text", math=True))
+        self.assertEqual(_style_directive("voice"), VOICE_STYLE)  # Matrix
+        self.assertEqual(_style_directive("text"), TEXT_STYLE)
+        self.assertEqual(_style_directive("inbox_chat", math=True), TEXT_STYLE)

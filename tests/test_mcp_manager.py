@@ -90,16 +90,83 @@ class MCPManagerTests(unittest.TestCase):
         manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
         self.assertEqual(manager.get_tools_for_servers(["nonexistent"]), [])
 
-    def test_collision_warning_when_different_server_overwrites(self):
+    def test_collision_first_owner_keeps_name_newcomer_is_prefixed(self):
+        manager = MCPManager({
+            "alpha": {"transport": "http"},
+            "beta-srv": {"transport": "http"},
+        })
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
+        with self.assertLogs("mcp_manager", level="WARNING") as cm:
+            manager._register_tools("beta-srv", _FakeListTools([_FakeTool("search")]))
+        self.assertTrue(any("collision" in msg for msg in cm.output))
+        # The earlier owner is never overwritten...
+        self.assertEqual(manager.get_server_for_tool("search"), "alpha")
+        # ...and the newcomer stays reachable under a server-keyed name.
+        self.assertEqual(manager.get_server_for_tool("beta_srv_search"), "beta-srv")
+        names = [t["function"]["name"] for t in manager.tools]
+        self.assertEqual(sorted(names), ["beta_srv_search", "search"])
+
+    def test_collision_renamed_tool_calls_upstream_name(self):
         manager = MCPManager({
             "alpha": {"transport": "http"},
             "beta": {"transport": "http"},
         })
         manager._register_tools("alpha", _FakeListTools([_FakeTool("search")]))
-        with self.assertLogs("mcp_manager", level="WARNING") as cm:
+        with self.assertLogs("mcp_manager", level="WARNING"):
             manager._register_tools("beta", _FakeListTools([_FakeTool("search")]))
-        self.assertTrue(any("collision" in msg for msg in cm.output))
-        self.assertEqual(manager.get_server_for_tool("search"), "beta")
+        seen = []
+
+        class _Recording(_FakeSession):
+            async def call_tool(self, name, arguments):
+                seen.append(name)
+                return _FakeResult("ok")
+
+        manager._sessions["beta"] = _Recording()
+        self.assertEqual(asyncio.run(manager.call_tool("beta_search", {})), "ok")
+        self.assertEqual(seen, ["search"])
+
+    def test_tool_prefix_names_and_routes_to_upstream(self):
+        manager = MCPManager({"email-srv": {"transport": "http", "tool_prefix": "email"}})
+        manager._register_tools(
+            "email-srv",
+            _FakeListTools([_FakeTool("keyword_search"), _FakeTool("stats"), _FakeTool("email_legacy")]),
+        )
+        names = {t["function"]["name"] for t in manager.tools}
+        # Prefix is not doubled when the upstream name already carries it
+        # (same rule as pi-mcp-adapter's formatToolName).
+        self.assertEqual(names, {"email_keyword_search", "email_stats", "email_legacy"})
+        seen = []
+
+        class _Recording(_FakeSession):
+            async def call_tool(self, name, arguments):
+                seen.append(name)
+                return _FakeResult("ok")
+
+        manager._sessions["email-srv"] = _Recording()
+        asyncio.run(manager.call_tool("email_stats", {}))
+        self.assertEqual(seen, ["stats"])
+
+    def test_call_server_tool_bypasses_display_names(self):
+        manager = MCPManager({"vault": {"transport": "http", "tool_prefix": "vault"}})
+        manager._register_tools("vault", _FakeListTools([_FakeTool("search")]))
+        seen = []
+
+        class _Recording(_FakeSession):
+            async def call_tool(self, name, arguments):
+                seen.append(name)
+                return _FakeResult("hits")
+
+        manager._sessions["vault"] = _Recording()
+        self.assertEqual(asyncio.run(manager.call_server_tool("vault", "search", {"query": "x"})), "hits")
+        self.assertEqual(seen, ["search"])
+        self.assertIn("unknown server", asyncio.run(manager.call_server_tool("nope", "search", {})))
+
+    def test_reregister_drops_tools_removed_upstream(self):
+        manager = MCPManager({"alpha": {"transport": "http"}})
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("old_name"), _FakeTool("keep")]))
+        manager._register_tools("alpha", _FakeListTools([_FakeTool("new_name"), _FakeTool("keep")]))
+        self.assertEqual(manager.get_registered_tool_names(), {"new_name", "keep"})
+        self.assertEqual(len(manager.tools), 2)
 
     def test_no_collision_warning_on_same_server_reregister(self):
         manager = MCPManager({"alpha": {"transport": "http"}})

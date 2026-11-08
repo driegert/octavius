@@ -93,12 +93,10 @@ class _RecordingAsyncClient:
         return outcome
 
 
-def _make_tts_client(kokoro_voices: list[str] | None = None) -> TTSClient:
+def _make_tts_client() -> TTSClient:
     return TTSClient(
-        primary={"url": "http://primary-tts", "model": "voxtral", "voice": "alice"},
-        fallback={"url": "http://fallback-tts", "model": "kokoro", "voice": "bob"},
-        response_format="wav",
-        kokoro_voices=kokoro_voices,
+        url="http://phonon-tts", model="phonon", voice="Imogen",
+        voices=["Imogen", "Delia", "Hugh"], response_format="wav",
     )
 
 
@@ -831,186 +829,35 @@ class LLMAuthHeaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.headers, [{"Authorization": "Bearer sk-abc"}])
 
 
-class TTSCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_primary_success_keeps_breaker_closed(self):
+class TTSClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_known_voice_is_sent_as_is(self):
         client = _make_tts_client()
-        fake = _RecordingAsyncClient([_FakeTTSResponse(b"primary-audio")])
+        fake = _RecordingAsyncClient([_FakeTTSResponse(b"audio")])
 
         with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("hello")
+            result = await client.synthesize("hi", voice="Delia")
 
-        self.assertEqual(result, b"primary-audio")
-        self.assertEqual(fake.calls, ["http://primary-tts"])
-        self.assertEqual(client._primary_consecutive_failures, 0)
-        self.assertFalse(client._primary_is_tripped())
+        self.assertEqual(result, b"audio")
+        self.assertEqual(fake.calls, ["http://phonon-tts"])
+        self.assertEqual(fake.bodies[0]["voice"], "Delia")
+        self.assertEqual(fake.bodies[0]["model"], "phonon")
+        self.assertEqual(fake.bodies[0]["response_format"], "wav")
 
-    async def test_primary_failure_falls_back_but_breaker_stays_closed(self):
+    async def test_unknown_or_missing_voice_uses_the_default(self):
+        # Phonon 400s on names it lacks (an old Voxtral "de_male" saved in a browser).
+        for voice in ("de_male", None):
+            client = _make_tts_client()
+            fake = _RecordingAsyncClient([_FakeTTSResponse()])
+            with patch("service_clients.httpx.AsyncClient", return_value=fake):
+                await client.synthesize("hi", voice=voice)
+            self.assertEqual(fake.bodies[0]["voice"], "Imogen")
+
+    async def test_http_error_propagates(self):
         client = _make_tts_client()
-        fake = _RecordingAsyncClient([
-            httpx.ConnectError("primary down"),
-            _FakeTTSResponse(b"fallback-audio"),
-        ])
-
+        fake = _RecordingAsyncClient([httpx.ConnectError("down")])
         with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("hello")
-
-        self.assertEqual(result, b"fallback-audio")
-        self.assertEqual(fake.calls, ["http://primary-tts", "http://fallback-tts"])
-        self.assertEqual(client._primary_consecutive_failures, 1)
-        self.assertFalse(client._primary_is_tripped())
-
-    async def test_breaker_trips_after_threshold_failures(self):
-        client = _make_tts_client()
-        # 3 failure/fallback pairs — on the 3rd failure the breaker should trip.
-        outcomes = []
-        for _ in range(TTSClient.PRIMARY_FAILURE_THRESHOLD):
-            outcomes.extend([httpx.ConnectError("nope"), _FakeTTSResponse(b"fb")])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=_RecordingAsyncClient(outcomes)):
-            for _ in range(TTSClient.PRIMARY_FAILURE_THRESHOLD):
-                await client.synthesize("hi")
-
-        self.assertTrue(client._primary_is_tripped())
-        self.assertEqual(client._primary_consecutive_failures, TTSClient.PRIMARY_FAILURE_THRESHOLD)
-
-    async def test_tripped_breaker_skips_primary_entirely(self):
-        client = _make_tts_client()
-        client._primary_consecutive_failures = TTSClient.PRIMARY_FAILURE_THRESHOLD
-        client._primary_skip_until = time.monotonic() + 60.0
-        fake = _RecordingAsyncClient([_FakeTTSResponse(b"fallback-only")])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("hi")
-
-        self.assertEqual(result, b"fallback-only")
-        self.assertEqual(fake.calls, ["http://fallback-tts"])
-
-    async def test_primary_success_resets_counter_after_partial_failures(self):
-        client = _make_tts_client()
-        # Two failures, then a success — counter should reset, breaker stay closed.
-        with patch(
-            "service_clients.httpx.AsyncClient",
-            return_value=_RecordingAsyncClient([
-                httpx.ConnectError("1"),
-                _FakeTTSResponse(b"fb"),
-                httpx.ConnectError("2"),
-                _FakeTTSResponse(b"fb"),
-                _FakeTTSResponse(b"primary-recovered"),
-            ]),
-        ):
-            await client.synthesize("a")
-            await client.synthesize("b")
-            result = await client.synthesize("c")
-
-        self.assertEqual(result, b"primary-recovered")
-        self.assertEqual(client._primary_consecutive_failures, 0)
-        self.assertFalse(client._primary_is_tripped())
-
-    async def test_half_open_probe_after_cooldown(self):
-        client = _make_tts_client()
-        # Simulate: breaker tripped, cooldown already elapsed.
-        client._primary_consecutive_failures = TTSClient.PRIMARY_FAILURE_THRESHOLD
-        client._primary_skip_until = time.monotonic() - 1.0
-        fake = _RecordingAsyncClient([_FakeTTSResponse(b"primary-back")])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("probe")
-
-        # Should have attempted the primary again and recovered.
-        self.assertEqual(result, b"primary-back")
-        self.assertEqual(fake.calls, ["http://primary-tts"])
-        self.assertEqual(client._primary_consecutive_failures, 0)
-        self.assertFalse(client._primary_is_tripped())
-
-    async def test_half_open_failure_re_trips_breaker(self):
-        client = _make_tts_client()
-        client._primary_consecutive_failures = TTSClient.PRIMARY_FAILURE_THRESHOLD
-        client._primary_skip_until = time.monotonic() - 1.0  # cooldown elapsed
-        fake = _RecordingAsyncClient([
-            httpx.ConnectError("still dead"),
-            _FakeTTSResponse(b"fb"),
-        ])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("probe")
-
-        self.assertEqual(result, b"fb")
-        self.assertEqual(fake.calls, ["http://primary-tts", "http://fallback-tts"])
-        self.assertTrue(client._primary_is_tripped())
-        self.assertEqual(
-            client._primary_consecutive_failures,
-            TTSClient.PRIMARY_FAILURE_THRESHOLD + 1,
-        )
-
-    async def test_primary_honors_per_call_voice(self):
-        client = _make_tts_client()
-
-        captured: dict = {}
-
-        class _Capturing(_RecordingAsyncClient):
-            async def post(self, url, json=None):
-                captured["url"] = url
-                captured["json"] = json
-                return _FakeTTSResponse(b"ok")
-
-        with patch("service_clients.httpx.AsyncClient", return_value=_Capturing([])):
-            await client.synthesize("hi", voice="charlie")
-
-        self.assertEqual(captured["url"], "http://primary-tts")
-        self.assertEqual(captured["json"]["voice"], "charlie")
-
-    async def test_kokoro_voice_bypasses_primary(self):
-        client = _make_tts_client(kokoro_voices=["af_heart"])
-        fake = _RecordingAsyncClient([_FakeTTSResponse(b"kokoro-audio")])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("hi", voice="af_heart")
-
-        self.assertEqual(result, b"kokoro-audio")
-        self.assertEqual(fake.calls, ["http://fallback-tts"])
-        self.assertEqual(client._primary_consecutive_failures, 0)
-        self.assertFalse(client._primary_is_tripped())
-
-    async def test_kokoro_voice_sends_user_voice_not_fallback_default(self):
-        client = _make_tts_client(kokoro_voices=["af_heart"])
-
-        captured: dict = {}
-
-        class _Capturing(_RecordingAsyncClient):
-            async def post(self, url, json=None):
-                captured["url"] = url
-                captured["json"] = json
-                return _FakeTTSResponse(b"ok")
-
-        with patch("service_clients.httpx.AsyncClient", return_value=_Capturing([])):
-            await client.synthesize("hi", voice="af_heart")
-
-        self.assertEqual(captured["url"], "http://fallback-tts")
-        self.assertEqual(captured["json"]["voice"], "af_heart")
-
-    async def test_kokoro_voice_ignores_tripped_breaker(self):
-        client = _make_tts_client(kokoro_voices=["af_heart"])
-        client._primary_consecutive_failures = TTSClient.PRIMARY_FAILURE_THRESHOLD
-        client._primary_skip_until = time.monotonic() + 60.0
-        fake = _RecordingAsyncClient([_FakeTTSResponse(b"kokoro-audio")])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("hi", voice="af_heart")
-
-        self.assertEqual(result, b"kokoro-audio")
-        self.assertEqual(fake.calls, ["http://fallback-tts"])
-        # Breaker state untouched by Kokoro-voice calls.
-        self.assertTrue(client._primary_is_tripped())
-
-    async def test_non_kokoro_voice_still_uses_primary(self):
-        client = _make_tts_client(kokoro_voices=["af_heart"])
-        fake = _RecordingAsyncClient([_FakeTTSResponse(b"primary-audio")])
-
-        with patch("service_clients.httpx.AsyncClient", return_value=fake):
-            result = await client.synthesize("hi", voice="de_male")
-
-        self.assertEqual(result, b"primary-audio")
-        self.assertEqual(fake.calls, ["http://primary-tts"])
+            with self.assertRaises(httpx.ConnectError):
+                await client.synthesize("hi", voice="Delia")
 
 
 if __name__ == "__main__":
