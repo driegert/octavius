@@ -38,6 +38,48 @@ class ReaderIngestHandlerTests(unittest.TestCase):
         with patch.object(handlers, "get_trafilatura", return_value=fake):
             self.assertIsNone(handlers.extract_article_text("<html></html>", _ReaderIngestError))
 
+    def test_extract_article_text_drops_comment_and_newsletter_widgets(self):
+        para = "The builder runs eight used data center cards in one office, on two ordinary circuits. " * 4
+        html = f"""<html><body class="news-page has-comments"><article><h1>Lawyer builds a server</h1>
+        <div id="article-body"><p>{para}</p>
+        <div class="newsletter-form__wrapper"><p class="newsletter-form__strapline">Get Example's best news and in-depth reviews, straight to your inbox.</p></div>
+        <p>{para.replace("builder", "owner")}</p>
+        <p>Follow Example on Google News, or add us as a preferred source, to get our latest news in your feeds.</p>
+        <p>One commenter traced the same problem to a bad cable, which the article itself reports.</p></div></article>
+        <div class="xenforo-comment-widget"><ul class="xenforo-comments-list">
+        <li class="xenforo-comment"><div class="xenforo-comment-content">marmarmar34 Reply Seems like a huge waste.</div></li>
+        </ul></div></body></html>"""
+        text = handlers.extract_article_text(html, _ReaderIngestError)
+        self.assertIn("eight used data center cards", text)
+        self.assertIn("The owner runs", text)
+        self.assertIn("One commenter traced", text)  # article prose that mentions comments stays
+        for gone in ("marmarmar34", "huge waste", "in-depth reviews", "Google News"):
+            self.assertNotIn(gone, text)
+        self.assertGreater(text.count("\n\n"), 1)  # paragraphs, not one block
+
+    def test_prune_keeps_container_holding_the_article(self):
+        tree = handlers._prune_page_furniture(
+            '<html><body><div class="comments-enabled"><article><h1>T</h1><p>Body text.</p></article></div></body></html>'
+        )
+        self.assertEqual(len(tree.xpath("//article")), 1)
+
+    def test_repair_markdown_tables_rejoins_one_cell_per_line(self):
+        broken = "See the table.\n\nPrompt length |\nWait |\n|---|---|\n1K tokens |\n1.2 seconds |\n32K tokens |\n17.2 seconds |\n\nAfter."
+        fixed = handlers._repair_markdown_tables(broken)
+        self.assertIn("| Prompt length | Wait |\n|---|---|\n| 1K tokens | 1.2 seconds |\n| 32K tokens | 17.2 seconds |", fixed)
+        self.assertTrue(fixed.startswith("See the table.") and fixed.endswith("After."))
+        good = "| a | b |\n|---|---|\n| 1 | 2 |"
+        self.assertEqual(handlers._repair_markdown_tables(good), good)
+        ragged = "a |\nb |\n|---|---|\n1 |"  # cells do not fill the last row: left alone
+        self.assertEqual(handlers._repair_markdown_tables(ragged), ragged)
+
+    def test_drop_promo_paragraphs_leaves_prose(self):
+        text = "Get our newsletter in your inbox.\n\nGet the cards seated properly, the builder says, or they drop to x4.\n\nSubscribe to Example's newsletter."
+        self.assertEqual(
+            handlers._drop_promo_paragraphs(text),
+            "Get the cards seated properly, the builder says, or they drop to x4.",
+        )
+
     def test_refine_title_from_web_page_uses_title_suffix_when_generic(self):
         fake = _FakeTrafilatura(metadata=None)
         with patch.object(handlers, "get_trafilatura", return_value=fake):

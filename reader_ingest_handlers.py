@@ -44,23 +44,101 @@ def get_trafilatura(reader_ingest_error_type: type["ReaderIngestError"]):
         ) from exc
 
 
+# Page furniture trafilatura keeps as article text. Its own include_comments=False
+# misses comment widgets it doesn't know: Tom's Hardware's XenForo widget
+# (div.xenforo-comment-widget, li.xenforo-comment) came through as 21 spoken
+# sentences, usernames run into the text. Matched as a whole token of a class or id
+# ("comment", "comments", "xf-comment-reply", "newsletter-form__strapline").
+_FURNITURE_ATTR = re.compile(r'(?:^|[\s_-])(?:comments?|newsletter)(?:$|[\s_-])', re.IGNORECASE)
+# Never prune these, nor anything holding the article, whatever its class says
+# (a <body class="has-comments"> must not take the page with it).
+_FURNITURE_KEEP_TAGS = frozenset({"html", "body", "main", "article"})
+# A promo line that sits as a plain paragraph inside the article body.
+_PROMO_PARAGRAPH = re.compile(
+    r'^\W*(?:follow|get|sign up|subscribe|join)\b.{0,200}'
+    r'\b(?:google news|newsletters?|inbox|preferred source|in your feeds)\b',
+    re.IGNORECASE | re.DOTALL,
+)
+_PROMO_MAX_CHARS = 300
+
+
+def _prune_page_furniture(raw: str):
+    """The page as an lxml tree without comment and newsletter widgets, or `raw` unparsed."""
+    try:
+        import lxml.html
+
+        tree = lxml.html.fromstring(raw)
+    except Exception:
+        return raw
+    for el in list(tree.iter()):
+        if not isinstance(el.tag, str) or el.tag in _FURNITURE_KEEP_TAGS:
+            continue
+        parent = el.getparent()
+        if parent is None:
+            continue
+        if _FURNITURE_ATTR.search(f'{el.get("class", "")} {el.get("id", "")}') and not el.xpath('.//article|.//h1'):
+            parent.remove(el)
+    return tree
+
+
+def _repair_markdown_tables(text: str) -> str:
+    """Rejoin tables trafilatura's markdown writes one cell per line ("Prompt length |").
+
+    Rows are rebuilt from the column count of the `|---|---|` rule, so the reader's
+    table handling (caption plus overview, never cell by cell) recognises them.
+    """
+    out = []
+    for block in text.split("\n\n"):
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        rule = next((ln for ln in lines if re.fullmatch(r'\|(?:\s*:?-+:?\s*\|)+', ln)), None)
+        if rule is None or any(ln.startswith("|") and ln != rule for ln in lines):
+            out.append(block)
+            continue
+        ncols = rule.count("|") - 1
+        idx = lines.index(rule)
+        head = [ln.rstrip("|").strip() for ln in lines[:idx]]
+        cells = [ln.rstrip("|").strip() for ln in lines[idx + 1:]]
+        if len(head) != ncols or len(cells) % ncols:
+            out.append(block)
+            continue
+        rows = ["| " + " | ".join(head) + " |", rule]
+        rows += ["| " + " | ".join(cells[i:i + ncols]) + " |" for i in range(0, len(cells), ncols)]
+        out.append("\n".join(rows))
+    return "\n\n".join(out)
+
+
+def _drop_promo_paragraphs(text: str) -> str:
+    return "\n\n".join(
+        p for p in text.split("\n\n")
+        if not (len(p) <= _PROMO_MAX_CHARS and _PROMO_PARAGRAPH.search(p.strip()))
+    )
+
+
 def extract_article_text(raw: str, reader_ingest_error_type: type["ReaderIngestError"]) -> str | None:
+    # Markdown, not txt: txt separates paragraphs with a single newline, and the
+    # reader splits on blank lines, so a whole article became one chunk. Tables are
+    # kept because the reader speaks them as a caption plus an overview.
     trafilatura = get_trafilatura(reader_ingest_error_type)
+    page = _prune_page_furniture(raw)
     extracted = trafilatura.extract(
-        raw,
+        page,
         include_links=False,
         include_comments=False,
-        include_tables=False,
-        output_format="txt",
+        include_tables=True,
+        output_format="markdown",
     )
     if not extracted:
         extracted = trafilatura.extract(
-            raw,
+            _prune_page_furniture(raw),  # fresh: extract() may have cleaned the first tree in place
             include_links=False,
+            include_comments=False,
+            include_tables=True,
             favor_recall=True,
-            output_format="txt",
+            output_format="markdown",
         )
-    return extracted
+    if not extracted:
+        return extracted
+    return _drop_promo_paragraphs(_repair_markdown_tables(extracted)) or None
 
 
 def refine_title_from_html(

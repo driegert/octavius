@@ -776,7 +776,14 @@ Still live:
 
 - Accepts local files, URLs, inbox items, and **raw pasted text**.
 - Converts PDF, markdown, and extracted HTML content into speech-oriented JSON.
-- HTML extraction uses trafilatura.
+- HTML extraction uses trafilatura, as **markdown with tables** (since 2026-11-09; `txt` joined paragraphs with
+  single newlines, so a whole article became one chunk). `reader_ingest_handlers.extract_article_text` first prunes
+  elements whose class/id has a `comment(s)` or `newsletter` token (trafilatura's `include_comments=False` missed
+  Tom's Hardware's XenForo widget), rejoins tables trafilatura 2.0 writes one cell per line, and drops short
+  "Follow us on Google News"/newsletter paragraphs. Comments are dropped, never read.
+- Inline `$...$` counts as math only under Pandoc's rule (as `static/math-render.js`): no space inside either dollar,
+  no digit after the closing one. "$2,400 ... $900" used to send a whole article through the math LLM and then
+  `strip_latex`, which deleted every `$`.
 - Math-heavy paragraphs are sent to the reader LLM; non-math paragraphs are cleaned locally.
 - Before chunking, `reader_text.join_page_breaks` rejoins a paragraph a PDF page break split mid-sentence (it ends
   in a word, comma or hyphen and the next prose paragraph starts lower case, or it ended on a comma), moving any

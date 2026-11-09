@@ -44,8 +44,15 @@ SENTENCE_END = re.compile(
     r'(?:(?<!\bet al\.)\s+(?![a-z])|(?<=\bet al\.)\s+(?=[A-Z]))'
 )
 HEADING_RE = re.compile(r'^(#{1,3})\s+(.+)$', re.MULTILINE)
+# Inline $...$ follows Pandoc's rule, as static/math-render.js does: no space just
+# inside either dollar, no digit right after the closing one, no blank line inside.
+# The old `\$\$?.+?\$\$?` took prices for math: "$2,400 ... $900" in a Tom's Hardware
+# article (2026-11-09) sent the whole page to the math LLM, whose rewrite kept the
+# prices, failed this check on every endpoint, and fell through to strip_latex, which
+# dropped every "$" and read "Q6_KM" as "Q6 sub K M".
 MATH_RE = re.compile(
-    r'\$\$?.+?\$\$?'          # $inline$ / $$display$$
+    r'\$\$.+?\$\$'            # $$display$$
+    r'|(?<![\\$])\$(?![\s$])(?:[^$\n]|\n(?!\n))*?[^\s\\$]\$(?!\d)'  # $inline$
     r'|\\\(.+?\\\)'           # \(inline\)
     r'|\\\[.+?\\\]'           # \[display\]
     r'|\\begin\{[a-z]+\*?\}', # equation/align/... environments

@@ -162,6 +162,17 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(has_math("\\begin{equation}\nx\n\\end{equation}"))
         self.assertFalse(has_math("costs 5 dollars, no math here"))
 
+    def test_has_math_ignores_prices(self):
+        # Pandoc's rule: a closing $ has no space before it and no digit after it.
+        self.assertFalse(has_math("costing about $2,400 per board; now $900, double the $400 from the post"))
+        self.assertFalse(has_math("costing about $2,400 per board\nnow listed for about $900"))
+        self.assertFalse(has_math("between $5 and $10"))
+        self.assertTrue(has_math("price $p$ rises"))
+        self.assertTrue(has_math("let $x$ be"))
+        self.assertTrue(has_math("where $\\alpha = 0.05$, we reject"))
+        # a blank line ends an inline span
+        self.assertFalse(has_math("$a\n\nb$"))
+
     def test_strip_latex_fallback_beats_command_soup(self):
         # The Thomson 2012 equation that was being read aloud as raw LaTeX.
         text = ("$$\\widehat{R_B}(\\tau) = \\frac{1}{N} "
