@@ -775,6 +775,7 @@ Still live:
 ### Document Reader
 
 - Accepts local files, URLs, inbox items, and **raw pasted text**.
+- `/reader`'s add box (since 2026-11-10): "+" opens a file picker; the picked file goes through `POST /api/media/upload` (so it works from any device) and is then added by the returned spool path. The checkmark adds whatever is picked or typed and stays disabled until there is something. **Temporary** (`temporary: true` on `POST /api/reader/documents`, strict bool; `reader_documents.temporary`) applies to a file, path, URL or pasted text: `reader_store.purge_temporary_documents` deletes such a document once read to the end, or 24 h after it was added, on startup and before each library listing (never while `processing`), together with its pasted-text or uploaded source; a path Dave typed is never removed.
 - Converts PDF, markdown, and extracted HTML content into speech-oriented JSON.
 - HTML extraction uses trafilatura, as **markdown with tables** (since 2026-11-09; `txt` joined paragraphs with
   single newlines, so a whole article became one chunk). `reader_ingest_handlers.extract_article_text` first prunes

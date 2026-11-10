@@ -3,7 +3,7 @@
 import json
 import shutil
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from settings import settings
@@ -87,7 +87,7 @@ def get_document(conn: sqlite3.Connection, doc_id: int) -> dict | None:
         """SELECT id, title, source_type, source_path, saved_item_id,
                   speech_file, original_md_file, chunk_count, status, error,
                   last_chunk, last_sentence, created_at, updated_at,
-                  total_sentences, progress_sentences
+                  total_sentences, progress_sentences, temporary
            FROM reader_documents WHERE id = ?""",
         (doc_id,),
     ).fetchone()
@@ -101,6 +101,7 @@ def get_document(conn: sqlite3.Connection, doc_id: int) -> dict | None:
         "last_chunk": row[10], "last_sentence": row[11],
         "created_at": row[12], "updated_at": row[13],
         "total_sentences": row[14], "progress_sentences": row[15],
+        "temporary": bool(row[16]),
     }
 
 
@@ -110,7 +111,8 @@ def list_documents(
     status: str | None = None,
 ) -> list[dict]:
     sql = """SELECT id, title, source_type, chunk_count, status, error, created_at,
-                    total_sentences, progress_sentences, speech_file, last_chunk, last_sentence
+                    total_sentences, progress_sentences, speech_file, last_chunk, last_sentence,
+                    temporary
              FROM reader_documents"""
     params: list = []
     if status:
@@ -128,6 +130,7 @@ def list_documents(
             "id": r[0], "title": r[1], "source_type": r[2],
             "chunk_count": r[3], "status": r[4], "error": r[5], "created_at": r[6],
             "total_sentences": total, "progress_sentences": progress,
+            "temporary": bool(r[12]),
         })
     return docs
 
@@ -144,6 +147,48 @@ def delete_document(conn: sqlite3.Connection, doc_id: int) -> bool:
     conn.execute("DELETE FROM reader_documents WHERE id = ?", (doc_id,))
     conn.commit()
     return True
+
+
+TEMPORARY_MAX_AGE = timedelta(hours=24)
+
+
+def purge_temporary_documents(conn: sqlite3.Connection, now: datetime | None = None) -> list[int]:
+    """Delete temporary documents that are read to the end, or a day old.
+
+    Run on startup and before each library listing, so a finished temporary
+    document drops out of the list the next time it is fetched rather than
+    vanishing mid-sentence. A `processing` one is left to its job, and a failed
+    one only goes once it ages out (so its error can still be read).
+    Pasted text and client uploads behind a temporary document are removed
+    too; a path Dave typed is his file and is never touched.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - TEMPORARY_MAX_AGE).isoformat()
+    rows = conn.execute(
+        """SELECT id FROM reader_documents
+           WHERE temporary = 1 AND status != 'processing'
+             AND (created_at < ?
+                  OR (status = 'ready' AND total_sentences > 0
+                      AND progress_sentences >= total_sentences))""",
+        (cutoff,),
+    ).fetchall()
+    owned_dirs = [
+        (Path(settings.reader.directory) / "pasted").resolve(),
+        Path(settings.media_upload_dir).resolve(),
+    ]
+    purged = []
+    for (doc_id,) in rows:
+        doc = get_document(conn, doc_id)
+        if doc and doc.get("source_path"):
+            src = Path(doc["source_path"]).resolve()
+            if any(src.is_relative_to(d) for d in owned_dirs) and src.is_file():
+                try:
+                    src.unlink()
+                except OSError:
+                    pass
+        if delete_document(conn, doc_id):
+            purged.append(doc_id)
+    return purged
 
 
 def fail_stale_processing_documents(

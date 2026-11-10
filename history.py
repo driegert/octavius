@@ -83,6 +83,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             # start NULL and are filled lazily by reader_store.list_documents.
             conn.execute(f"ALTER TABLE reader_documents ADD COLUMN {col} INTEGER")
             log.info("Migration: added reader_documents.%s", col)
+    if "temporary" not in reader_cols:
+        # Temporary documents are purged once read (reader_store.purge_temporary_documents).
+        conn.execute("ALTER TABLE reader_documents ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0")
+        log.info("Migration: added reader_documents.temporary")
     # `conversations.indexed` (2026-08-10 → 2026-09-15) is no longer added or
     # written. It recorded the summariser's index decision for the retired
     # sweeper; the library indexes every conversation with a non-empty summary,

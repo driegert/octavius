@@ -6,6 +6,10 @@
   const docList = $('doc-list');
   const ingestForm = $('ingest-form');
   const ingestInput = $('ingest-input');
+  const ingestFile = $('ingest-file');
+  const ingestBrowse = $('ingest-browse');
+  const ingestBtn = $('ingest-btn');
+  const ingestTemporary = $('ingest-temporary');
   const addMsg = $('add-msg');
   const pasteToggle = $('paste-toggle');
   const pasteBar = $('paste-bar');
@@ -1252,6 +1256,7 @@
       let stateTag = '';
       if (doc.status === 'processing') stateTag = '<span class="doc-state-tag processing">Converting</span><span class="sep"></span>';
       else if (doc.status === 'failed') stateTag = '<span class="doc-state-tag failed">Failed</span><span class="sep"></span>';
+      if (doc.temporary) stateTag += '<span class="doc-state-tag temporary" title="Deleted once read to the end, or after a day">Temporary</span><span class="sep"></span>';
       const source = SOURCE_LABELS[doc.source_type] || doc.source_type || '';
       row.innerHTML = `
         <button type="button" class="doc-open">
@@ -1406,24 +1411,85 @@
     addMsg.dataset.tone = tone || '';
   }
 
+  // A file picked with "+" is uploaded (the browser may not be on this host),
+  // then added by the path the upload returns. Typing in the box drops it.
+  let pickedFile = null;
+
+  function refreshIngestBtn() {
+    ingestBtn.disabled = !(pickedFile || ingestInput.value.trim());
+  }
+
+  function clearPickedFile() {
+    pickedFile = null;
+    ingestFile.value = '';
+    delete ingestInput.dataset.file;
+  }
+
+  refreshIngestBtn(); // a value the browser restored on reload counts
+  ingestBrowse.addEventListener('click', () => ingestFile.click());
+
+  ingestFile.addEventListener('change', () => {
+    const file = ingestFile.files && ingestFile.files[0];
+    if (!file) return;
+    pickedFile = file;
+    ingestInput.value = file.name;
+    ingestInput.dataset.file = '';
+    setAddMsg('');
+    refreshIngestBtn();
+    ingestBtn.focus();
+  });
+
+  ingestInput.addEventListener('input', () => {
+    if (pickedFile) clearPickedFile();
+    refreshIngestBtn();
+  });
+
+  function withTemporary(body) {
+    if (ingestTemporary.checked) body.temporary = true;
+    return body;
+  }
+
+  async function uploadPicked(file) {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const resp = await fetch('/api/media/upload', { method: 'POST', body: form });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.path) throw new Error(data.error || `upload failed (HTTP ${resp.status})`);
+    return data.path;
+  }
+
   ingestForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     const val = ingestInput.value.trim();
-    if (!val) return;
+    if (!pickedFile && !val) return;
 
-    const isUrl = val.startsWith('http://') || val.startsWith('https://');
-    const body = {
-      source: isUrl ? 'url' : 'file',
-      path: isUrl ? undefined : val,
-      url: isUrl ? val : undefined,
-      title: val.split('/').pop() || 'Document',
-    };
-
+    ingestBtn.disabled = true;
     try {
+      let body;
+      if (pickedFile) {
+        setAddMsg(`Uploading ${pickedFile.name}…`);
+        let path;
+        try {
+          path = await uploadPicked(pickedFile);
+        } catch (e) {
+          setAddMsg(`Couldn’t upload that: ${e.message || e}`, 'error');
+          return;
+        }
+        body = { source: 'file', path, title: pickedFile.name.replace(/\.[^.]+$/, '') || pickedFile.name };
+      } else {
+        const isUrl = val.startsWith('http://') || val.startsWith('https://');
+        body = {
+          source: isUrl ? 'url' : 'file',
+          path: isUrl ? undefined : val,
+          url: isUrl ? val : undefined,
+          title: val.split('/').pop() || 'Document',
+        };
+      }
+
       const resp = await fetch('/api/reader/documents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(withTemporary(body)),
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
@@ -1431,11 +1497,14 @@
         return;
       }
       ingestInput.value = '';
+      clearPickedFile();
       setAddMsg('Added. It shows as Converting until it’s ready.');
       loadDocList();
     } catch (e) {
       console.error('Ingest failed:', e);
       setAddMsg('Couldn’t reach the server.', 'error');
+    } finally {
+      refreshIngestBtn();
     }
   });
 
@@ -1472,7 +1541,7 @@
       const resp = await fetch('/api/reader/documents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(withTemporary(body)),
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));

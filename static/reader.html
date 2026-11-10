@@ -42,12 +42,22 @@
     <div class="rail-pane" id="pane-library" role="tabpanel" aria-labelledby="tab-library">
     <section class="add" aria-label="Add a document">
       <form class="add-row" id="ingest-form" autocomplete="off">
-        <input type="text" id="ingest-input" placeholder="Add a file path or URL" aria-label="File path or URL">
-        <button type="submit" class="add-go" id="ingest-btn" aria-label="Add document">
+        <input type="text" id="ingest-input" placeholder="File path or URL" aria-label="File path or URL">
+        <input type="file" id="ingest-file" hidden
+               accept=".pdf,.html,.htm,.xhtml,.txt,.text,.md,.markdown,.qmd,.rmd,.Rmd,.tex,.rst,.org,application/pdf,text/*">
+        <button type="button" class="add-go" id="ingest-browse" title="Choose a file" aria-label="Choose a file">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
         </button>
+        <button type="submit" class="add-go add-ok" id="ingest-btn" title="Add to the library" aria-label="Add to the library" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+        </button>
       </form>
-      <button class="link-btn" id="paste-toggle" aria-expanded="false" aria-controls="paste-bar">Paste text instead</button>
+      <div class="add-opts">
+        <button class="link-btn" id="paste-toggle" aria-expanded="false" aria-controls="paste-bar">Paste text instead</button>
+        <label class="temp-opt" title="Deleted once you have listened to the end, or after a day">
+          <input type="checkbox" id="ingest-temporary"> Temporary
+        </label>
+      </div>
       <div class="paste" id="paste-bar" hidden>
         <textarea id="paste-input" placeholder="Paste or type text to read aloud" aria-label="Text to read"></textarea>
         <input type="text" id="paste-title" placeholder="Title (optional)" aria-label="Title">

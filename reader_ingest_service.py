@@ -28,7 +28,21 @@ class ReaderIngestError(Exception):
 
 
 async def start_reader_ingest(db_path: str | Path, mcp_manager: "MCPManager", body: dict) -> dict:
-    db_path = Path(db_path)
+    """Start an ingest. `temporary: true` (strict) marks the document for
+    `purge_temporary_documents`: gone once read to the end, or after a day."""
+    temporary = body.get("temporary")
+    if temporary is not None and not isinstance(temporary, bool):
+        # Strict, as with "finished": bool("false") is True.
+        raise ReaderIngestError("temporary must be true or false")
+    result = await _start_reader_ingest(Path(db_path), mcp_manager, body)
+    if temporary:
+        with connect_db(Path(db_path)) as conn:
+            update_document(conn, result["id"], temporary=1)
+        result["temporary"] = True
+    return result
+
+
+async def _start_reader_ingest(db_path: Path, mcp_manager: "MCPManager", body: dict) -> dict:
     source = body.get("source", "file")
     title = body.get("title", "Untitled")
     path = body.get("path")

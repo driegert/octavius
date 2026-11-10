@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -322,6 +323,104 @@ class MarkFinishedTests(unittest.TestCase):
             db_path, _ = _db_with_doc(tmp, status="processing")
             self.assertEqual(self._post(db_path, {"finished": True}, doc_id=9).status_code, 404)
             self.assertEqual(self._post(db_path, {"finished": True}).status_code, 409)
+
+
+class TemporaryDocumentTests(unittest.TestCase):
+    """`temporary: true` documents are purged once read, or a day after adding."""
+
+    def _conn(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(READER_DOCUMENTS_DDL)
+        return conn
+
+    def _add(self, conn, *, temporary=1, created="2026-11-10T12:00:00+00:00", status="ready",
+             total=5, progress=0, source_path="https://x/a"):
+        cur = conn.execute(
+            """INSERT INTO reader_documents (title, source_type, source_path, status, temporary,
+                   total_sentences, progress_sentences, created_at)
+               VALUES ('T', 'markdown', ?, ?, ?, ?, ?, ?)""",
+            (source_path, status, temporary, total, progress, created))
+        conn.commit()
+        return cur.lastrowid
+
+    def _purge(self, conn, tmp):
+        from datetime import datetime, timezone
+        fake = SimpleNamespace(reader=SimpleNamespace(directory=tmp), media_upload_dir=str(Path(tmp) / "up"))
+        with patch.object(reader_store, "settings", fake):
+            return reader_store.purge_temporary_documents(
+                conn, now=datetime(2026, 11, 10, 18, tzinfo=timezone.utc))
+
+    def test_purges_finished_and_aged_but_not_unread_kept_or_processing(self):
+        conn = self._conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            finished = self._add(conn, progress=5)
+            unread = self._add(conn, progress=2)
+            aged = self._add(conn, created="2026-11-09T12:00:00+00:00")
+            kept = self._add(conn, temporary=0, progress=5, created="2026-01-01T00:00:00+00:00")
+            busy = self._add(conn, status="processing", total=None, progress=None,
+                             created="2026-11-09T12:00:00+00:00")
+            failed_new = self._add(conn, status="failed", total=None, progress=None)
+            self.assertEqual(sorted(self._purge(conn, tmp)), sorted([finished, aged]))
+        left = {r[0] for r in conn.execute("SELECT id FROM reader_documents")}
+        self.assertEqual(left, {unread, kept, busy, failed_new})
+
+    def test_removes_pasted_and_uploaded_sources_but_never_a_typed_path(self):
+        conn = self._conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "pasted").mkdir()
+            (Path(tmp) / "up").mkdir()
+            pasted = Path(tmp) / "pasted" / "1-x.md"
+            upload = Path(tmp) / "up" / "abc-x.txt"
+            mine = Path(tmp) / "mine.md"
+            for p in (pasted, upload, mine):
+                p.write_text("hi")
+                self._add(conn, progress=5, source_path=str(p))
+            self.assertEqual(len(self._purge(conn, tmp)), 3)
+            self.assertFalse(pasted.exists())
+            self.assertFalse(upload.exists())
+            self.assertTrue(mine.exists())
+
+    def test_migration_adds_temporary(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, last_extracted_message_id INTEGER)")
+        conn.execute(READER_DOCUMENTS_DDL.replace("    temporary INTEGER NOT NULL DEFAULT 0,\n", ""))
+        history._run_migrations(conn)
+        history._run_migrations(conn)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(reader_documents)")}
+        self.assertIn("temporary", cols)
+
+    def test_ingest_route_marks_temporary_strictly_and_list_reports_it(self):
+        import reader_ingest_service
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "r.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(READER_DOCUMENTS_DDL)
+            conn.close()
+            src = Path(tmp) / "a.txt"
+            src.write_text("Hello there.")
+            app = FastAPI()
+            app.include_router(reader_api.router)
+            app.state.db_path = db_path
+            app.state.mcp_manager = None
+
+            async def _no_task(*a, **k):
+                return None
+
+            with patch("reader_ingest_handlers.ingest_document_task", _no_task), TestClient(app) as client:
+                bad = client.post("/api/reader/documents",
+                                  json={"source": "file", "path": str(src), "temporary": "false"})
+                self.assertEqual(bad.status_code, 400)
+                ok = client.post("/api/reader/documents",
+                                 json={"source": "file", "path": str(src), "title": "a", "temporary": True})
+                self.assertEqual(ok.status_code, 200, ok.text)
+                plain = client.post("/api/reader/documents",
+                                    json={"source": "file", "path": str(src), "title": "b"})
+                docs = {d["id"]: d for d in client.get("/api/reader/documents").json()["documents"]}
+            self.assertTrue(docs[ok.json()["id"]]["temporary"])
+            self.assertFalse(docs[plain.json()["id"]]["temporary"])
+            self.assertEqual(len(docs), 2)  # the rejected request created nothing
+            del reader_ingest_service
+
 
 if __name__ == "__main__":
     unittest.main()

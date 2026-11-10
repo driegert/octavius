@@ -18,7 +18,7 @@ from routes.inbox import router as inbox_router
 from routes.media import router as media_router
 from routes.reader_api import router as reader_router
 from routes.vault import router as vault_router
-from reader_store import fail_stale_processing_documents
+from reader_store import fail_stale_processing_documents, purge_temporary_documents
 from service_clients import embedding_client, llm_client
 from subagent_dispatcher import SubagentDispatcher
 import tools as local_tools
@@ -37,6 +37,10 @@ async def lifespan(app: FastAPI):
     db_path = app.state.db_path
     history = HistoryRecorder(db_path)
     stale_count = fail_stale_processing_documents(history_conn)
+    try:
+        purge_temporary_documents(history_conn)
+    except Exception:  # a sweep must never stop startup; the next listing retries it
+        log.warning("Could not purge temporary reader documents on startup", exc_info=True)
     app.state.mcp_manager = mcp_manager
     app.state.history = history
     app.state.db_path = db_path
