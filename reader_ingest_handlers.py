@@ -62,8 +62,70 @@ _PROMO_PARAGRAPH = re.compile(
 _PROMO_MAX_CHARS = 300
 
 
+# A list of links to other stories, recognised by its heading ("READ MORE",
+# "Related stories", "Top stories"). Pruned only when most of its text is link text.
+_LINK_LIST_HEADING = re.compile(
+    r'^(?:read more|related(?: articles| stories| content| reading)?|more (?:stories|on this|from .{1,40})'
+    r'|recommended(?: for you| reading)?|you (?:may|might) also like|top stories|most (?:read|popular)'
+    r'|popular(?: now| stories)?|trending(?: now)?)$',
+    re.IGNORECASE,
+)
+_LINK_LIST_MIN_LINK_SHARE = 0.6
+# The Register (2026-11-10) wraps each of a dozen teaser cards in its own <article>,
+# and trafilatura chose the "Top stories" cards over the story. When one <article>
+# dominates by this much, extraction is confined to it.
+_MAIN_ARTICLE_MIN_CHARS = 1500
+_MAIN_ARTICLE_DOMINANCE = 3
+
+
+def _text_len(el) -> int:
+    return len(" ".join(el.text_content().split()))
+
+
+def _prune_link_lists(tree) -> None:
+    for heading in list(tree.iter("h2", "h3", "h4", "h5")):
+        if not _LINK_LIST_HEADING.match(" ".join(heading.text_content().split()).rstrip(":")):
+            continue
+        box = heading.getparent()
+        if box is None or box.tag in _FURNITURE_KEEP_TAGS or box.getparent() is None:
+            continue
+        if box.xpath('.//h1|.//article'):
+            continue
+        rest = _text_len(box) - _text_len(heading)
+        links = sum(_text_len(a) for a in box.iter("a"))
+        if rest <= 0 or links >= _LINK_LIST_MIN_LINK_SHARE * rest:
+            box.getparent().remove(box)
+
+
+def _scope_to_main_article(tree):
+    """`tree` cut down to its one dominant <article>, nested ones removed; else `tree`."""
+    import copy
+
+    import lxml.html
+
+    articles = list(tree.iter("article"))
+    if len(articles) < 2:
+        return tree
+    sized = sorted(((_text_len(a), a) for a in articles), key=lambda x: x[0], reverse=True)
+    top_len, top = sized[0]
+    nested = set(top.iterancestors()) | set(top.iterdescendants())
+    rivals = [n for n, a in sized[1:] if a not in nested]
+    if top_len < _MAIN_ARTICLE_MIN_CHARS or (rivals and top_len < _MAIN_ARTICLE_DOMINANCE * rivals[0]):
+        return tree
+    main = copy.deepcopy(top)
+    for inner in list(main.iterdescendants("article")):
+        inner.getparent().remove(inner)
+    page = lxml.html.fromstring("<html><head></head><body></body></html>")
+    head = tree.find("head")
+    if head is not None:
+        page.replace(page.find("head"), copy.deepcopy(head))
+    page.find("body").append(main)
+    return page
+
+
 def _prune_page_furniture(raw: str):
-    """The page as an lxml tree without comment and newsletter widgets, or `raw` unparsed."""
+    """The page as an lxml tree without comment/newsletter widgets and story-link lists,
+    confined to its dominant <article> when it has one, or `raw` unparsed."""
     try:
         import lxml.html
 
@@ -78,7 +140,8 @@ def _prune_page_furniture(raw: str):
             continue
         if _FURNITURE_ATTR.search(f'{el.get("class", "")} {el.get("id", "")}') and not el.xpath('.//article|.//h1'):
             parent.remove(el)
-    return tree
+    _prune_link_lists(tree)
+    return _scope_to_main_article(tree)
 
 
 def _repair_markdown_tables(text: str) -> str:

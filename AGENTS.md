@@ -781,7 +781,10 @@ Still live:
   single newlines, so a whole article became one chunk). `reader_ingest_handlers.extract_article_text` first prunes
   elements whose class/id has a `comment(s)` or `newsletter` token (trafilatura's `include_comments=False` missed
   Tom's Hardware's XenForo widget), rejoins tables trafilatura 2.0 writes one cell per line, and drops short
-  "Follow us on Google News"/newsletter paragraphs. Comments are dropped, never read.
+  "Follow us on Google News"/newsletter paragraphs. Comments are dropped, never read. It also prunes link lists under a "Read more"/"Related"/"Top stories" heading
+  (mostly link text), and when one `<article>` dominates the page (1500+ chars, 3x any other) extracts from it
+  alone, nested `<article>`s removed: The Register wraps a dozen teaser cards in `<article>` and trafilatura read
+  only "Top stories" (2026-11-10).
 - Inline `$...$` counts as math only under Pandoc's rule (as `static/math-render.js`): no space inside either dollar,
   no digit after the closing one. "$2,400 ... $900" used to send a whole article through the math LLM and then
   `strip_latex`, which deleted every `$`.

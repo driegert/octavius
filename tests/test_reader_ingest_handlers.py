@@ -63,6 +63,44 @@ class ReaderIngestHandlerTests(unittest.TestCase):
         )
         self.assertEqual(len(tree.xpath("//article")), 1)
 
+    def test_extract_article_text_prefers_the_dominant_article_over_teaser_cards(self):
+        # The Register, 2026-11-10: a dozen teaser <article> cards beside the story,
+        # and a "READ MORE" link list inside it; trafilatura read only "Top stories".
+        def card(i):
+            return (f'<article class="column"><a href="/s{i}"><h4>Teaser headline number {i} about chips</h4></a>'
+                    f'<p>Standfirst for teaser {i}, a line or two of bait.</p></article>')
+        para = "Researchers had one model rewrite another model's weights directly, without training. " * 12
+        html = f"""<html><head><title>Story</title></head><body><main>
+        <section class="top"><h3>TOP STORIES</h3>{''.join(card(i) for i in range(8))}</section>
+        <article><h1>Forget retraining</h1><div class="bodytext">
+        <div class="toplist"><div class="content"><h3>READ MORE</h3><ul>
+        <li><a href="/x"><h4>Stanford study admits it is out of date</h4></a></li>
+        <li><a href="/y"><h4>Agents reveal secrets to each other</h4></a></li></ul></div></div>
+        <p>{para}</p><p>{para.replace("Researchers", "The authors")}</p>
+        <article class="inline-promo"><a href="/z">Nested promo card</a></article></div></article>
+        <section class="related">{''.join(card(i) for i in range(8, 12))}</section></main></body></html>"""
+        text = handlers.extract_article_text(html, _ReaderIngestError)
+        self.assertIn("rewrite another model's weights", text)
+        self.assertIn("The authors had one model", text)
+        for gone in ("TOP STORIES", "Teaser headline", "READ MORE", "Stanford study", "Nested promo"):
+            self.assertNotIn(gone, text)
+
+    def test_scope_leaves_pages_without_a_dominant_article_alone(self):
+        import lxml.html
+        body = "Words of a perfectly ordinary paragraph. " * 60
+        two = lxml.html.fromstring(f"<html><body><article><p>{body}</p></article><article><p>{body}</p></article></body></html>")
+        self.assertIs(handlers._scope_to_main_article(two), two)
+        short = lxml.html.fromstring("<html><body><article><p>Short.</p></article><article><p>x</p></article></body></html>")
+        self.assertIs(handlers._scope_to_main_article(short), short)
+
+    def test_link_list_heading_over_prose_is_kept(self):
+        tree = handlers._prune_page_furniture(
+            '<html><body><article><h1>T</h1><div><h3>Related reading</h3>'
+            '<p>This section explains, at length and in plain prose, which earlier work matters and why.</p>'
+            '<a href="/a">one</a></div></article></body></html>'
+        )
+        self.assertIn("earlier work matters", tree.text_content())
+
     def test_repair_markdown_tables_rejoins_one_cell_per_line(self):
         broken = "See the table.\n\nPrompt length |\nWait |\n|---|---|\n1K tokens |\n1.2 seconds |\n32K tokens |\n17.2 seconds |\n\nAfter."
         fixed = handlers._repair_markdown_tables(broken)
