@@ -325,27 +325,50 @@ class WebSocketSessionHandler:
         await self.send_payload({"type": "pong"})
 
     async def handle_restore_session(self, data: dict):
+        """A client reconnected: carry on the conversation it was in.
+
+        The connect-time record is retired and the old one becomes this connection's
+        record, so new turns append to it and the id the client holds never changes
+        (it used to get a new id per reconnect, and a second reconnect then restored
+        a record holding only the turns since the first). An id with no messages gets
+        no reply, as before; a record that is not a voice one (see
+        `HistoryRecorder.resume_conversation`) is only loaded into memory.
+        """
         from history import get_conversation_messages
         old_conv_id = data.get("conversation_id")
         if not old_conv_id:
             return
+        if old_conv_id == self.state.history_session.conv_id:
+            await self.send_payload({"type": "session_id", "conversation_id": old_conv_id})
+            return
         with self.state.history.connect() as conn:
             msgs = get_conversation_messages(conn, old_conv_id)
-        if msgs:
-            self.state.conversation.load_from_history(msgs)
-            log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
-            pi_brain = getattr(self.ws.app.state, "pi_brain", None)
-            if pi_brain is not None:
-                pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
-                self._apply_chat_model()
-                # A live re-attached process has history the slot may have lost.
-                self._request_pi_warm("restore_session")
-            await self.send_payload(
-                {
-                    "type": "session_id",
-                    "conversation_id": self.state.history_session.conv_id,
-                }
-            )
+        if not msgs:
+            return
+        await self._abandon_turn()
+        resumed = self.state.history.resume_conversation(old_conv_id)
+        if resumed is not None:
+            await self.state.history_session.end_async()  # retire the connect-time record
+            self.state.history_session = resumed
+        self.state.conversation.load_from_history(msgs)
+        log.info(
+            "Restored conversation %d on reconnect (%d messages, %s)",
+            old_conv_id, len(msgs),
+            "continuing it" if resumed is not None else "into a new record",
+        )
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is not None:
+            # A no-op when the record was resumed (same id); it still matters when not.
+            pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
+            self._apply_chat_model()
+            # A live re-attached process has history the slot may have lost.
+            self._request_pi_warm("restore_session")
+        await self.send_payload(
+            {
+                "type": "session_id",
+                "conversation_id": self.state.history_session.conv_id,
+            }
+        )
 
     async def handle_attach_session(self, data: dict):
         """Bind this connection to a durable conversation by client key.
@@ -508,9 +531,9 @@ class WebSocketSessionHandler:
     def _apply_chat_model(self) -> None:
         """Point the current agent conversation's pi turns at Dave's chosen model.
 
-        `prefer` is keyed by conversation id, and the id changes on reset, load, restore
-        and delegation pulls, so this runs after each of those and again before every pi
-        turn. A Reader chat keeps its own choice (doc_chat_model); a client that never
+        `prefer` is keyed by conversation id, and the id changes on reset, load and
+        delegation pulls (and on a restore that could not resume the record), so this
+        runs after each of those and again before every pi turn. A Reader chat keeps its own choice (doc_chat_model); a client that never
         sent `chat_model` is left alone.
         """
         if self.state.chat_model is None or self.state.doc_chat_id is not None:
@@ -564,13 +587,22 @@ class WebSocketSessionHandler:
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
+        # An in-flight reply belongs to the conversation being left, not the loaded one.
+        await self._abandon_turn()
         self.state.doc_chat_id = None
         await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.load_from_history(msgs)
-        self.state.history_session = self.state.history.start_conversation(
-            source="voice",
-            model=settings.llm_chain[0]["model"],
+        # A voice conversation is continued in place: new turns append to it, so a
+        # later restore_session of this id reads them. Anything else (a Matrix
+        # thread, a Reader or item chat, another service's record) is only read:
+        # new turns go to a new record, as they always did.
+        self.state.history_session = (
+            self.state.history.resume_conversation(conv_id)
+            or self.state.history.start_conversation(
+                source="voice",
+                model=settings.llm_chain[0]["model"],
+            )
         )
         self._apply_chat_model()  # before the warm, so it warms the chosen model
         # The loaded thread runs on a new process; start it now and warm the template.
@@ -592,6 +624,14 @@ class WebSocketSessionHandler:
                 "type": "conversation_loaded",
                 "conversation_id": conv_id,
                 "messages": history_pairs,
+            }
+        )
+        # The id new turns are recorded under, which is what a client must restore after
+        # a reconnect. Clients persist whatever session_id says.
+        await self.send_payload(
+            {
+                "type": "session_id",
+                "conversation_id": self.state.history_session.conv_id,
             }
         )
         log.info("Loaded conversation %d (%d messages)", conv_id, len(msgs))

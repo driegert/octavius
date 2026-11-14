@@ -54,6 +54,14 @@ class _FakeHistory:
     def __init__(self):
         self.started = []
         self.sessions = []
+        self.resumable = set()  # conversation ids resume_conversation will reopen
+        self.resumed = []
+
+    def resume_conversation(self, conv_id):
+        if conv_id not in self.resumable:
+            return None
+        self.resumed.append(conv_id)
+        return _FakeHistorySession(conv_id=conv_id)
 
     def start_conversation(self, **kwargs):
         self.started.append(kwargs)
@@ -162,6 +170,97 @@ class WebSocketSessionTests(unittest.TestCase):
                 handler.state.history.started[-1],
                 {"source": "voice", "model": settings.llm_chain[0]["model"]},
             )
+
+        asyncio.run(run())
+
+    def test_load_conversation_continues_a_voice_record_and_reports_its_id(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+            old_session = _FakeHistorySession(conv_id=1)
+            handler.state.history_session = old_session
+            handler.state.history.resumable.add(42)
+
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hello"}]):
+                await handler.handle_load_conversation({"conversation_id": 42})
+
+            self.assertTrue(old_session.ended)
+            self.assertEqual(handler.state.history_session.conv_id, 42)
+            self.assertEqual(handler.state.history.started, [])
+            frames = [json.loads(t) for t in ws.sent]
+            kinds = [f["type"] for f in frames]
+            self.assertLess(kinds.index("conversation_loaded"), kinds.index("session_id"))
+            self.assertEqual(frames[kinds.index("session_id")]["conversation_id"], 42)
+
+        asyncio.run(run())
+
+    def test_load_conversation_of_a_non_voice_record_reports_the_new_record(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+            handler.state.history_session = _FakeHistorySession(conv_id=1)
+
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hello"}]):
+                await handler.handle_load_conversation({"conversation_id": 42})
+
+            new_id = handler.state.history_session.conv_id
+            self.assertNotIn(new_id, (1, 42))
+            frames = {json.loads(t)["type"]: json.loads(t) for t in ws.sent}
+            self.assertEqual(frames["conversation_loaded"]["conversation_id"], 42)
+            self.assertEqual(frames["session_id"]["conversation_id"], new_id)
+
+        asyncio.run(run())
+
+    def test_load_conversation_stops_an_in_flight_turn_first(self):
+        async def run():
+            handler = WebSocketSessionHandler(_FakeWS())
+            handler.state.history_session = _FakeHistorySession(conv_id=1)
+            handler.state.turn_task = asyncio.create_task(asyncio.sleep(10))
+
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hello"}]):
+                await handler.handle_load_conversation({"conversation_id": 42})
+
+            self.assertTrue(handler.state.turn_task.cancelled())
+
+        asyncio.run(run())
+
+    def test_restore_session_continues_the_old_record_under_the_same_id(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+            connect_time = _FakeHistorySession(conv_id=9)
+            handler.state.history_session = connect_time
+            handler.state.history.resumable.add(3)
+
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hi"},
+                                     {"role": "assistant", "content": "hello"}]):
+                await handler.handle_restore_session({"conversation_id": 3})
+
+            self.assertTrue(connect_time.ended)
+            self.assertEqual(handler.state.history_session.conv_id, 3)
+            self.assertEqual(json.loads(ws.sent[-1]), {"type": "session_id", "conversation_id": 3})
+            self.assertEqual(len(handler.state.conversation.get_messages()), 3)
+
+        asyncio.run(run())
+
+    def test_restore_session_of_an_unknown_id_keeps_the_connect_record_and_is_silent(self):
+        async def run():
+            ws = _FakeWS()
+            handler = WebSocketSessionHandler(ws)
+            connect_time = _FakeHistorySession(conv_id=9)
+            handler.state.history_session = connect_time
+            handler.state.history.resumable.add(3)
+
+            with patch("history.get_conversation_messages", return_value=[]):
+                await handler.handle_restore_session({"conversation_id": 3})
+
+            self.assertFalse(connect_time.ended)
+            self.assertIs(handler.state.history_session, connect_time)
+            self.assertEqual(ws.sent, [])
 
         asyncio.run(run())
 
@@ -1519,6 +1618,18 @@ class PiBrainWiringTests(unittest.TestCase):
                        return_value=[{"role": "user", "content": "hi"}]):
                 await handler.handle_restore_session({"conversation_id": 3})
             self.assertEqual(brain.rekeyed, [(3, 5)])
+
+        asyncio.run(run())
+
+    def test_restore_of_a_resumed_record_keeps_its_pi_process_key(self):
+        async def run():
+            handler, brain = self._handler()
+            handler.state.history.resumable.add(3)
+            with patch("history.get_conversation_messages",
+                       return_value=[{"role": "user", "content": "hi"}]):
+                await handler.handle_restore_session({"conversation_id": 3})
+            self.assertEqual(brain.rekeyed, [(3, 3)])
+            self.assertEqual(brain.discarded, [])
 
         asyncio.run(run())
 

@@ -523,6 +523,7 @@ so it never depends on display names. Upstream renames: mcp-tools `RENAMES-2026-
 
 - Each WebSocket connection gets its own `Conversation` instance.
 - Conversation IDs are persisted in browser `localStorage` and restored with `restore_session`.
+- **A reconnect continues the same record** (since 2026-11-13). `restore_session` retires the empty connect-time record and resumes the old conversation (`HistoryRecorder.resume_conversation`), so new turns append to it and `session_id` returns the id the client sent. Before, each reconnect started a new record, and a second reconnect restored one holding only the turns since the first. `load_conversation` does the same for a voice conversation and now follows `conversation_loaded` with a `session_id` naming the record new turns go to. Only `service='octavius'`, `source='voice'` records are resumed: a loaded Matrix thread, Reader chat or item chat is read into memory and new turns go to a new record. An id with no messages still gets no reply. Ending a resumed record with no new turn rewrites nothing; with new turns, the summary covers its last 40 earlier messages plus the new ones. Two connections may hold the same id (phone and PWA); each sees the other's turns only after its next restore.
 - The WebSocket carries both binary audio and JSON messages.
 - The agent buffers sentences during tool-call rounds and only emits final spoken text when tool use is complete.
 - Tool-call rounds are capped and nudged to stop around rounds 5-6 of 7.
