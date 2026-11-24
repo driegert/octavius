@@ -82,5 +82,5 @@ before parsing starts, as the only pre-receipt bound. See `routes/media.py` /
 `path`/`size_bytes` on faith, though: `path` must resolve under the
 `OCTAVIUS_MEDIA_SPOOL_DIRS` allowlist (`media_uploads.resolve_spooled_media`),
 and `handle_image_input` re-checks the actual file size against
-`IMAGE_MAX_BYTES` — see AGENTS.md's "Media turns" section for the details and
+`IMAGE_MAX_BYTES` — see `docs/runbooks/media-turns.md` for the details and
 the accompanying `audio_done`-on-rejection rule.

@@ -44,8 +44,8 @@ def classify_chain_error(exc: Exception) -> tuple[str, int | None]:
 
       auth          401/403 — our key is missing, stale, or not accepted here
       client_error  other 4xx — most often a model alias absent from this
-                    endpoint's catalog, which hard-400s (see CLAUDE.md
-                    "Router model ids")
+                    endpoint's catalog, which hard-400s (see docs/runbooks/model-routing.md
+                    "Endpoint catalogs")
       server_error  5xx — endpoint reachable but failing
       connect       TCP refused/unreachable — endpoint is down
       connect_timeout  no TCP handshake within the connect budget — host is

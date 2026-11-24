@@ -75,7 +75,7 @@ frame fields cross-checked against octavius's parser.
 Also fixed in passing: `tests/test_websocket_session.py`'s
 `test_poll_failure_still_runs_a_turn_reporting_the_error` never executed its
 coroutine (missing `asyncio.run`), and its neighbour ran twice. Docs updated:
-`CLAUDE.md` (vision + PDF bullets), `docs/ws-media-contract.md` impl notes.
+`CLAUDE.md` (vision + PDF bullets; now `docs/runbooks/media-turns.md`), `docs/ws-media-contract.md` impl notes.
 
 ## Deployment checklist (Dave, mostly root)
 

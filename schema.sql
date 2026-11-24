@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS reader_documents (
     last_sentence     INTEGER NOT NULL DEFAULT 0,
     total_sentences   INTEGER,                 -- NULL until known; blanks included, as in the speech JSON
     progress_sentences INTEGER,                -- sentences before the saved place; = total when read to the end
+    temporary         INTEGER NOT NULL DEFAULT 0, -- 1: purged once read to the end, or after a day
     created_at        TEXT    NOT NULL,
     updated_at        TEXT
 );

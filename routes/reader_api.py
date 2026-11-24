@@ -3,7 +3,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from db import connect_db
 from reader_store import (
-    delete_document, get_document, list_documents, load_speech_data, sentences_before, set_finished,
+    delete_document, get_document, list_documents, load_speech_data, purge_temporary_documents,
+    sentences_before, set_finished,
 )
 from reader_ingest_service import (
     ReaderIngestError,
@@ -35,6 +36,7 @@ async def reader_ingest(request: Request):
 @router.get("/api/reader/documents")
 async def reader_list(request: Request):
     with connect_db(request.app.state.db_path) as conn:
+        purge_temporary_documents(conn)
         docs = list_documents(conn)
     return JSONResponse({"documents": docs})
 

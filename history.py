@@ -83,6 +83,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             # start NULL and are filled lazily by reader_store.list_documents.
             conn.execute(f"ALTER TABLE reader_documents ADD COLUMN {col} INTEGER")
             log.info("Migration: added reader_documents.%s", col)
+    if "temporary" not in reader_cols:
+        # Temporary documents are purged once read (reader_store.purge_temporary_documents).
+        conn.execute("ALTER TABLE reader_documents ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0")
+        log.info("Migration: added reader_documents.temporary")
     # `conversations.indexed` (2026-08-10 → 2026-09-15) is no longer added or
     # written. It recorded the summariser's index decision for the retired
     # sweeper; the library indexes every conversation with a non-empty summary,
@@ -90,6 +94,11 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
 
 
 # -- Core recording API --------------------------------------------------------
+
+# A resumed conversation is re-summarised from its last this-many messages plus the
+# new ones (the live context keeps 40 too), so a long thread stays one small request.
+RESUME_SUMMARY_MESSAGES = 40
+
 
 class HistoryRecorder:
     """Records conversation turns to the history database.
@@ -168,6 +177,44 @@ class HistoryRecorder:
         log.info("Resumed %s conversation %s (session %s)", service, conv_id, key[:16])
         return ConversationSession(conn, conv_id, key, self.db_path)
 
+    def resume_conversation(self, conv_id, service: str = "octavius",
+                            source: str = "voice") -> "ConversationSession | None":
+        """Reopen an existing conversation by id so new turns append to it.
+
+        This is what a reconnect (`restore_session`) or loading a past chat uses, so
+        the id a client holds keeps naming the whole conversation. Returns None when
+        the id is unknown or the record is not a `service`/`source` one: a Matrix
+        thread, a Reader chat or another service's record is never appended to from
+        here. The row is not touched until a new message arrives, so a reconnect
+        with no new turn leaves its `ended_at`, summary and tags as they were.
+        """
+        if isinstance(conv_id, bool) or not isinstance(conv_id, int):
+            return None
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT session_id, COALESCE(total_duration_ms, 0) FROM conversations "
+            "WHERE id = ? AND service = ? AND source = ?",
+            (conv_id, service, source),
+        ).fetchone()
+        if row is None:
+            conn.close()
+            return None
+        session = ConversationSession(conn, conv_id, row[0], self.db_path)
+        prior = conn.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? "
+            "AND role IN ('user', 'assistant') ORDER BY created_at, id",
+            (conv_id,),
+        ).fetchall()
+        # The summary written at the next end covers the conversation, not only the
+        # turns since this resume.
+        session._messages_for_summary = [
+            {"role": r, "content": c} for r, c in prior[-RESUME_SUMMARY_MESSAGES:]
+        ]
+        session._resumed_message_count = len(session._messages_for_summary)
+        session._prior_duration_ms = row[1]
+        log.info("Resumed %s conversation %s by id", service, conv_id)
+        return session
+
 
 class ConversationSession:
     """Tracks a single conversation's messages and metadata."""
@@ -179,7 +226,18 @@ class ConversationSession:
         self.db_path = Path(db_path)
         self._start_time = time.monotonic()
         self._messages_for_summary: list[dict] = []
+        # Set by HistoryRecorder.resume_conversation: how many of the messages above
+        # were already in the record, and the time it had already run.
+        self._resumed_message_count: int | None = None
+        self._prior_duration_ms = 0
         self._closed = False
+
+    def _resumed_untouched(self) -> bool:
+        """Resumed by id and nothing was added: ending it must not rewrite anything."""
+        return (
+            self._resumed_message_count is not None
+            and len(self._messages_for_summary) == self._resumed_message_count
+        )
 
     def connect(self) -> sqlite3.Connection:
         return _connect(self.db_path)
@@ -388,6 +446,10 @@ class ConversationSession:
         """Finalize the conversation: set ended_at, generate summary and tags."""
         if self._closed:
             return
+        if self._resumed_untouched():
+            self.conn.close()
+            self._closed = True
+            return
         self._finalize_conversation_row()
 
         # Generate summary
@@ -418,6 +480,10 @@ class ConversationSession:
         """Finalize the conversation without blocking the event loop on remote calls."""
         if self._closed:
             return
+        if self._resumed_untouched():
+            self.conn.close()
+            self._closed = True
+            return
         self._finalize_conversation_row()
 
         result = await generate_summary_async(self._messages_for_summary)
@@ -445,7 +511,7 @@ class ConversationSession:
     def _finalize_conversation_row(self):
         if self._closed:
             return
-        elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
+        elapsed_ms = self._prior_duration_ms + int((time.monotonic() - self._start_time) * 1000)
         now = _now()
 
         self.conn.execute(

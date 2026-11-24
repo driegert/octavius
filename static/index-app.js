@@ -49,14 +49,7 @@
   let reconnectDelay = 1000;
 
   // Streaming STT state
-  let sttAudioCtx = null;
-  let sttStream = null;
-  let sttProcessor = null;
-  let sttChunks = [];
-  let sttSendTimer = null;
-  let sttStreaming = false;
-  let micStarting = false;   // getUserMedia in flight
-  let releaseWhileStarting = false; // hold released before the mic opened
+  let releaseWhileStarting = false; // stop asked for before the mic opened
   let micLevel = 0;
 
   // Turn state, driven by server `status` frames
@@ -64,6 +57,33 @@
   let acceptPartials = false; // true from stt_start until that capture's transcript
   let dropAudio = false; // after barge-in, ignore stale audio until the next transcript
   let nextClipIsMath = false; // speech_clip: the next audio frame is a formula
+
+  // The capture owns getUserMedia, the audio graph and the 250 ms PCM flush (voice-capture.js).
+  // Declared up here, before anything that reads isCapturing(), so no call can hit it uninitialised.
+  // A stop while the mic is still opening is remembered here (releaseWhileStarting, sent once it
+  // opens); a cancel goes to capture.cancel(), which releases the mic and sends nothing.
+  let stopSent = false;
+  const capture = OctaviusVoiceCapture.createCapture({
+    send(frame) {
+      if (frame instanceof Uint8Array) {
+        if (ws && ws.readyState === WebSocket.OPEN) { ws.send(frame); return true; }
+        return false;
+      }
+      if (frame.type === 'stt_start') acceptPartials = true;
+      const ok = send(frame);
+      if (frame.type === 'stt_stop') stopSent = ok;
+      return ok;
+    },
+    onLevel(level) { micLevel = level; },
+    onError() {
+      singleTurn = false;
+      if (continuousActive) continuousActive = false;
+      setStatus('Microphone access denied. Allow it in the browser to talk.');
+      refreshUi();
+    },
+  });
+  const isCapturing = () => capture.isStreaming();
+  const isMicStarting = () => capture.isStarting();
 
   let currentVoice = null; // from prefs at boot, else the server's agent default
   let chatModel = null; // agent model menu id Dave picked; null: never picked (server default)
@@ -155,7 +175,7 @@
     },
     onPlaybackIdle() {
       stopBtn.hidden = true;
-      if (sttStreaming || micStarting) return; // barge-in already moved on
+      if (isCapturing() || isMicStarting()) return; // barge-in already moved on
       phase = 'idle';
       if (continuousActive && sttEnabled && connected) {
         startRecording();
@@ -177,7 +197,7 @@
   // ---------- Status + orb ----------
 
   function toneFor(text) {
-    if (sttStreaming) return 'listening';
+    if (isCapturing()) return 'listening';
     if (/error|failed|denied|couldn't/i.test(text)) return 'error';
     if (phase === 'speaking') return 'speaking';
     if (phase !== 'idle') return 'busy';
@@ -191,7 +211,7 @@
 
   function orbState() {
     if (!connected) return 'offline';
-    if (sttStreaming) return 'listening';
+    if (isCapturing()) return 'listening';
     if (phase === 'transcribing') return 'transcribing';
     if (phase === 'thinking') return 'thinking';
     if (phase === 'speaking') return 'speaking';
@@ -203,7 +223,7 @@
     if (talkMode === 'continuous') {
       return continuousActive ? 'End hands-free conversation' : 'Start hands-free conversation';
     }
-    if (talkMode === 'toggle') return sttStreaming ? 'Stop talking' : 'Tap to talk';
+    if (talkMode === 'toggle') return isCapturing() ? 'Stop talking' : 'Tap to talk';
     return 'Hold to talk';
   }
 
@@ -214,7 +234,7 @@
   function hintText() {
     if (!connected) return '';
     if (!sttEnabled) return 'Microphone is off. Write below.';
-    if (sttStreaming) {
+    if (isCapturing()) {
       if (singleTurn) return `A pause sends it. Press ${coarse ? 'One turn' : 'T'} to send now.`;
       if (talkMode === 'hold') return 'Release to send';
       if (talkMode === 'toggle') return coarse ? 'Tap the orb again to send' : 'Press Space or the orb again to send';
@@ -586,14 +606,14 @@
       phase = 'idle';
       dropLiveUser();
       // No audio_done follows an empty transcription, so re-arm here.
-      if (continuousActive && sttEnabled) setTimeout(() => { if (continuousActive && !sttStreaming) startRecording(); }, 400);
+      if (continuousActive && sttEnabled) setTimeout(() => { if (continuousActive && !isCapturing()) startRecording(); }, 400);
     } else if (/^(Agent error|Transcription failed)/.test(text)) {
       addNote(text, true);
     } else if (phase === 'thinking' || phase === 'transcribing') {
       // Tool progress ("Searching the web…") while a turn runs.
     }
 
-    if (!sttStreaming) setStatus(text);
+    if (!isCapturing()) setStatus(text);
     refreshUi();
   }
 
@@ -694,7 +714,7 @@
             convTitle.textContent = (known && known.summary) || `Conversation ${msg.conversation_id}`;
             markActiveHistory();
             setStatus('Picked up where you left off');
-            setTimeout(() => { if (phase === 'idle' && !sttStreaming) setStatus('Ready'); }, 2000);
+            setTimeout(() => { if (phase === 'idle' && !isCapturing()) setStatus('Ready'); }, 2000);
             break;
           }
           case 'chat_model':
@@ -728,7 +748,7 @@
         if (continuousActive) {
           continuousActive = false;
         }
-        if (sttStreaming || micStarting) teardownMic();
+        if (isCapturing() || isMicStarting()) teardownMic();
         settlePending();
         dropLiveUser();
         phase = 'idle';
@@ -741,81 +761,26 @@
 
   // ---------- Microphone ----------
 
-  function sendPCMChunks() {
-    if (!sttChunks.length) return;
-    let total = 0;
-    for (const c of sttChunks) total += c.length;
-    const combined = new Float32Array(total);
-    let off = 0;
-    for (const c of sttChunks) { combined.set(c, off); off += c.length; }
-    sttChunks = [];
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(new Uint8Array(combined.buffer));
-    }
-  }
-
   function teardownMic() {
-    sttStreaming = false;
     singleTurn = false;
-    if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
-    if (sttStream) { sttStream.getTracks().forEach((t) => t.stop()); sttStream = null; }
-    if (sttAudioCtx) { sttAudioCtx.close(); sttAudioCtx = null; }
-    sttProcessor = null;
-    sttChunks = [];
-    micLevel = 0;
+    if (capture.isActive()) capture.cancel(); // also abandons a mic that is still opening
   }
 
   async function startRecording() {
-    if (!sttEnabled || !connected || sttStreaming || micStarting) return;
-    micStarting = true;
+    if (!sttEnabled || !connected || isCapturing() || isMicStarting()) return;
     releaseWhileStarting = false;
-    try {
-      sttStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
-      });
-      sttAudioCtx = new AudioContext({ sampleRate: 16000 });
-      const src = sttAudioCtx.createMediaStreamSource(sttStream);
-      sttProcessor = sttAudioCtx.createScriptProcessor(4096, 1, 1);
-      sttProcessor.onaudioprocess = (e) => {
-        if (!sttStreaming) return;
-        const data = e.inputBuffer.getChannelData(0);
-        sttChunks.push(new Float32Array(data));
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-        micLevel = Math.min(1, Math.sqrt(sum / data.length) * 9);
-      };
-      src.connect(sttProcessor);
-      sttProcessor.connect(sttAudioCtx.destination);
-
-      sttStreaming = true;
-      sttChunks = [];
-      acceptPartials = true;
-      send({ type: 'stt_start' });
-      sttSendTimer = setInterval(sendPCMChunks, 250);
-
-      micStarting = false;
-      setStatus(continuousActive || singleTurn ? 'Listening…' : 'Recording…');
-      refreshUi();
-      if (releaseWhileStarting && (talkMode === 'hold' || singleTurn)) stopRecording();
-    } catch (_err) {
-      micStarting = false;
-      teardownMic();
-      if (continuousActive) continuousActive = false;
-      setStatus('Microphone access denied. Allow it in the browser to talk.');
-      refreshUi();
-    }
+    if (!(await capture.start())) return;
+    setStatus(continuousActive || singleTurn ? 'Listening…' : 'Recording…');
+    refreshUi();
+    if (releaseWhileStarting) stopRecording(); // released, tapped again or sent before the mic opened
   }
 
   function stopRecording() {
-    if (micStarting) { releaseWhileStarting = true; return; }
-    if (!sttStreaming) return;
-    sttStreaming = false;
-    if (sttSendTimer) { clearInterval(sttSendTimer); sttSendTimer = null; }
-
-    // Send remaining audio, then signal stop to server.
-    sendPCMChunks();
-    if (send({ type: 'stt_stop' })) {
+    if (isMicStarting()) { releaseWhileStarting = true; return; }
+    if (!isCapturing()) return;
+    stopSent = false;
+    capture.stop(); // sends the remaining audio, then stt_stop, then releases the mic
+    if (stopSent) {
       phase = 'transcribing';
       setStatus('Transcribing…');
     }
@@ -825,8 +790,7 @@
 
   function cancelRecording() {
     // Tear down audio without sending stt_stop (no utterance to process).
-    if (micStarting) releaseWhileStarting = true;
-    if (sttStreaming) teardownMic();
+    if (capture.isActive()) teardownMic();
     dropLiveUser();
   }
 
@@ -858,7 +822,7 @@
   // capture on a pause in every talk mode; nothing but continuousActive reopens the mic.
   function oneTurnPress() {
     if (!connected || !sttEnabled) return;
-    const capturing = sttStreaming || micStarting;
+    const capturing = isCapturing() || isMicStarting();
     if (singleTurn && capturing) { stopRecording(); return; }
     continuousActive = false; // during hands-free, this makes the current turn the last
     singleTurn = true;
@@ -874,12 +838,12 @@
 
   function talkPress() {
     if (!connected || !sttEnabled) return;
-    if (singleTurn && (sttStreaming || micStarting)) { stopRecording(); return; }
+    if (singleTurn && (isCapturing() || isMicStarting())) { stopRecording(); return; }
     if (talkMode === 'continuous') {
       if (continuousActive) endContinuousConversation();
       else startContinuousConversation();
     } else if (talkMode === 'toggle') {
-      if (sttStreaming || micStarting) stopRecording();
+      if (isCapturing() || isMicStarting()) stopRecording();
       else { bargeIn(); startRecording(); }
     } else {
       bargeIn();
@@ -925,7 +889,7 @@
       if (shell.classList.contains('rail-open')) { closeRail(); return; }
       if (audioPlayer.isActive()) { audioPlayer.stop(); return; }
       if (continuousActive) { endContinuousConversation(); return; }
-      if (sttStreaming) { cancelRecording(); setStatus('Ready'); refreshUi(); }
+      if (capture.isActive()) { cancelRecording(); setStatus('Ready'); refreshUi(); }
       return;
     }
     if (isTypingTarget(document.activeElement)) return;
@@ -1222,7 +1186,7 @@
     const value = event.target && event.target.value;
     if (!value) return;
     if (continuousActive && value !== 'continuous') endContinuousConversation();
-    if (sttStreaming && value !== talkMode) cancelRecording();
+    if (isCapturing() && value !== talkMode) cancelRecording();
     talkMode = value;
     updateInputMode();
   });

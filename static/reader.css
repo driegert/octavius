@@ -67,6 +67,24 @@ body { overflow: hidden; }
   color: #1a1530;
 }
 .add-go svg { width: 16px; height: 16px; }
+.add-go:disabled { background: var(--surface-2); color: var(--ink-3); }
+.add-ok:not(:disabled) { background: var(--tide); color: #10302b; }
+.add-row input[data-file] { color: var(--tide); }
+
+.add-opts { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.temp-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.45rem;
+  font-size: 0.8rem;
+  color: var(--ink-3);
+  cursor: pointer;
+  user-select: none;
+}
+.temp-opt:hover { color: var(--ink-2); }
+.temp-opt input { margin: 0; accent-color: var(--tide); }
+.doc-state-tag.temporary { color: var(--tide); }
 
 .link-btn {
   margin: 0.45rem 0 0 0.2rem;

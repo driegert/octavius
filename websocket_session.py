@@ -1,163 +1,31 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import time
-import uuid
 from contextlib import aclosing
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-try:
-    from fastapi import WebSocket, WebSocketDisconnect
-except ModuleNotFoundError:
-    WebSocket = Any
-
-    class WebSocketDisconnect(RuntimeError):
-        pass
-import docproc_client
-import media_uploads
 from conversation import Conversation
-from reader_playback import ReaderPacer, save_heard_position, stream_reader_audio
+from reader_playback import ReaderPacer
 from settings import settings
-from subagent import run_subagent
-from subagent_dispatcher import SubagentTicket
+from ws_common import WebSocket, WebSocketDisconnect  # noqa: F401  (re-exported)
+from ws_delegation import DelegationMixin, DelegationRecord, ProactiveMessage  # noqa: F401
+from ws_doc_chat import (  # noqa: F401  (re-exported: main.py and tests import these from here)
+    DocChatMixin,
+    chat_model_choice,
+    chat_model_label,
+    chat_models_payload,
+    reader_model_label,
+)
+from ws_item_chat import ItemChatMixin, build_item_chat_context, create_item_conversation  # noqa: F401
+from ws_media import MediaTurnsMixin
+from ws_reader import ReaderPlaybackMixin
+from ws_stt import STT_FINAL_WAIT_S, VAD_SILENCE_SECONDS, STTMixin, StreamingSTTState  # noqa: F401
 
 log = logging.getLogger(__name__)
-
-
-_ITEM_CHAT_MAX_CHARS = 6000
-
-
-def reader_model_label(model: str) -> str:
-    """The Reader chat menu's label for a pi model id, or the id itself."""
-    for m in settings.pi_brain.reader_models:
-        if m.get("model") == model:
-            return m.get("label") or model
-    return model
-
-
-def chat_model_label(model: str) -> str:
-    """The agent menu's label for a pi model id (then the Reader menu's), or the id itself."""
-    for m in settings.pi_brain.chat_models:
-        if m.get("model") and m.get("model") == model:
-            return m.get("label") or model
-    return reader_model_label(model)
-
-
-def chat_model_choice(model_id) -> dict:
-    """The agent menu entry for ``model_id``; unknown or missing: the first (default)."""
-    models = settings.pi_brain.chat_models or [{"id": "auto", "label": "Auto", "model": None}]
-    return next((m for m in models if m.get("id") == model_id), models[0])
-
-
-def chat_models_payload() -> dict:
-    """The agent's model menu, for GET /api/chat-models and the `chat_model` ack."""
-    models = settings.pi_brain.chat_models or [{"id": "auto", "label": "Auto", "model": None}]
-    return {
-        "models": [{"id": m["id"], "label": m.get("label") or m["id"]} for m in models],
-        "default": models[0]["id"],
-        # The menu only does anything on the pi brain; the native loop has one chain.
-        "enabled": settings.pi_brain.enabled,
-    }
-
-
-def build_item_chat_context(item: dict, item_id: int) -> str:
-    # The saved_items stack is retiring and this legacy "chat about a saved item"
-    # flow no longer has a fetch tool, so inline the (capped) content directly.
-    content = item.get("content") or ""
-    if len(content) > _ITEM_CHAT_MAX_CHARS:
-        body = content[:_ITEM_CHAT_MAX_CHARS] + "\n\n...(content truncated)"
-    else:
-        body = content
-    return (
-        f"\n\nYou are discussing saved item #{item_id} with Dave.\n"
-        f"Title: {item['title']}\nType: {item['item_type']}\n\n"
-        f"Content:\n{body}"
-    )
-
-
-def create_item_conversation(item: dict, item_id: int) -> Conversation:
-    conversation = Conversation()
-    conversation._messages[0]["content"] += build_item_chat_context(item, item_id)
-    return conversation
-
-
-VAD_SILENCE_SECONDS = 1.5  # auto-stop after this much silence post-speech
-STT_FINAL_WAIT_S = 3.0  # longest wait at stop for an in-flight Whisper run
-
-# Max chars in the per-delegation preview line shown in the UI badge.
-_DELEGATION_PREVIEW_CHARS = 180
-
-
-def _build_preview(text: str) -> str:
-    """Build a single-line preview of a delegation result for the UI badge."""
-    first_line = text.strip().splitlines()[0] if text.strip() else ""
-    if len(first_line) <= _DELEGATION_PREVIEW_CHARS:
-        return first_line
-    cut = first_line[:_DELEGATION_PREVIEW_CHARS].rsplit(" ", 1)[0]
-    return cut + "..."
-
-
-@dataclass
-class StreamingSTTState:
-    """Per-session state for streaming speech-to-text."""
-    active: bool = False
-    pcm_buffer: bytes = b""
-    last_text: str = ""
-    last_partial: str = ""
-    speech_detected: bool = False
-    silence_start: float | None = None
-    # Bytes of pcm_buffer that last_text covers, and the buffer length at the end of
-    # the last chunk VAD heard speech in: speech past last_len is not in last_text yet.
-    last_len: int = 0
-    speech_end: int = 0
-    # Bumped on every reset, so a transcription started for one utterance cannot
-    # write into the next one or send a partial after its transcript.
-    generation: int = 0
-    _transcribe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    def reset(self):
-        self.active = False
-        self.pcm_buffer = b""
-        self.last_text = ""
-        self.last_partial = ""
-        self.speech_detected = False
-        self.silence_start = None
-        self.last_len = 0
-        self.speech_end = 0
-        self.generation += 1
-
-
-
-async def _acquire_and_release(lock: asyncio.Lock) -> None:
-    async with lock:
-        pass
-
-
-@dataclass
-class DelegationRecord:
-    handle: str
-    domain: str
-    submitted_task: str
-    ticket: SubagentTicket
-    created_at: datetime
-    task: asyncio.Task | None = None
-    status: str = "running"  # 'running' | 'ready' | 'failed'
-    result: str | None = None  # full result text including TOOL DATA, parked for pull
-    preview: str | None = None  # short one-line preview for the UI badge
-    error: str | None = None
-
-
-@dataclass
-class ProactiveMessage:
-    handle: str
-    domain: str
-    text: str
 
 
 @dataclass
@@ -202,7 +70,14 @@ class WebSocketSessionState:
     chat_model: str | None = None
 
 
-class WebSocketSessionHandler:
+class WebSocketSessionHandler(
+    STTMixin,
+    ReaderPlaybackMixin,
+    DocChatMixin,
+    MediaTurnsMixin,
+    ItemChatMixin,
+    DelegationMixin,
+):
     def __init__(self, ws: Any):
         self.state = WebSocketSessionState(
             ws=ws,
@@ -325,27 +200,50 @@ class WebSocketSessionHandler:
         await self.send_payload({"type": "pong"})
 
     async def handle_restore_session(self, data: dict):
+        """A client reconnected: carry on the conversation it was in.
+
+        The connect-time record is retired and the old one becomes this connection's
+        record, so new turns append to it and the id the client holds never changes
+        (it used to get a new id per reconnect, and a second reconnect then restored
+        a record holding only the turns since the first). An id with no messages gets
+        no reply, as before; a record that is not a voice one (see
+        `HistoryRecorder.resume_conversation`) is only loaded into memory.
+        """
         from history import get_conversation_messages
         old_conv_id = data.get("conversation_id")
         if not old_conv_id:
             return
+        if old_conv_id == self.state.history_session.conv_id:
+            await self.send_payload({"type": "session_id", "conversation_id": old_conv_id})
+            return
         with self.state.history.connect() as conn:
             msgs = get_conversation_messages(conn, old_conv_id)
-        if msgs:
-            self.state.conversation.load_from_history(msgs)
-            log.info("Restored conversation %d on reconnect (%d messages)", old_conv_id, len(msgs))
-            pi_brain = getattr(self.ws.app.state, "pi_brain", None)
-            if pi_brain is not None:
-                pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
-                self._apply_chat_model()
-                # A live re-attached process has history the slot may have lost.
-                self._request_pi_warm("restore_session")
-            await self.send_payload(
-                {
-                    "type": "session_id",
-                    "conversation_id": self.state.history_session.conv_id,
-                }
-            )
+        if not msgs:
+            return
+        await self._abandon_turn()
+        resumed = self.state.history.resume_conversation(old_conv_id)
+        if resumed is not None:
+            await self.state.history_session.end_async()  # retire the connect-time record
+            self.state.history_session = resumed
+        self.state.conversation.load_from_history(msgs)
+        log.info(
+            "Restored conversation %d on reconnect (%d messages, %s)",
+            old_conv_id, len(msgs),
+            "continuing it" if resumed is not None else "into a new record",
+        )
+        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
+        if pi_brain is not None:
+            # A no-op when the record was resumed (same id); it still matters when not.
+            pi_brain.rekey(old_conv_id, self.state.history_session.conv_id)
+            self._apply_chat_model()
+            # A live re-attached process has history the slot may have lost.
+            self._request_pi_warm("restore_session")
+        await self.send_payload(
+            {
+                "type": "session_id",
+                "conversation_id": self.state.history_session.conv_id,
+            }
+        )
 
     async def handle_attach_session(self, data: dict):
         """Bind this connection to a durable conversation by client key.
@@ -419,141 +317,6 @@ class WebSocketSessionHandler:
         await self.send_json("status", "Conversation reset.")
         log.info("Conversation reset by client")
 
-    async def handle_doc_chat_open(self, data: dict):
-        """Bind this connection to a Reader document's chat (/reader's chat panel).
-
-        One chat per document: the conversation is keyed `reader-doc:<id>` and resumed
-        on every open. `new: true` renames the old key aside (it stays in history under
-        `reader-doc:<id>:<conversation id>`) and starts a fresh one.
-        """
-        from contextlib import closing
-
-        from history import get_conversation_messages
-        from reader_store import get_document
-        try:
-            doc_id = int(data.get("doc_id"))
-        except (TypeError, ValueError):
-            await self.send_payload({"type": "doc_chat_error", "doc_id": data.get("doc_id"), "error": "No document id."})
-            return
-        with closing(self.state.history.connect()) as conn:
-            doc = get_document(conn, doc_id)
-        if not doc:
-            await self.send_payload({"type": "doc_chat_error", "doc_id": doc_id, "error": "Document not found."})
-            return
-        await self._abandon_turn()
-        await self._discard_pi_process()
-        await self.state.history_session.end_async()
-        key = f"reader-doc:{doc_id}"
-        if data.get("new") is True:
-            with closing(self.state.history.connect()) as conn:
-                conn.execute(
-                    "UPDATE conversations SET session_id = session_id || ':' || id WHERE session_id = ?",
-                    (key,),
-                )
-                conn.commit()
-        self.state.history_session = self.state.history.resume_or_start_conversation(
-            key,
-            source="reader",
-            model=settings.llm_chain[0]["model"],
-        )
-        conv_id = self.state.history_session.conv_id
-        msgs = get_conversation_messages(self.state.history_session.conn, conv_id)
-        if msgs:
-            self.state.conversation.load_from_history(msgs)
-        else:
-            self.state.conversation.reset()
-        self.state.doc_chat_id = doc_id
-        self.state.doc_chat_position = None
-        choice = self._choose_reader_model(data.get("model"))
-        self._request_pi_warm("doc_chat_open", start=True)
-        await self.send_payload(
-            {
-                "type": "doc_chat_opened",
-                "doc_id": doc_id,
-                "title": doc["title"],
-                "conversation_id": conv_id,
-                "messages": [
-                    {"role": m["role"], "content": m["content"]}
-                    for m in msgs
-                    if m["role"] in ("user", "assistant") and m.get("content")
-                ],
-                "models": [{"id": m["id"], "label": m.get("label") or m["id"]} for m in settings.pi_brain.reader_models],
-                "model": choice["id"] if choice else None,
-            }
-        )
-        log.info("Reader chat for document %d on conversation %d (%d messages)", doc_id, conv_id, len(msgs))
-
-    def _choose_reader_model(self, model_id) -> dict | None:
-        """Point this Reader chat's turns at a menu model (unknown or missing: the default)."""
-        models = settings.pi_brain.reader_models
-        if not models:
-            return None
-        choice = next((m for m in models if m.get("id") == model_id), models[0])
-        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
-        if pi_brain is not None and self.state.history_session is not None:
-            pi_brain.prefer(self.state.history_session.conv_id, choice["model"], choice.get("thinking"))
-        return choice
-
-    async def handle_doc_chat_model(self, data: dict):
-        """Dave picked another model in the Reader chat's menu."""
-        if self.state.doc_chat_id is None:
-            return
-        choice = self._choose_reader_model(data.get("model"))
-        if choice is None:
-            return
-        self._request_pi_warm("doc_chat_model")
-        await self.send_payload({"type": "doc_chat_model", "doc_id": self.state.doc_chat_id, "model": choice["id"]})
-        log.info("Reader chat for document %d now on %s", self.state.doc_chat_id, choice["model"])
-
-    def _apply_chat_model(self) -> None:
-        """Point the current agent conversation's pi turns at Dave's chosen model.
-
-        `prefer` is keyed by conversation id, and the id changes on reset, load, restore
-        and delegation pulls, so this runs after each of those and again before every pi
-        turn. A Reader chat keeps its own choice (doc_chat_model); a client that never
-        sent `chat_model` is left alone.
-        """
-        if self.state.chat_model is None or self.state.doc_chat_id is not None:
-            return
-        pi_brain = getattr(self.ws.app.state, "pi_brain", None)
-        if pi_brain is None or self.state.history_session is None:
-            return
-        choice = chat_model_choice(self.state.chat_model)
-        pi_brain.prefer(self.state.history_session.conv_id, choice.get("model"), choice.get("thinking"))
-
-    async def handle_chat_model(self, data: dict):
-        """Dave picked a model for the agent (`{"type": "chat_model", "model": <menu id>}`).
-
-        The choice belongs to the connection, not the conversation: it carries over New
-        chat, loading a past conversation and reconnect-restore. The ack names what is
-        now in effect (an unknown id falls back to the default) and repeats the menu.
-        """
-        choice = chat_model_choice(data.get("model"))
-        self.state.chat_model = choice["id"]
-        self._apply_chat_model()
-        if self.state.doc_chat_id is None and settings.pi_brain.enabled:
-            self._request_pi_warm("chat_model")
-        await self.send_payload({
-            "type": "chat_model",
-            "model": choice["id"],
-            "label": choice.get("label") or choice["id"],
-            **chat_models_payload(),
-        })
-        log.info("Agent model set to %s (%s)", choice["id"], choice.get("model") or "shared chain")
-
-    async def handle_doc_chat_position(self, data: dict):
-        """Where Dave was listening when he asked: the reader chat's "this"."""
-        if self.state.doc_chat_id is None or data.get("doc_id") != self.state.doc_chat_id:
-            return
-        ci, si = data.get("chunk_index"), data.get("sentence_index")
-        if isinstance(ci, int) and isinstance(si, int):
-            position = {"chunk_index": ci, "sentence_index": si}
-            # A selection: place_context rebuilds its text from the document by index.
-            ec, es = data.get("end_chunk_index"), data.get("end_sentence_index")
-            if isinstance(ec, int) and isinstance(es, int):
-                position.update(end_chunk_index=ec, end_sentence_index=es)
-            self.state.doc_chat_position = position
-
     async def handle_load_conversation(self, data: dict):
         from history import get_conversation_messages
         conv_id = data.get("conversation_id")
@@ -564,13 +327,22 @@ class WebSocketSessionHandler:
         if not msgs:
             await self.send_json("status", "Conversation not found.")
             return
+        # An in-flight reply belongs to the conversation being left, not the loaded one.
+        await self._abandon_turn()
         self.state.doc_chat_id = None
         await self._discard_pi_process()
         await self.state.history_session.end_async()
         self.state.conversation.load_from_history(msgs)
-        self.state.history_session = self.state.history.start_conversation(
-            source="voice",
-            model=settings.llm_chain[0]["model"],
+        # A voice conversation is continued in place: new turns append to it, so a
+        # later restore_session of this id reads them. Anything else (a Matrix
+        # thread, a Reader or item chat, another service's record) is only read:
+        # new turns go to a new record, as they always did.
+        self.state.history_session = (
+            self.state.history.resume_conversation(conv_id)
+            or self.state.history.start_conversation(
+                source="voice",
+                model=settings.llm_chain[0]["model"],
+            )
         )
         self._apply_chat_model()  # before the warm, so it warms the chosen model
         # The loaded thread runs on a new process; start it now and warm the template.
@@ -592,6 +364,14 @@ class WebSocketSessionHandler:
                 "type": "conversation_loaded",
                 "conversation_id": conv_id,
                 "messages": history_pairs,
+            }
+        )
+        # The id new turns are recorded under, which is what a client must restore after
+        # a reconnect. Clients persist whatever session_id says.
+        await self.send_payload(
+            {
+                "type": "session_id",
+                "conversation_id": self.state.history_session.conv_id,
             }
         )
         log.info("Loaded conversation %d (%d messages)", conv_id, len(msgs))
@@ -616,614 +396,6 @@ class WebSocketSessionHandler:
             return
         await self.send_json("transcript", user_text)
         self._spawn_turn(user_text, source="text")
-
-    async def handle_image_input(self, data: dict):
-        """Handle the frozen WS media contract's `image_input` frame.
-
-        See docs/ws-media-contract.md. The sidecar has already spooled the
-        file to disk, but the frame's `path` and `size_bytes` are still
-        frame-supplied input: we resolve `path` against
-        `settings.media_spool_dirs` (`media_uploads.resolve_spooled_media`)
-        rather than trusting a bare existence check, check the mime looks
-        like an image, and revalidate the actual file size on disk against
-        `IMAGE_MAX_BYTES` rather than trusting `size_bytes`. Once validated,
-        we build an OpenAI-style multimodal content array and route the turn
-        through the vision chain (agent.py's `use_vision` handling in
-        `stream_agent_turn`).
-        Vision routing is sticky: once a thread has carried an image
-        (`Conversation.has_images`), its follow-up turns stay on the vision
-        chain and the content array stays in the in-memory conversation.
-        Unknown/extra frame fields are ignored by construction (we only read
-        the keys we know about).
-        """
-        path = data.get("path", "")
-        mime = data.get("mime", "") or ""
-        filename = data.get("filename") or (Path(path).name if path else "image")
-        caption = (data.get("text") or "").strip()
-
-        resolved = media_uploads.resolve_spooled_media(path, settings.media_spool_dirs)
-        if resolved is None:
-            log.warning("image_input with missing/unauthorized path: %r", path)
-            await self.send_json("status", "I got notified about an image but couldn't find the file.")
-            await self.send_json("status", "audio_done")
-            return
-        path = str(resolved)
-        if not mime.startswith("image/"):
-            log.warning("image_input with non-image mime %r for %s", mime, path)
-            await self.send_json(
-                "status", f"Received '{filename}' but its type ({mime or 'unknown'}) isn't an image I can view."
-            )
-            await self.send_json("status", "audio_done")
-            return
-
-        # Revalidate actual size on disk rather than trusting the frame's
-        # size_bytes, which describes what the sidecar/uploader claims to
-        # have spooled, not what's actually sitting at `path`.
-        try:
-            actual_size = resolved.stat().st_size
-        except OSError:
-            log.exception("Failed to stat spooled image at %s", resolved)
-            await self.send_json("status", "Received an image but couldn't read the file.")
-            await self.send_json("status", "audio_done")
-            return
-        if actual_size > media_uploads.IMAGE_MAX_BYTES:
-            log.warning("image_input at %s is %d bytes, over the %d cap", resolved, actual_size, media_uploads.IMAGE_MAX_BYTES)
-            await self.send_json("status", "That image is too large for me to view (max 20 MB).")
-            await self.send_json("status", "audio_done")
-            return
-
-        try:
-            image_bytes = resolved.read_bytes()
-        except OSError:
-            log.exception("Failed to read spooled image at %s", resolved)
-            await self.send_json("status", "Received an image but couldn't read the file.")
-            await self.send_json("status", "audio_done")
-            return
-
-        b64 = base64.b64encode(image_bytes).decode("ascii")
-        # Text part sent to the vision model for THIS turn.
-        vision_text = caption or f"The user sent an image: {filename}"
-        # Text representation used everywhere else: transcript display,
-        # persisted history, and memory queries. Never base64 — the content
-        # array lives only in the in-memory conversation (see agent.py's
-        # stream_agent_turn / memory trust boundary).
-        placeholder_text = f"[image: {filename}]" + (f" {caption}" if caption else "")
-        content = [
-            {"type": "text", "text": vision_text},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-        ]
-
-        await self.send_json("transcript", placeholder_text)
-        self._spawn_turn(
-            placeholder_text,
-            source="image",
-            user_content=content,
-            attachment={"type": "image", "reference": path, "title": filename},
-        )
-
-    async def handle_file_input(self, data: dict):
-        """Handle the frozen WS media contract's `file_input` frame.
-
-        See docs/ws-media-contract.md. The frame's `path` is resolved against
-        `settings.media_spool_dirs` (`media_uploads.resolve_spooled_media`)
-        rather than trusted outright. PDFs are submitted to the docproc queue
-        DETERMINISTICALLY (plain code — not an LLM tool-call decision);
-        non-PDF files just get a brief acknowledgement since Octavius can't
-        process them yet. Unknown/extra frame fields are ignored by
-        construction.
-        """
-        path = data.get("path", "")
-        mime = data.get("mime", "") or ""
-        filename = data.get("filename") or (Path(path).name if path else "file")
-        caption = (data.get("text") or "").strip()
-
-        resolved = media_uploads.resolve_spooled_media(path, settings.media_spool_dirs)
-        if resolved is None:
-            log.warning("file_input with missing/unauthorized path: %r", path)
-            await self.send_json("status", "I got notified about a file but couldn't find it on disk.")
-            await self.send_json("status", "audio_done")
-            return
-        path = str(resolved)
-
-        if mime != "application/pdf":
-            await self.send_json("transcript", f"[file: {filename}]")
-            instruction = (
-                f"[Dave just sent a file named '{filename}' (stored at {path}). "
-                "Octavius can only process PDFs into readable text so far. Briefly "
-                "acknowledge receipt, mention PDFs are the only file type handled "
-                "right now, and note where it's stored.]"
-            )
-            self._spawn_turn(
-                instruction, source="file",
-                attachment={"type": "file", "reference": path, "title": filename},
-            )
-            return
-
-        await self.send_json("transcript", f"[file: {filename}]" + (f" {caption}" if caption else ""))
-        await self._handle_pdf_file_input(path, filename, caption)
-
-    async def _handle_pdf_file_input(self, path: str, filename: str, caption: str) -> None:
-        """Deterministically submit a PDF to the docproc queue, then either
-        acknowledge immediately (no caption) or poll in the background and
-        run the caption as instructions once conversion completes.
-        """
-        try:
-            job_id = await docproc_client.submit_job(self.state.mcp_manager, path)
-        except Exception as exc:
-            log.exception("docproc submission failed for %s", path)
-            instruction = (
-                f"[Dave sent a PDF named '{filename}' but submitting it for "
-                f"conversion failed: {exc}. Let him know something went wrong "
-                "and he may need to resend it.]"
-            )
-            self._spawn_turn(
-                instruction, source="file",
-                attachment={"type": "file", "reference": path, "title": filename},
-            )
-            return
-
-        log.info("Submitted PDF %s to docproc: job %s (caption=%r)", path, job_id, bool(caption))
-
-        if caption:
-            # Caption = instructions. Poll in the background (bounded,
-            # doesn't block the WS loop or other sessions) and run the turn
-            # once conversion lands.
-            asyncio.create_task(self._await_pdf_and_run(job_id, filename, caption))
-            return
-
-        # No caption: acknowledge right away rather than making Dave wait on
-        # the conversion.
-        instruction = (
-            f"[Dave just sent a PDF named '{filename}' for conversion (docproc "
-            f"job {job_id}). Briefly acknowledge receipt, mention it's "
-            "converting to markdown in the background, and ask what he'd like "
-            "done with it once it's ready.]"
-        )
-        self._spawn_turn(
-            instruction, source="file",
-            attachment={"type": "file", "reference": path, "title": filename},
-        )
-
-    async def _await_pdf_and_run(self, job_id: str, filename: str, caption: str) -> None:
-        """Background task: poll a docproc job to completion, then run the
-        agent turn with the caption as instructions plus the converted
-        document (inlined if it fits the char budget, else path + excerpt).
-
-        Runs off the WS receive loop (spawned via asyncio.create_task) and
-        calls run_turn directly rather than _spawn_turn: unlike a fresh WS
-        frame, dropping this turn on overlap would silently lose Dave's
-        instructions, so it queues behind turn_lock instead. Wrapped like
-        _run_turn_guarded so a client disconnect mid-poll (this can run for
-        several minutes) doesn't surface as an unretrieved task exception.
-        """
-        try:
-            await self._await_pdf_and_run_unguarded(job_id, filename, caption)
-        except (WebSocketDisconnect, RuntimeError):
-            log.info("PDF-turn aborted: client disconnected mid-conversion (job %s)", job_id)
-        except Exception:
-            log.exception("PDF-turn task crashed (job %s)", job_id)
-
-    async def _await_pdf_and_run_unguarded(self, job_id: str, filename: str, caption: str) -> None:
-        try:
-            row = await docproc_client.poll_job(self.state.mcp_manager, job_id)
-        except docproc_client.DocprocError as exc:
-            log.warning("docproc job %s did not complete: %s", job_id, exc)
-            instruction = (
-                f"[The PDF '{filename}' Dave sent (docproc job {job_id}) failed "
-                f"to convert or timed out: {exc}. Let him know and ask if he'd "
-                "like to try again.]"
-            )
-            await self.run_turn(instruction, source="file")
-            return
-        except Exception as exc:
-            log.exception("Unexpected error polling docproc job %s", job_id)
-            instruction = (
-                f"[Something went wrong checking on the PDF '{filename}' Dave "
-                f"sent (docproc job {job_id}): {exc}. Let him know.]"
-            )
-            await self.run_turn(instruction, source="file")
-            return
-
-        md_path = row.get("result_md_path")
-        doc_text = ""
-        if md_path:
-            try:
-                doc_text = Path(md_path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                log.warning("Could not read converted markdown at %s", md_path)
-
-        if doc_text and len(doc_text) <= settings.docproc_inline_char_budget:
-            body = f"Converted document content:\n\n{doc_text}"
-        elif doc_text:
-            head = doc_text[: settings.docproc_excerpt_chars]
-            body = (
-                f"The converted document is long ({len(doc_text)} chars); here is "
-                f"the markdown path and a head excerpt (use check_document_status "
-                f"with job_id {job_id} to fetch more).\nMarkdown file: {md_path}\n\n"
-                f"Excerpt:\n{head}"
-            )
-        else:
-            body = f"Markdown file: {md_path or '(unknown — use check_document_status)'}"
-
-        instruction = (
-            f"[Dave sent a PDF named '{filename}' with instructions: \"{caption}\". "
-            f"It has finished converting (docproc job {job_id}).\n{body}\n\n"
-            "Follow Dave's instructions using this document content.]"
-        )
-        await self.run_turn(instruction, source="file")
-
-    async def handle_reader_play(self, data: dict):
-        await self.cancel_reader_task()
-        self.state.reader_seq = data.get("seq", 0)
-        # `download` (strict, like `paced`): the client caches the audio without playing it, so the
-        # stream must not touch the reading place. No pacer either: nothing would send reader_heard.
-        download = data.get("download") is True
-        self.state.reader_pacer = ReaderPacer(self.state.reader_seq) if data.get("paced") is True and not download else None
-        self.state.reader_task = asyncio.create_task(
-            stream_reader_audio(
-                self.ws,
-                data["doc_id"],
-                self.state.history.db_path,
-                chunk_index=data.get("chunk_index", 0),
-                sentence_index=data.get("sentence_index", 0),
-                voice=data.get("voice", self.state.voice),
-                seq=data.get("seq", 0),
-                pacer=self.state.reader_pacer,
-                save_place=not download,
-            )
-        )
-
-    async def handle_reader_heard(self, data: dict):
-        # Sent by a paced client as each sentence starts playing. Stale frames from
-        # an earlier play (after a seek) are dropped so they can't move the place back.
-        # Only a live paced stream takes them: once it has ended (and written "finished")
-        # a late or duplicate frame must not move the place back.
-        task = self.state.reader_task
-        if not self.state.reader_pacer or data.get("seq") != self.state.reader_seq or not task or task.done():
-            return
-        # Save before waking the stream: on the last sentence it then writes "finished" after this.
-        self._save_heard_position(data)
-        if self.state.reader_pacer:
-            self.state.reader_pacer.report(data.get("seq"), data.get("sentence_global"))
-
-    async def handle_reader_pause(self, data: dict):
-        await self.cancel_reader_task()
-        self._save_heard_position(data)
-
-    async def handle_reader_stop(self, data: dict):
-        await self.cancel_reader_task()
-        self._save_heard_position(data)
-
-    def _save_heard_position(self, data: dict) -> None:
-        # Optional fields (2026-10-30): the sentence the client was hearing. Saved after
-        # the cancel, so it replaces the further-ahead place the stream recorded.
-        if "chunk_index" in data:
-            save_heard_position(self.state.history.db_path, data.get("doc_id"),
-                                data.get("chunk_index"), data.get("sentence_index"))
-
-    async def handle_item_chat_load(self, data: dict):
-        from history import (
-            get_conversation_messages,
-            get_item_chat_conversation_id,
-            get_saved_item,
-            set_item_chat_conversation,
-        )
-        item_id = data.get("item_id")
-        with self.state.history.connect() as conn:
-            item = get_saved_item(conn, item_id)
-            chat_conv_id = get_item_chat_conversation_id(conn, item_id)
-            msgs = get_conversation_messages(conn, chat_conv_id) if chat_conv_id else []
-
-        if not item:
-            await self.send_payload(
-                {
-                    "type": "item_chat_status",
-                    "item_id": item_id,
-                    "text": "Item not found.",
-                }
-            )
-            return
-
-        if chat_conv_id:
-            conversation = create_item_conversation(item, item_id)
-            for message in msgs:
-                if message["role"] in ("user", "assistant") and message.get("content"):
-                    conversation._messages.append({"role": message["role"], "content": message["content"]})
-            conversation.trim()
-            self.state.item_conversations[item_id] = conversation
-            history_session = self.state.history.start_conversation(
-                service="octavius",
-                source="inbox_chat",
-                model=settings.llm_chain[0]["model"],
-            )
-            self.state.item_history_sessions[item_id] = history_session
-            with self.state.history.connect() as conn:
-                set_item_chat_conversation(conn, item_id, history_session.conv_id)
-            history_pairs = [
-                {"role": message["role"], "content": message["content"]}
-                for message in msgs
-                if message["role"] in ("user", "assistant") and message.get("content")
-            ]
-            await self.send_payload(
-                {
-                    "type": "item_chat_loaded",
-                    "item_id": item_id,
-                    "messages": history_pairs,
-                }
-            )
-            return
-
-        self.state.item_conversations[item_id] = create_item_conversation(item, item_id)
-        history_session = self.state.history.start_conversation(
-            service="octavius",
-            source="inbox_chat",
-            model=settings.llm_chain[0]["model"],
-        )
-        self.state.item_history_sessions[item_id] = history_session
-        with self.state.history.connect() as conn:
-            set_item_chat_conversation(conn, item_id, history_session.conv_id)
-        await self.send_payload({"type": "item_chat_loaded", "item_id": item_id, "messages": []})
-
-    async def handle_item_chat(self, data: dict):
-        from agent import stream_agent_turn
-        item_id = data.get("item_id")
-        user_text = data.get("text", "").strip()
-        if not user_text or item_id not in self.state.item_conversations:
-            return
-
-        conversation = self.state.item_conversations[item_id]
-        history_session = self.state.item_history_sessions.get(item_id)
-        await self.send_payload({"type": "item_chat_status", "item_id": item_id, "text": "Thinking..."})
-        if history_session:
-            await history_session.add_message_async(role="user", content=user_text)
-
-        turn_start = time.monotonic()
-
-        async def item_status_cb(text: str):
-            await self.send_payload({"type": "item_chat_status", "item_id": item_id, "text": text})
-
-        full_parts = []
-        try:
-            async for sentence in stream_agent_turn(
-                conversation,
-                self.state.mcp_manager,
-                user_text,
-                status_callback=item_status_cb,
-                history_session=history_session,
-                session=self,
-                source="inbox_chat",
-            ):
-                full_parts.append(sentence)
-        except Exception as exc:
-            log.exception("Item chat agent failed")
-            await self.send_payload(
-                {
-                    "type": "item_chat_response",
-                    "item_id": item_id,
-                    "text": f"Error: {exc}",
-                }
-            )
-            return
-
-        full_reply = "".join(full_parts).strip()
-        if history_session and full_reply:
-            latency_ms = int((time.monotonic() - turn_start) * 1000)
-            await history_session.add_message_async(
-                role="assistant",
-                content=full_reply,
-                model=settings.llm_chain[0]["model"],
-                latency_ms=latency_ms,
-            )
-
-        await self.send_payload(
-            {
-                "type": "item_chat_response",
-                "item_id": item_id,
-                "text": full_reply or "I'm not sure how to respond to that.",
-            }
-        )
-
-    async def handle_item_chat_reset(self, data: dict):
-        from history import get_saved_item, set_item_chat_conversation
-        item_id = data.get("item_id")
-        old_session = self.state.item_history_sessions.pop(item_id, None)
-        if old_session:
-            await old_session.end_async()
-        self.state.item_conversations.pop(item_id, None)
-
-        with self.state.history.connect() as conn:
-            item = get_saved_item(conn, item_id)
-        if item:
-            conversation = create_item_conversation(item, item_id)
-            self.state.item_conversations[item_id] = conversation
-            history_session = self.state.history.start_conversation(
-                service="octavius",
-                source="inbox_chat",
-                model=settings.llm_chain[0]["model"],
-            )
-            self.state.item_history_sessions[item_id] = history_session
-            with self.state.history.connect() as conn:
-                set_item_chat_conversation(conn, item_id, history_session.conv_id)
-
-        await self.send_payload({"type": "item_chat_loaded", "item_id": item_id, "messages": []})
-
-    async def handle_audio_message(self, audio_bytes: bytes):
-        from stt import transcribe
-
-        # WebM/Opus blobs always start with the EBML magic header.
-        # When VAD auto-stops the streaming session, the browser's audio
-        # capture keeps producing PCM chunks for a brief window; those
-        # arrive after stt_stream.active flips False and would otherwise
-        # land here, get POSTed as audio/webm, and 500 on Whisper. Drop
-        # silently — the streaming path already produced the transcript
-        # for this turn.
-        if not audio_bytes.startswith(b"\x1A\x45\xDF\xA3"):
-            log.debug(
-                "Discarding %d bytes of non-WebM data on non-streaming "
-                "audio path (likely trailing PCM after VAD auto-stop)",
-                len(audio_bytes),
-            )
-            return
-
-        await self.send_json("status", "Transcribing...")
-        try:
-            user_text = await transcribe(audio_bytes)
-        except Exception as exc:
-            log.exception("STT failed")
-            await self.send_json("status", f"Transcription failed: {exc}")
-            return
-
-        if not user_text:
-            await self.send_json("status", "Couldn't hear anything. Try again.")
-            return
-
-        await self.send_json("transcript", user_text)
-        self._spawn_turn(user_text, source="voice")
-
-    # --- Streaming STT ---
-
-    async def handle_stt_start(self, _data: dict):
-        from vad import SileroVAD
-
-        # Starting a new capture means the user is speaking now — cancel any
-        # response still in flight so a "barge-in" actually interrupts it (the
-        # client clears its own audio queue in parallel). In the normal flow the
-        # turn is already finished by the time the mic reopens, so this is a
-        # no-op; it only bites when the user talks over a still-streaming reply.
-        turn = self.state.turn_task
-        pending = self.state.pending_confirm
-        # A turn waiting on a confirmation is not talking: Dave is opening the mic
-        # to answer it, and his transcript resolves it in _spawn_turn.
-        if turn and not turn.done() and (pending is None or pending.done()):
-            turn.cancel()
-            try:
-                await turn
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.debug("In-flight turn ended during barge-in", exc_info=True)
-
-        self.state.stt_stream.reset()
-        self.state.stt_stream.active = True
-        # Dave is speaking: warm pi's cache while he does (never blocks the capture).
-        self._request_pi_warm("stt_start", start=True)
-        if self.state.vad is None:
-            self.state.vad = SileroVAD()
-        else:
-            self.state.vad.reset()
-        log.debug("Streaming STT started")
-
-    async def handle_stt_chunk(self, pcm_bytes: bytes):
-        """Accumulate PCM audio, run VAD, and kick off background transcription."""
-        stream = self.state.stt_stream
-        stream.pcm_buffer += pcm_bytes
-
-        # Run VAD to detect speech/silence
-        vad = self.state.vad
-        if vad is not None:
-            probs = vad.process_chunk(pcm_bytes)
-            max_prob = max(probs) if probs else 0.0
-            has_speech = max_prob >= vad.threshold
-            if has_speech:
-                stream.speech_detected = True
-                stream.silence_start = None
-                stream.speech_end = len(stream.pcm_buffer)
-            elif stream.speech_detected:
-                # Silence after speech — track duration
-                now = time.monotonic()
-                if stream.silence_start is None:
-                    stream.silence_start = now
-                elif (now - stream.silence_start) >= VAD_SILENCE_SECONDS:
-                    # End of turn detected — auto-stop
-                    log.info("VAD: end of speech detected (%.1fs silence)", now - stream.silence_start)
-                    await self.send_payload({"type": "stt_auto_stop"})
-                    await self.handle_stt_stop({})
-                    return
-
-        # Skip transcription if a transcription is already running or buffer too short
-        if stream._transcribe_lock.locked():
-            return
-        if len(stream.pcm_buffer) < 16000 * 4:  # need at least ~1s
-            return
-
-        # Run transcription in background so the message loop isn't blocked
-        asyncio.create_task(self._transcribe_streaming_buffer())
-
-    async def _transcribe_streaming_buffer(self):
-        """Background task: transcribe the current PCM buffer and send a partial."""
-        from stt import transcribe_pcm
-
-        stream = self.state.stt_stream
-        if not stream.active:
-            return
-        async with stream._transcribe_lock:
-            if not stream.active:
-                return
-            buf = stream.pcm_buffer
-            generation = stream.generation
-            try:
-                text = await transcribe_pcm(buf)
-            except Exception:
-                log.debug("Streaming STT chunk transcription failed", exc_info=True)
-                return
-            if not text or stream.generation != generation:
-                return  # empty, or the utterance was reset while Whisper ran
-            stream.last_text, stream.last_len = text, len(buf)
-            # Once the capture has stopped, handle_stt_stop owns the text: a partial
-            # sent now would land after the transcript and show as a second line.
-            if stream.active and text != stream.last_partial:
-                stream.last_partial = text
-                await self.send_payload({"type": "transcript_partial", "text": text})
-
-    async def handle_stt_stop(self, _data: dict):
-        """Finalize streaming transcription and start agent turn.
-
-        The latest partial usually lags the audio: Whisper was still working on a
-        newer buffer when the capture stopped, and that run is the one that heard
-        the last words. So wait (briefly) for an in-flight run instead of using a
-        stale partial, then transcribe once more only if VAD heard speech past
-        what the text covers. Nothing is sent as a partial after this point.
-        """
-        from stt import transcribe_pcm
-
-        stream = self.state.stt_stream
-        stream.active = False
-        generation = stream.generation
-
-        if stream._transcribe_lock.locked():
-            try:
-                await asyncio.wait_for(_acquire_and_release(stream._transcribe_lock), STT_FINAL_WAIT_S)
-            except asyncio.TimeoutError:
-                log.info("STT: in-flight transcription still running after %.1fs; using what we have", STT_FINAL_WAIT_S)
-        if stream.generation != generation:
-            return  # a new capture started while we waited
-
-        last_text = stream.last_text
-        buf = stream.pcm_buffer
-        if (not last_text or stream.speech_end > stream.last_len) and len(buf) >= 1600 * 4:
-            async with stream._transcribe_lock:
-                if not last_text:
-                    await self.send_json("status", "Transcribing...")
-                try:
-                    text = await transcribe_pcm(buf)
-                except Exception as exc:
-                    log.exception("Streaming STT final transcription failed")
-                    if not last_text:
-                        await self.send_json("status", f"Transcription failed: {exc}")
-                        stream.reset()
-                        return
-                    text = ""
-                if stream.generation != generation:
-                    return
-                last_text = text or last_text
-        stream.reset()
-
-        if not last_text:
-            await self.send_json("status", "Couldn't hear anything. Try again.")
-            return
-
-        await self.send_json("transcript", last_text)
-        self._spawn_turn(last_text, source="voice")
 
     async def handle_typing_start(self, _data: dict):
         """A client saw Dave start typing: warm pi while he types (text turns)."""
@@ -1463,311 +635,6 @@ class WebSocketSessionHandler:
         await self.send_json("response", text)
         if self.state.history_session:
             await self.state.history_session.add_message_async(role="assistant", content=text, model=model)
-
-    async def cancel_reader_task(self):
-        if self.state.reader_task and not self.state.reader_task.done():
-            self.state.reader_task.cancel()
-            try:
-                await self.state.reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-    async def _proactive_worker(self) -> None:
-        try:
-            while True:
-                msg = await self.state.proactive_queue.get()
-                try:
-                    async with self.state.turn_lock:
-                        await self._proactive_speak(msg)
-                except Exception:
-                    log.exception("Proactive speak failed for %s", msg.handle)
-        except asyncio.CancelledError:
-            pass
-
-    async def _proactive_speak(self, msg: ProactiveMessage) -> None:
-        from agent import SENTENCE_END
-        from tts import speakable, synthesize
-
-        spoken = msg.text.split("\n\n===TOOL DATA", 1)[0].strip()
-        if not spoken:
-            return
-
-        prelude = f"(from {msg.domain}) "
-        full = prelude + spoken
-        self.state.conversation.add_assistant(full)
-        if self.state.history_session:
-            await self.state.history_session.add_message_async(
-                role="assistant",
-                content=full,
-                model=settings.subagent_llm_chain[0]["model"],
-            )
-
-        await self.send_payload({
-            "type": "subagent_done",
-            "handle": msg.handle,
-            "domain": msg.domain,
-            "text": full,
-        })
-
-        if not self.state.tts_enabled:
-            return
-
-        await self.send_json("status", "Speaking...")
-        parts = SENTENCE_END.split(spoken)
-        sentences = [prelude + parts[0]] + parts[1:] if parts else [full]
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            try:
-                wav_bytes = await synthesize(await speakable(sentence), voice=self.state.voice)
-                await self.send_bytes(wav_bytes)
-            except Exception:
-                log.exception("TTS failed for proactive chunk")
-        await self.send_json("status", "audio_done")
-
-    async def run_inline_subagent(self, domain: str, task: str) -> str:
-        """Run a scoped subagent synchronously and return its result text.
-
-        Used by the consult_specialist local tool. The main agent's turn blocks
-        on this and then weaves the returned text into its spoken reply in the
-        SAME turn (no badge, no pull). A dispatcher ticket is reserved so inline
-        consults still respect endpoint capacity, and the subagent's per-step
-        progress is forwarded to the UI status line so Dave isn't left in
-        silence while it works.
-        """
-        ticket = await self.state.subagent_dispatcher.reserve()
-        try:
-            assigned_url = await ticket.acquire()
-            fallback_url = self.state.subagent_dispatcher.fallback_url()
-
-            async def status_cb(text: str):
-                # run_subagent already maps tool names through tool_labels and
-                # formats the text (e.g. "Email Search..."); forward as-is.
-                await self.send_json("status", text)
-
-            return await run_subagent(
-                task,
-                domain,
-                self.state.mcp_manager,
-                assigned_url=assigned_url,
-                fallback_url=fallback_url,
-                status_callback=status_cb,
-            )
-        finally:
-            await ticket.release()
-
-    async def spawn_delegation(self, domain: str, task: str) -> dict:
-        """Reserve an endpoint, create a background asyncio.Task running the
-        subagent, and register it. Returns a summary dict for the tool response.
-        """
-        ticket = await self.state.subagent_dispatcher.reserve()
-        handle = f"dlg_{uuid.uuid4().hex[:12]}"
-        record = DelegationRecord(
-            handle=handle,
-            domain=domain,
-            submitted_task=task,
-            ticket=ticket,
-            created_at=datetime.now(),
-        )
-        record.task = asyncio.create_task(self._run_and_announce(record))
-        self.state.delegations[handle] = record
-        log.info(
-            "Spawned delegation %s (domain=%s, dispatcher=%s)",
-            handle, domain, self.state.subagent_dispatcher.snapshot(),
-        )
-        return {
-            "handle": handle,
-            "domain": domain,
-            "status": "started",
-        }
-
-    async def cancel_delegation(self, handle: str) -> dict:
-        record = self.state.delegations.get(handle)
-        if record is None:
-            return {"cancelled": False, "reason": "unknown handle", "handle": handle}
-        if record.ticket.assigned_url is None:
-            await record.ticket.cancel_pending()
-        if record.task and not record.task.done():
-            record.task.cancel()
-        self.state.delegations.pop(handle, None)
-        return {"cancelled": True, "handle": handle}
-
-    async def _emit_delegation_update(self, record: DelegationRecord) -> None:
-        await self.send_payload({
-            "type": "delegation_update",
-            "handle": record.handle,
-            "domain": record.domain,
-            "submitted_task": record.submitted_task,
-            "status": record.status,
-            "preview": record.preview,
-            "error": record.error,
-        })
-
-    async def _run_and_announce(self, record: DelegationRecord) -> None:
-        assigned_url: str | None = None
-        try:
-            await self._emit_delegation_update(record)
-            assigned_url = await record.ticket.acquire()
-            fallback_url = self.state.subagent_dispatcher.fallback_url()
-
-            async def status_cb(text: str):
-                label = settings.tool_labels.get(text, text)
-                await self.send_payload({
-                    "type": "subagent_progress",
-                    "handle": record.handle,
-                    "domain": record.domain,
-                    "text": label,
-                })
-
-            result = await run_subagent(
-                record.submitted_task,
-                record.domain,
-                self.state.mcp_manager,
-                assigned_url=assigned_url,
-                fallback_url=fallback_url,
-                status_callback=status_cb,
-            )
-            spoken = result.split("\n\n===TOOL DATA", 1)[0].strip()
-            record.result = result
-            record.preview = _build_preview(spoken)
-            record.status = "ready"
-            await self._emit_delegation_update(record)
-            if self.state.proactive_speak_enabled:
-                await self.state.proactive_queue.put(
-                    ProactiveMessage(handle=record.handle, domain=record.domain, text=result)
-                )
-        except asyncio.CancelledError:
-            log.info("Delegation %s cancelled", record.handle)
-            # Cancelled records are removed by cancel_delegation already.
-            raise
-        except Exception as exc:
-            log.exception("Delegation %s crashed", record.handle)
-            record.status = "failed"
-            record.error = str(exc)
-            await self._emit_delegation_update(record)
-        finally:
-            await record.ticket.release()
-            # Note: we intentionally do NOT remove the record here. Ready and
-            # failed records stay parked until the user pulls or dismisses
-            # them (or the WebSocket disconnects, at which point cleanup
-            # cancels everything).
-
-    async def handle_delegation_list(self, _data: dict):
-        """Reply with the current snapshot. Used by the UI on connect/reconnect."""
-        for record in list(self.state.delegations.values()):
-            await self._emit_delegation_update(record)
-
-    async def handle_delegation_dismiss(self, data: dict):
-        handle = data.get("handle", "")
-        record = self.state.delegations.get(handle)
-        if record is None:
-            return
-        if record.status == "running":
-            # Treat dismiss-while-running as cancel.
-            await self.cancel_delegation(handle)
-        else:
-            self.state.delegations.pop(handle, None)
-        await self.send_payload({"type": "delegation_removed", "handle": handle})
-
-    async def handle_delegation_pull(self, data: dict):
-        handle = data.get("handle", "")
-        mode = data.get("mode", "merge")
-        await self.pull_delegation(handle=handle, mode=mode, via="ui")
-
-    async def pull_delegation(self, handle: str, mode: str, via: str = "ui") -> str:
-        """Bring a parked delegation result into the conversation.
-
-        mode='merge' injects the result into the running conversation. When
-        called via UI, runs a fresh agent turn so Octavius summarizes the
-        result naturally; when called via the agent's pull_delegation tool
-        (via='voice'), returns the result text as the tool observation so
-        the in-flight agent turn can incorporate it.
-
-        mode='new' (UI only) creates a fresh history session seeded with the
-        original task and result, and tells the UI to switch to it. The
-        previous conversation is left intact.
-        """
-        record = self.state.delegations.get(handle)
-        if record is None:
-            return f"No pending delegation found with handle {handle}."
-        if record.status == "running":
-            return (
-                f"Delegation {handle} is still running. "
-                "I'll pull the result once it's ready."
-            )
-
-        if record.status == "failed":
-            err = record.error or "unknown error"
-            self.state.delegations.pop(handle, None)
-            await self.send_payload({"type": "delegation_removed", "handle": handle})
-            return f"That delegation failed: {err}"
-
-        spoken = (record.result or "").split("\n\n===TOOL DATA", 1)[0].strip()
-        domain = record.domain
-        submitted = record.submitted_task
-        self.state.delegations.pop(handle, None)
-        await self.send_payload({"type": "delegation_removed", "handle": handle})
-
-        if mode == "new":
-            await self._spawn_seeded_conversation(domain, submitted, spoken)
-            return f"Started a new conversation seeded with the {domain} results."
-
-        # mode == "merge"
-        if via == "ui":
-            prompt = (
-                f"[I earlier delegated this {domain} task and the specialist has "
-                f"now returned. Original task: {submitted}\n\nSpecialist reply:\n"
-                f"{spoken}\n\nSummarize this for me conversationally.]"
-            )
-            await self.send_json("transcript", f"(reviewing {domain} results)")
-            self._spawn_turn(prompt, source="text")
-            return ""
-        # via == "voice" — caller is the agent mid-turn; hand it the text.
-        return spoken
-
-    async def _spawn_seeded_conversation(
-        self, domain: str, submitted_task: str, result_text: str,
-    ) -> None:
-        """End the current history session, start a new one seeded with the
-        delegation exchange, and tell the UI to switch to it.
-        """
-        if self.state.history_session:
-            await self.state.history_session.end_async()
-        new_session = self.state.history.start_conversation(
-            service="octavius",
-            source="voice",
-            model=settings.llm_chain[0]["model"],
-        )
-        seed_user = (
-            f"[Earlier I delegated this {domain} task and the specialist has "
-            f"returned. Original task: {submitted_task}]"
-        )
-        seed_assistant = result_text or "(no content)"
-        await new_session.add_message_async(
-            role="user", content=seed_user, model=None,
-        )
-        await new_session.add_message_async(
-            role="assistant",
-            content=seed_assistant,
-            model=settings.subagent_llm_chain[0]["model"],
-        )
-        self.state.history_session = new_session
-        self.state.conversation.reset()
-        self.state.conversation.add_user(seed_user)
-        self.state.conversation.add_assistant(seed_assistant)
-        await self.send_payload({
-            "type": "conversation_loaded",
-            "conversation_id": new_session.conv_id,
-            "messages": [
-                {"role": "user", "content": seed_user},
-                {"role": "assistant", "content": seed_assistant},
-            ],
-        })
-        await self.send_payload({
-            "type": "session_id",
-            "conversation_id": new_session.conv_id,
-        })
 
 
 async def handle_websocket_session(ws: Any):
