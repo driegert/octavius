@@ -12,22 +12,27 @@ app through the process environment: the systemd user unit pulls it from
 
 Key groups:
 - STT, TTS, and LLM endpoints
-- LLM endpoint auth (`OCTAVIUS_LLM_API_KEYS`, a JSON map of `scheme://host:port` → bearer token)
+- LLM endpoint auth (`OCTAVIUS_LR_API_KEY` for the lilripper ports, exported from `~/.config/secrets.env`; `OCTAVIUS_LLM_API_KEYS`, a JSON map of `scheme://host:port` → bearer token, for any other keyed endpoint)
+- LLM model routing per role in `~/.config/octavius/models.json`
 - reader storage and reader LLM settings
 - download and reader directories
 - summary and embedding service endpoints
 
-Secrets belong in `~/.config/octavius/env` (mode 0600, outside the repo), never in the
-tree. See "Configuration and secrets" in `CLAUDE.md`.
+Non-secret config belongs in `~/.config/octavius/env` (mode 0600, outside the repo); the
+lilripper token lives only in `~/.config/secrets.env`. Never put secrets in the tree. See
+`docs/runbooks/config-and-secrets.md`; `AGENTS.md` indexes the other runbooks.
 
 ## Development
 
 Run the app:
 
 ```bash
-set -a; . ~/.config/octavius/env; set +a   # only if a keyed endpoint is in the chain
-uv run python main.py
+set -a; . ~/.config/octavius/env; . ~/.config/secrets.env; set +a   # secrets only if a keyed endpoint is in the chain
+OCTAVIUS_DB_PATH=/media/extra_stuff/octavius/octavius_history.db uv run python main.py
 ```
+
+Stop the service first (it holds `:8030`). Without `OCTAVIUS_DB_PATH` the app opens the stale
+repo copy of the history DB and its startup check refuses to run.
 
 Run the tests:
 

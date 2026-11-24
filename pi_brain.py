@@ -1214,7 +1214,7 @@ async def stream_pi_turn(
                                     for b in (msg.get("content") if isinstance(msg.get("content"), list) else [])
                                 )
                                 if stop == "length" and not text and not has_tool_call:
-                                    # max_tokens spent on reasoning (AGENTS.md, gemma4): nothing to say.
+                                    # max_tokens spent on reasoning (docs/runbooks/model-routing.md, gemma4): nothing to say.
                                     empty_output = True
                                 if text:
                                     answer_parts.append(text)

@@ -9,7 +9,7 @@ UI_PAGES = {"/", "/inbox", "/reader"}
 # No 'unsafe-inline' anywhere: the pages have no inline <script>, no on*=
 # handlers and no style="" attributes (JS sets styles through el.style, which
 # CSP allows). Adding an external resource means adding its origin here; see
-# AGENTS.md "Frontend". connect-src 'self' covers same-origin ws:/wss: (CSP3).
+# docs/runbooks/frontend.md. connect-src 'self' covers same-origin ws:/wss: (CSP3).
 UI_CSP = "; ".join([
     "default-src 'self'",
     "script-src 'self'",  # marked is vendored in static/vendor/, so no CDN is trusted

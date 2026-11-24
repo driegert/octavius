@@ -75,7 +75,7 @@ the first changed token. Don't re-litigate this.
    briefly flashing tool-call XML.
 
 4. **Keep-warm ping** for the 2.77 s cold-start hit, and cross-host failover for the subagent
-   chain (see `status.md` Near-Term Work #4 — both tiers are still on `lilripper`).
+   chain (see `status.md` Near-Term Work #4 — both tiers are still on `lilripper`). *(Since done: every role now fails over across hosts; see `docs/runbooks/model-routing.md`. The old item is in `docs/status-archive.md`.)*
 
 ## The `:8020` 502s — closed 2026-07-31
 
