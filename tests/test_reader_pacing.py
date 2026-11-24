@@ -104,13 +104,13 @@ class ReaderHeardWiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_play_with_paced_creates_a_pacer_and_heard_feeds_it(self):
         handler = self._handler()
-        with patch("websocket_session.stream_reader_audio", side_effect=lambda *a, **k: asyncio.sleep(10)) as stream:
+        with patch("ws_reader.stream_reader_audio", side_effect=lambda *a, **k: asyncio.sleep(10)) as stream:
             await handler.handle_reader_play({"doc_id": 1, "seq": 7, "paced": True})
         pacer = stream.call_args.kwargs["pacer"]
         self.assertIsInstance(pacer, ReaderPacer)
         pacer.start(0)
         saves = []
-        with patch("websocket_session.save_heard_position", side_effect=lambda *a: saves.append(a[1:])):
+        with patch("ws_reader.save_heard_position", side_effect=lambda *a: saves.append(a[1:])):
             await handler.handle_reader_heard({"seq": 6, "doc_id": 1, "chunk_index": 0, "sentence_index": 9,
                                                "sentence_global": 9})   # stale play: ignored
             await handler.handle_reader_heard({"seq": 7, "doc_id": 1, "chunk_index": 0, "sentence_index": 2,
@@ -118,17 +118,17 @@ class ReaderHeardWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saves, [(1, 0, 2)])
         self.assertEqual(pacer.heard, 2)
         await handler.cancel_reader_task()
-        with patch("websocket_session.save_heard_position", side_effect=lambda *a: saves.append(a[1:])):
+        with patch("ws_reader.save_heard_position", side_effect=lambda *a: saves.append(a[1:])):
             await handler.handle_reader_heard({"seq": 7, "doc_id": 1, "chunk_index": 0, "sentence_index": 3,
                                                "sentence_global": 3})   # stream over: ignored
         self.assertEqual(saves, [(1, 0, 2)])
 
     async def test_play_without_paced_is_unpaced(self):
         handler = self._handler()
-        with patch("websocket_session.stream_reader_audio", side_effect=lambda *a, **k: asyncio.sleep(10)) as stream:
+        with patch("ws_reader.stream_reader_audio", side_effect=lambda *a, **k: asyncio.sleep(10)) as stream:
             await handler.handle_reader_play({"doc_id": 1, "seq": 1})
         self.assertIsNone(stream.call_args.kwargs["pacer"])
-        with patch("websocket_session.save_heard_position") as save:
+        with patch("ws_reader.save_heard_position") as save:
             await handler.handle_reader_heard({"seq": 1, "doc_id": 1, "chunk_index": 0, "sentence_index": 3})
         save.assert_not_called()
         await handler.cancel_reader_task()

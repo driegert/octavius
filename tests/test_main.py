@@ -7,9 +7,11 @@ from pathlib import Path
 try:
     from fastapi.testclient import TestClient
     import main
+    import ui_security
 except ModuleNotFoundError:
     TestClient = None
     main = None
+    ui_security = None
 
 
 class _FakeConn:
@@ -216,14 +218,14 @@ class MainTests(unittest.TestCase):
         for path, page in pages.items():
             with self.subTest(path=path):
                 self.assertEqual(page.status_code, 200)
-                self.assertEqual(page.headers["content-security-policy"], main.UI_CSP)
+                self.assertEqual(page.headers["content-security-policy"], ui_security.UI_CSP)
                 self.assertEqual(page.headers["x-content-type-options"], "nosniff")
                 self.assertEqual(page.headers["referrer-policy"], "same-origin")
         # JSON and assets are not documents: no policy needed there.
         self.assertNotIn("content-security-policy", health.headers)
         self.assertNotIn("content-security-policy", asset.headers)
 
-        csp = main.UI_CSP
+        csp = ui_security.UI_CSP
         self.assertNotIn("unsafe-inline", csp)
         self.assertNotIn("unsafe-eval", csp)
         directives = dict(d.strip().split(" ", 1) for d in csp.split(";"))
