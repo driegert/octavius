@@ -1,6 +1,5 @@
 // Shared microphone capture for the streaming STT protocol: stt_start, Float32 LE PCM
-// (16 kHz mono) as binary frames every 250 ms, then stt_stop. Shaped after
-// startRecording/stopRecording/cancelRecording in index-app.js so that page can adopt it later.
+// (16 kHz mono) as binary frames every 250 ms, then stt_stop. Used by index-app.js and reader-chat.js.
 (function() {
   // options: send(objOrBytes) -> bool (JSON-serialisable objects are the control frames,
   // Uint8Array is PCM), onLevel(0..1), onError(err).
@@ -101,7 +100,12 @@
       if (streaming) teardown();
     }
 
-    return { start, stop, cancel, isActive: () => streaming || starting };
+    return {
+      start, stop, cancel,
+      isActive: () => streaming || starting,
+      isStreaming: () => streaming,
+      isStarting: () => starting,
+    };
   }
 
   window.OctaviusVoiceCapture = { createCapture };
