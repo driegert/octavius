@@ -247,7 +247,7 @@ class WebSocketSessionTests(unittest.TestCase):
                 "history.get_conversation_messages",
                 return_value=[
                     {"role": "user", "content": "q1", "model": None},
-                    {"role": "assistant", "content": "a1", "model": "pi:lrv-p01/qwen3.8-27b"},
+                    {"role": "assistant", "content": "a1", "model": "pi:lrv-p01/xray"},
                     {"role": "assistant", "content": "a2", "model": "gemma4-26b-a4b"},
                 ],
             ), patch("websocket_session.chat_model_label", side_effect=lambda m: f"L({m})"):
@@ -256,7 +256,7 @@ class WebSocketSessionTests(unittest.TestCase):
             loaded = [json.loads(t) for t in ws.sent if '"conversation_loaded"' in t][-1]
             self.assertEqual(loaded["messages"], [
                 {"role": "user", "content": "q1"},
-                {"role": "assistant", "content": "a1", "answered_by": "L(lrv-p01/qwen3.8-27b)"},
+                {"role": "assistant", "content": "a1", "answered_by": "L(lrv-p01/xray)"},
                 {"role": "assistant", "content": "a2"},
             ])
 

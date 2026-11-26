@@ -203,7 +203,7 @@ class MainTests(unittest.TestCase):
                 data = client.get("/api/chat-models").json()
         self.assertEqual(data["default"], "auto")
         self.assertEqual(data["models"][0], {"id": "auto", "label": "Auto"})
-        self.assertIn("qwen3.8-27b", [m["id"] for m in data["models"]])
+        self.assertIn("xray", [m["id"] for m in data["models"]])
         self.assertIsInstance(data["enabled"], bool)
 
     def test_ui_pages_carry_content_security_policy(self):

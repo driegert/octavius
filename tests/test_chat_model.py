@@ -44,11 +44,11 @@ class ChatModelTests(unittest.TestCase):
             h = self._handler()
             conv = h.state.history_session.conv_id
             with patch.object(type(settings.pi_brain), "enabled", new_callable=mock.PropertyMock, return_value=True):
-                await h.handle_chat_model({"model": "qwen3.8-27b"})
+                await h.handle_chat_model({"model": "xray"})
             ack = self._last(h, "chat_model")
-            self.assertEqual((ack["model"], ack["label"]), ("qwen3.8-27b", "Qwen3.8 27B"))
+            self.assertEqual((ack["model"], ack["label"]), ("xray", "Xray: Qwen3.8 27B"))
             self.assertEqual(ack["default"], "auto")
-            self.assertEqual(self.prefs[-1], (conv, "lrv-p01/qwen3.8-27b", None))
+            self.assertEqual(self.prefs[-1], (conv, "lrv-p01/xray", None))
             self.assertEqual(self.warms[-1], (conv, "chat_model"))
             # Back to Auto clears the preference (prefer with no model).
             await h.handle_chat_model({"model": "auto"})
@@ -62,7 +62,7 @@ class ChatModelTests(unittest.TestCase):
     def test_choice_carries_over_new_chat_and_load(self):
         async def run():
             h = self._handler()
-            await h.handle_chat_model({"model": "gemma4-12b"})
+            await h.handle_chat_model({"model": "gamma"})
             old = h.state.history_session.conv_id
             h.state.history_session.add_message("user", "hello")
             h.state.history_session.add_message("assistant", "hi")
@@ -70,11 +70,11 @@ class ChatModelTests(unittest.TestCase):
             await h.handle_reset({})
             fresh = h.state.history_session.conv_id
             self.assertNotEqual(fresh, old)
-            self.assertEqual(self.prefs[-1], (fresh, "wh-vllm/gemma4-12b", "off"))
+            self.assertEqual(self.prefs[-1], (fresh, "wh-vllm/gamma", "off"))
 
             await h.handle_load_conversation({"conversation_id": old})
             loaded = h.state.history_session.conv_id
-            self.assertEqual(self.prefs[-1], (loaded, "wh-vllm/gemma4-12b", "off"))
+            self.assertEqual(self.prefs[-1], (loaded, "wh-vllm/gamma", "off"))
             # Applied before the load's warm, so the warm is on the chosen model.
             self.assertEqual(self.warms[-1], (loaded, "load_conversation"))
 
@@ -93,17 +93,17 @@ class ChatModelTests(unittest.TestCase):
         async def run():
             h = self._handler()
             h.state.doc_chat_id = 7
-            await h.handle_chat_model({"model": "qwen3.8-27b"})
+            await h.handle_chat_model({"model": "xray"})
             self.assertEqual(self.prefs, [])
-            self.assertEqual(self._last(h, "chat_model")["model"], "qwen3.8-27b")
+            self.assertEqual(self._last(h, "chat_model")["model"], "xray")
 
         asyncio.run(run())
 
     def test_native_brain_stores_the_choice_without_a_pi_manager(self):
         async def run():
             h = self._handler(pi=False)
-            await h.handle_chat_model({"model": "qwen3.8-27b"})
-            self.assertEqual(h.state.chat_model, "qwen3.8-27b")
+            await h.handle_chat_model({"model": "xray"})
+            self.assertEqual(h.state.chat_model, "xray")
             self.assertIs(self._last(h, "chat_model")["enabled"], chat_models_payload()["enabled"])
 
         asyncio.run(run())

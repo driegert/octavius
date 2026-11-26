@@ -483,7 +483,7 @@ which stopped serving the 12B on 2026-10-30). Built as (b): see "Step 4 result".
 Built (b), Octavius-driven over RPC. `pi_brain.py`: `FailoverState` (the shared hop),
 `HopFailure` / `classify_provider_error`, `PiRpcProcess.use_model` (`set_model`), the attempt
 loop and silence watchdog in `stream_pi_turn`; settings `OCTAVIUS_PI_FALLBACK_MODELS`
-(`lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b`), `OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300),
+(`lrv-p01/xray,wh-vllm/gamma`), `OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300),
 `OCTAVIUS_PI_SILENCE_TIMEOUT_S` (30). pi_harness `octavius-warm.ts`: per-model templates and
 credentials on template warms.
 

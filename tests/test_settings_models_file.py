@@ -68,26 +68,26 @@ class ModelsFileTests(unittest.TestCase):
         ts = "http://workhorse:8010/v1/chat/completions"
         self.assertEqual(
             [(e["url"], e["model"]) for e in st.llm_chain],
-            [(lb, "gemma4-26b-a4b"), (lr, "qwen3.8-27b"), (ts, "gemma4-12b")],
+            [(lb, "gemma4-26b-a4b"), (lr, "xray"), (ts, "gamma")],
         )
         self.assertEqual(
             st.subagent_llm_chain,
             [
-                {"url": ts, "model": "gemma4-12b", "role": "primary", "capacity": 3},
-                {"url": lr, "model": "qwen3.8-27b", "role": "fallback", "capacity": 2},
+                {"url": ts, "model": "gamma", "role": "primary", "capacity": 3},
+                {"url": lr, "model": "xray", "role": "fallback", "capacity": 2},
             ],
         )
         self.assertEqual(
             [(e["url"], e["model"]) for e in st.vision_llm_chain],
-            [(lb, "gemma4-26b-a4b"), (lr, "qwen3.8-27b")],
+            [(lb, "gemma4-26b-a4b"), (lr, "xray")],
         )
-        self.assertEqual((st.reader.llm_url, st.reader.llm_model), (ts, "gemma4-12b"))
+        self.assertEqual((st.reader.llm_url, st.reader.llm_model), (ts, "gamma"))
         self.assertEqual(
-            (st.reader.llm_fallback_url, st.reader.llm_fallback_model), (lr, "qwen3.8-27b")
+            (st.reader.llm_fallback_url, st.reader.llm_fallback_model), (lr, "xray")
         )
-        self.assertEqual((st.summary_url, st.summary_model), (ts, "gemma4-12b"))
+        self.assertEqual((st.summary_url, st.summary_model), (ts, "gamma"))
         self.assertEqual(
-            (st.summary_fallback_url, st.summary_fallback_model), (lr, "qwen3.8-27b")
+            (st.summary_fallback_url, st.summary_fallback_model), (lr, "xray")
         )
 
     def test_code_default_tts_is_phonon(self):
@@ -155,7 +155,7 @@ class ModelsFileTests(unittest.TestCase):
             ]}
         })
         self.assertEqual(st.summary_model, "primary-m")
-        self.assertEqual(st.summary_fallback_model, "qwen3.8-27b")
+        self.assertEqual(st.summary_fallback_model, "xray")
 
     def test_reader_fallback_reads_the_second_entry(self):
         """The reader is single-endpoint per call, but the role's second entry
@@ -190,10 +190,10 @@ class ModelsFileTests(unittest.TestCase):
             os.environ.pop(var, None)
         _, st = self._load()
         pi = st.pi_brain
-        self.assertEqual(pi.fallback_models, ("lrv-p01/qwen3.8-27b", "wh-vllm/gemma4-12b"))
+        self.assertEqual(pi.fallback_models, ("lrv-p01/xray", "wh-vllm/gamma"))
         self.assertEqual((pi.failover_cooldown_s, pi.silence_timeout_s), (300.0, 30.0))
         self.assertEqual((pi.first_output_timeout_s, pi.tool_timeout_s), (60.0, 120.0))
-        self.assertEqual(pi.model_contexts["wh-vllm/gemma4-12b"], 65536)
+        self.assertEqual(pi.model_contexts["wh-vllm/gamma"], 65536)
         os.environ["OCTAVIUS_PI_FALLBACK_MODELS"] = " a/b , c/d ,"
         os.environ["OCTAVIUS_PI_FAILOVER_COOLDOWN_S"] = "60"
         os.environ["OCTAVIUS_PI_SILENCE_TIMEOUT_S"] = "12.5"

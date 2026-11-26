@@ -445,8 +445,8 @@ class PiWarmTests(unittest.IsolatedAsyncioTestCase):
 
 
 PRIMARY = "fake/model"
-HOP2 = "lrv-p01/qwen3.8-27b"
-HOP3 = "wh-vllm/gemma4-12b"
+HOP2 = "lrv-p01/xray"
+HOP3 = "wh-vllm/gamma"
 
 
 class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
@@ -574,7 +574,7 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
         order = [r["type"] if r["type"] != "prompt" else r.get("message") for r in self.records()
                  if r["type"] in ("set_model", "set_thinking_level", "prompt")]
         self.assertEqual(order[-1], "/warm")
-        self.assertIn({"type": "set_model", "provider": "wh-vllm", "modelId": "gemma4-12b"}, self._cmds("set_model"))
+        self.assertIn({"type": "set_model", "provider": "wh-vllm", "modelId": "gamma"}, self._cmds("set_model"))
         self.assertIn({"type": "set_thinking_level", "level": "off"}, self._cmds("set_thinking_level"))
         await self.manager.discard(conv)
         self.assertNotIn(conv, self.manager.preferred)
@@ -593,7 +593,7 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(prompts), 2)
         self.assertTrue(prompts[0].endswith("hi"))
         self.assertTrue(prompts[1].startswith(pi_brain.RESUME_MESSAGE[:30]))
-        self.assertIn({"type": "set_model", "provider": "lrv-p01", "modelId": "qwen3.8-27b"},
+        self.assertIn({"type": "set_model", "provider": "lrv-p01", "modelId": "xray"},
                       [{k: v for k, v in r.items() if k != "id"} for r in self.records("set_model")])
         health = self.manager.failover.health()
         self.assertEqual(health["current"], HOP2)
@@ -677,7 +677,7 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runs()[-1], (HOP2, "hi"))
         # Started on the hop through the environment, so there was no set_model for it.
         self.assertEqual(self.manager._new_process().env["PI_OCTAVIUS_MODEL"], HOP2)
-        self.assertEqual(len([r for r in self.records("set_model") if r["modelId"] == "qwen3.8-27b"]), 1)
+        self.assertEqual(len([r for r in self.records("set_model") if r["modelId"] == "xray"]), 1)
 
     async def test_live_processes_switch_before_their_next_turn(self):
         await self.turn("hi", _Session(self.manager, conv_id=9))  # a process on the primary
@@ -688,7 +688,7 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
         await self.turn("again", _Session(self.manager, conv_id=9))
         sets = self.records("set_model")
         self.assertEqual(len(sets), before + 1)
-        self.assertEqual(sets[-1]["modelId"], "qwen3.8-27b")
+        self.assertEqual(sets[-1]["modelId"], "xray")
         self.assertEqual(self.runs()[-1], (HOP2, "again"))
 
     async def test_primary_is_tried_again_after_the_cooldown(self):
@@ -929,7 +929,7 @@ class PiFailoverTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.02)
         order = [r["type"] + ":" + str(r.get("modelId") or r.get("message")) for r in self.records()
                  if r["type"] in ("set_model", "prompt")][-2:]
-        self.assertEqual(order, ["set_model:qwen3.8-27b", "prompt:/warm"])
+        self.assertEqual(order, ["set_model:xray", "prompt:/warm"])
         # and a short-lived warm process starts on the hop too
         self.assertEqual(self.manager._new_process(["--no-session"]).model, HOP2)
 

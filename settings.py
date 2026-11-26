@@ -135,8 +135,8 @@ class TTSSettings:
 # lilbuddy 26B 295k, lilripper :8020 262144, workhorse 64K (see docs/pi-backend-design.md).
 DEFAULT_PI_MODEL_CONTEXTS = {
     "lb-unified/gemma4-26b-a4b": 295000,
-    "lrv-p01/qwen3.8-27b": 262144,
-    "wh-vllm/gemma4-12b": 65536,
+    "lrv-p01/xray": 262144,
+    "wh-vllm/gamma": 65536,
 }
 
 # Models Dave can pick in /reader's chat panel; the first is the default. `thinking` is a pi
@@ -144,10 +144,10 @@ DEFAULT_PI_MODEL_CONTEXTS = {
 # answers a document question in ~1-2 s where the 26B thinks for 8-17 s (measured
 # 2026-10-31), and the document anchors it; the others are there for questions that matter.
 DEFAULT_PI_READER_MODELS = [
-    {"id": "gemma4-12b", "label": "Gemma4 12B (fast)", "model": "wh-vllm/gemma4-12b", "thinking": "off"},
+    {"id": "gamma", "label": "Gamma: Gemma4 12B (fast)", "model": "wh-vllm/gamma", "thinking": "off"},
     {"id": "gemma4-26b", "label": "Gemma4 26B-A4B", "model": "lb-unified/gemma4-26b-a4b", "thinking": None},
-    {"id": "qwen3.8-27b", "label": "Qwen3.8 27B", "model": "lrv-p01/qwen3.8-27b", "thinking": None},
-    {"id": "glm-5.3-flash", "label": "GLM-5.3 Flash", "model": "lr-p23/glm-5.3-flash", "thinking": None},
+    {"id": "xray", "label": "Xray: Qwen3.8 27B", "model": "lrv-p01/xray", "thinking": None},
+    {"id": "uv", "label": "UV: GLM-5.3 Flash", "model": "lr-p23/uv", "thinking": None},
 ]
 
 # Models Dave can pick for the agent's own conversations (`chat_model` WS frame,
@@ -183,7 +183,7 @@ class PiBrainSettings:
     warm_debounce_s: float = 5.0
     warm_retry_s: float = 60.0
     # Failover (rollout step 4): the hops after `model`, in order, as pi provider/model ids.
-    fallback_models: tuple = ("lrv-p01/qwen3.8-27b", "wh-vllm/gemma4-12b")
+    fallback_models: tuple = ("lrv-p01/xray", "wh-vllm/gamma")
     # How long failed-over processes stay on a fallback before the next turn tries `model` again.
     failover_cooldown_s: float = 300.0
     # Longest the model may go without a streaming event (thinking deltas count), from the
@@ -653,11 +653,11 @@ def load_settings() -> Settings:
     #     that sends max_tokens to it must budget for reasoning tokens. Size any
     #     new lilbuddy alias against the whole box's residency budget: an OOM
     #     there once took every port on the box down.
-    #  2. lilripper:8020 qwen3.8-27b — vLLM, behind auth, effectively always
+    #  2. lilripper:8020 xray — vLLM, behind auth, effectively always
     #     warm. Fallback only: Dave loads other models there by hand, and as a
     #     primary every turn would evict them. lilripper:8010 now serves only
-    #     glm-5.3-flash and is not used by Octavius.
-    #  3. workhorse:8010 gemma4-12b — third host, so voice survives lilbuddy
+    #     uv and is not used by Octavius.
+    #  3. workhorse:8010 gamma — third host, so voice survives lilbuddy
     #     and lilripper both being down. vLLM, open, 64K ctx, text-only (image
     #     turns use the vision chain). Was triplestuffed:8010 until 2026-10-31,
     #     when triplestuffed stopped serving gemma4-12b.
@@ -666,11 +666,11 @@ def load_settings() -> Settings:
         "OCTAVIUS_LLM_CHAIN",
         [
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
-            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gemma4-12b"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "xray"},
+            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gamma"},
         ],
     )
-    # Subagents (inline consult_specialist) run on workhorse:8010 gemma4-12b
+    # Subagents (inline consult_specialist) run on workhorse:8010 gamma
     # (vLLM). `capacity` 3 leaves room for main hop 3, the reader and summaries,
     # which share the model, and for pi_harness agents that also use it. :8020 is the HTTP-level fallback
     # (capacity is a guess: vLLM's limit is not readable from /v1/models); the
@@ -680,13 +680,13 @@ def load_settings() -> Settings:
         "subagent",
         "OCTAVIUS_SUBAGENT_LLM_CHAIN",
         [
-            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gemma4-12b", "role": "primary", "capacity": 3},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b", "role": "fallback", "capacity": 2},
+            {"url": "http://workhorse:8010/v1/chat/completions", "model": "gamma", "role": "primary", "capacity": 3},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "xray", "role": "fallback", "capacity": 2},
         ],
     )
     # Vision-capable chain for turns carrying image content (image_input WS
     # frames). Kept separate from llm_chain because that chain's third hop is
-    # chosen for availability, not modality: workhorse's gemma4-12b is
+    # chosen for availability, not modality: workhorse's gamma is
     # text-only and must never be added here. Check architecture.input_modalities
     # AND --ubatch-size (>= ~1152 for a gemma4v image) before adding a hop.
     vision_llm_chain = _role_chain(
@@ -694,7 +694,7 @@ def load_settings() -> Settings:
         "OCTAVIUS_VISION_LLM_CHAIN",
         [
             {"url": "http://lilbuddy:8010/v1/chat/completions", "model": "gemma4-26b-a4b"},
-            {"url": "http://lilripper:8020/v1/chat/completions", "model": "qwen3.8-27b"},
+            {"url": "http://lilripper:8020/v1/chat/completions", "model": "xray"},
         ],
     )
     tts = TTSSettings(
@@ -710,13 +710,13 @@ def load_settings() -> Settings:
     # the reader. A file that lists a single reader entry means "no fallback".
     _reader_in_file = "reader" in _MODEL_ROLES
     _reader_fb_url = None if _reader_in_file else "http://lilripper:8020/v1/chat/completions"
-    _reader_fb_model = None if _reader_in_file else "qwen3.8-27b"
+    _reader_fb_model = None if _reader_in_file else "xray"
     reader = ReaderSettings(
         directory=_env_str("OCTAVIUS_READER_DIR", "/home/dave/octavius-reader"),
         llm_url=_role_single("reader", "url", "OCTAVIUS_READER_LLM_URL", "http://workhorse:8010/v1/chat/completions"),
-        # gemma4-12b on workhorse, the same model as that host's other consumers
+        # gamma on workhorse, the same model as that host's other consumers
         # (subagent, summary, main hop 3). Verify the alias is live after rebuilds.
-        llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "gemma4-12b"),
+        llm_model=_role_single("reader", "model", "OCTAVIUS_READER_LLM_MODEL", "gamma"),
         # The reader is single-endpoint per call, but the role's second entry is
         # its failover target (reader_text.py tries it before giving up to
         # strip_latex). Generation params are NOT read from here: LLMChainClient.
@@ -752,17 +752,17 @@ def load_settings() -> Settings:
         tool_labels=_env_json("OCTAVIUS_TOOL_LABELS", DEFAULT_TOOL_LABELS),
         mcp_servers=_env_json("OCTAVIUS_MCP_SERVERS", DEFAULT_MCP_SERVERS),
         system_prompt=_env_str("OCTAVIUS_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
-        # workhorse gemma4-12b primary, lilripper:8020 qwen3.8-27b fallback.
+        # workhorse gamma primary, lilripper:8020 xray fallback.
         # Summaries fire at conversation END, long after Dave has moved on, so
         # :8020 stays the fallback: a background job must not evict a model he
         # loaded there by hand. SummaryClient carries a model PER URL and sends
         # auth_headers, so the authed fallback is fine.
         summary_url=_role_single("summary", "url", "OCTAVIUS_SUMMARY_URL", "http://workhorse:8010/v1/chat/completions"),
         summary_fallback_url=_env_str("OCTAVIUS_SUMMARY_FALLBACK_URL", "http://lilripper:8020/v1/chat/completions"),
-        summary_model=_role_single("summary", "model", "OCTAVIUS_SUMMARY_MODEL", "gemma4-12b"),
+        summary_model=_role_single("summary", "model", "OCTAVIUS_SUMMARY_MODEL", "gamma"),
         # The two endpoints do not share an alias; the fallback needs its own
         # model or it 400s.
-        summary_fallback_model=_env_str("OCTAVIUS_SUMMARY_FALLBACK_MODEL", "qwen3.8-27b"),
+        summary_fallback_model=_env_str("OCTAVIUS_SUMMARY_FALLBACK_MODEL", "xray"),
         summary_timeout=_env_int("OCTAVIUS_SUMMARY_TIMEOUT", 60),
         # lilbuddy is primary as of 2026-08-12. It was demoted on 2026-08-10 for
         # being unreachable (a tailscale fault, since fixed) — and because a dead
@@ -828,7 +828,7 @@ def load_settings() -> Settings:
             warm_retry_s=_env_float("OCTAVIUS_PI_WARM_RETRY_S", 60.0),
             fallback_models=tuple(
                 m.strip() for m in os.getenv(
-                    "OCTAVIUS_PI_FALLBACK_MODELS", "lrv-p01/qwen3.8-27b,wh-vllm/gemma4-12b",
+                    "OCTAVIUS_PI_FALLBACK_MODELS", "lrv-p01/xray,wh-vllm/gamma",
                 ).split(",") if m.strip()
             ),
             failover_cooldown_s=_env_float("OCTAVIUS_PI_FAILOVER_COOLDOWN_S", 300.0),
