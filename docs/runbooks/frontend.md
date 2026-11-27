@@ -26,7 +26,7 @@ Read this before editing anything under `static/`, adding an external resource, 
 
 ## `/` UI details worth knowing
 
-- Model menu (pi brain, since 2026-11-04): shown in the header with the voice, hidden unless `enabled` and more than one entry; saved as `chatModel` in `octavius-prefs` and sent on every connect even if never picked (null = default), so `/` always gets `answered_by`. Each reply is captioned ("— Qwen3.8 27B"), in coral with "(X failed)" when a picked non-Auto model did not answer. `conversation_loaded` carries `answered_by` on assistant messages recorded as `pi:<model>` (native turns record the chain's first model, so they get none). Protocol: [pi-brain.md](pi-brain.md).
+- Model menu (pi brain, since 2026-11-04): shown in the header with the voice, hidden unless `enabled` and more than one entry; saved as `chatModel` in `octavius-prefs` and sent on every connect even if never picked (null = default), so `/` always gets `answered_by`. Each reply is captioned ("— Xray: Inkling2 Mini"), in coral with "(X failed)" when a picked non-Auto model did not answer. `conversation_loaded` carries `answered_by` on assistant messages recorded as `pi:<model>` (native turns record the chain's first model, so they get none). Protocol: [pi-brain.md](pi-brain.md).
 - The wordmark, title and placeholder follow the picked voice's agent name (Octavius/Octavja).
 - `/`'s rail resizes like `/reader`'s (`railW` in `octavius-prefs`).
 - Prefs keys: `octavius-prefs` (`/`: `chatModel`, `mathSpeed`, `railW`, voice), `octavius-reader-prefs` (`railW`, `chatW`).

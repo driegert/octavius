@@ -146,7 +146,7 @@ DEFAULT_PI_MODEL_CONTEXTS = {
 DEFAULT_PI_READER_MODELS = [
     {"id": "gamma", "label": "Gamma: Gemma4 12B (fast)", "model": "wh-vllm/gamma", "thinking": "off"},
     {"id": "gemma4-26b", "label": "Gemma4 26B-A4B", "model": "lb-unified/gemma4-26b-a4b", "thinking": None},
-    {"id": "xray", "label": "Xray: Qwen3.8 27B", "model": "lrv-p01/xray", "thinking": None},
+    {"id": "xray", "label": "Xray: Inkling2 Mini", "model": "lrv-p01/xray", "thinking": None},
     {"id": "uv", "label": "UV: GLM-5.3 Flash", "model": "lr-p23/uv", "thinking": None},
 ]
 

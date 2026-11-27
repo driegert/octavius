@@ -31,7 +31,7 @@ All URLs are `/v1/chat/completions`. Why it looks like this:
 
 - **2026-10-28:** `lilripper:8010` now serves only `glm-5.3-flash`, so Octavius no longer uses it. Interactive roles went to lilbuddy's 26B; non-interactive to the 12B; `:8020` became every role's fallback.
 - **2026-10-31:** triplestuffed stopped serving `gemma4-12b` (its router 502'd and four roles were silently failing over), so they moved to workhorse.
-- **2026-11-26:** the three primary models got role names, which the servers answer to alongside the old ids: `gamma` = Gemma4-12B, `xray` = Qwen3.8-27B, `uv` = GLM-5.3-Flash. Config and pi model ids use the new names.
+- **2026-11-26:** the three primary models got role names, which the servers answer to alongside the old ids: `gamma` = Gemma4-12B, `xray` = Inkling2-mini, `uv` = GLM-5.3-Flash. Config and pi model ids use the new names. `:8020` switched from Qwen3.8-27B to Inkling2-mini at the same time; it still answers to `qwen3.8-27b`, but that name now serves Inkling (commit `12e47fe`'s message says xray = Qwen3.8-27B, which is wrong).
 - **`:8020` is never a primary in `models.json`**: Dave loads other models onto it by hand, and as a primary every turn would evict them (demoted 2026-08-18). Exception (2026-11-26): pi's primary is `lrv-p01/xray`, set in `~/.config/octavius/env` (see [pi-brain.md](pi-brain.md)). Same reason summaries are workhorse-first: they fire at conversation end, long after Dave moved on.
 - **lilbuddy's two slots** (`--parallel 2`) are shared by the main and vision primaries — fine for one user; a voice turn plus two concurrent image threads queue.
 - **workhorse** (vLLM, open, 64K ctx, text-only) is shared with pi_harness's research agents (6 concurrent requests measured, none queued), which is why subagent `capacity` is 3. Main hop 3 there means voice survives lilbuddy and lilripper both being down.
@@ -50,7 +50,7 @@ Role specifics:
 `complete_with_tools` uses each *entry's* model (payload model ignored) and fails over on any 4xx/5xx, so an alias missing from an endpoint hard-400s and silently burns a hop. Dave rebuilds catalogs; after any router work, a config naming a missing alias is the first suspect (the cause on 2026-08-26 and 2026-10-28).
 
 - `lilripper:8010` (llama.cpp, auth): `uv` only, text-only. Unused by Octavius.
-- `lilripper:8020` (**vLLM**, auth): `xray` = `Qwen3.8-27B-AWQ-INT4`, `max_model_len` 262144, takes images, effectively always warm (0.3 s).
+- `lilripper:8020` (**vLLM**, auth): `xray` = `Inkling-2-Mini-W4A16-g128-gptq` (a looping MoE; also answers to `inkling-2-mini` and `qwen3.8-27b`), `max_model_len` 267520, takes images (checked 2026-11-27), fast enough to be pi's primary.
 - `workhorse:8010` (**vLLM**, open): `gamma`, `max_model_len` 65536, text-only.
 - `triplestuffed:8010`: no longer serves `gemma4-12b`; 502 on 2026-10-31. Unused. (Also pulled once on 2026-08-08 as a zombie: listed fine, never generated, so failover burned the full 120 s read timeout.)
 - `lilbuddy:8010` (llama.cpp router, open, 12 aliases, all `--parallel 2`): loaded `gemma4-26b-a4b` (295k ctx, `--ubatch-size 2048`, text+image+video) and `nemotron-3.5-super` (307k ctx, text+image+video); unloaded `DEFAULT`, `agents-a1-4b`, `gemma4-12b` (text+image+audio — a different build from workhorse's), `muse-glimmer-30b`, `neohorse-1-9b`, `ornith-1.5-9b`, `qwen3.5-4b`, `qwen3.5-9b`, `qwen3.6-35b-a3b-mtp-q4-{code,general}`.

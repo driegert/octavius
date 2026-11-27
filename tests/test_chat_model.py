@@ -46,7 +46,7 @@ class ChatModelTests(unittest.TestCase):
             with patch.object(type(settings.pi_brain), "enabled", new_callable=mock.PropertyMock, return_value=True):
                 await h.handle_chat_model({"model": "xray"})
             ack = self._last(h, "chat_model")
-            self.assertEqual((ack["model"], ack["label"]), ("xray", "Xray: Qwen3.8 27B"))
+            self.assertEqual((ack["model"], ack["label"]), ("xray", "Xray: Inkling2 Mini"))
             self.assertEqual(ack["default"], "auto")
             self.assertEqual(self.prefs[-1], (conv, "lrv-p01/xray", None))
             self.assertEqual(self.warms[-1], (conv, "chat_model"))

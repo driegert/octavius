@@ -350,7 +350,7 @@
     scrollToEnd();
   }
 
-  // "— Qwen3.8 27B" under a reply. Flagged when a model Dave picked was not the one
+  // "— Xray: Inkling2 Mini" under a reply. Flagged when a model Dave picked was not the one
   // that answered (it failed and the turn moved to the shared chain).
   function addAnsweredBy(el, label) {
     if (!label) return;
