@@ -28,7 +28,7 @@ pi_harness `octavius-warm.ts`, RPC prompt `/warm`. `stt_start`, a `typing_start`
 
 Octavius-driven over RPC (`set_model`); pi's own auto-retry is off.
 
-- Hops: `OCTAVIUS_PI_MODEL` (default `lb-unified/gemma4-26b-a4b`), then `OCTAVIUS_PI_FALLBACK_MODELS` (`lrv-p01/xray,wh-vllm/gamma`).
+- Hops: `OCTAVIUS_PI_MODEL`, then `OCTAVIUS_PI_FALLBACK_MODELS`. Live (`~/.config/octavius/env`, since 2026-11-26): `lrv-p01/xray` → `lb-unified/gemma4-26b-a4b` → `wh-vllm/gamma`; Dave found xray faster than the 26B. Code defaults (env unset): `lb-unified/gemma4-26b-a4b`, then `lrv-p01/xray,wh-vllm/gamma`.
 - A turn moves on a provider error (5xx, 401, 400/404, refused connect) or when the model is silent for `OCTAVIUS_PI_FIRST_OUTPUT_TIMEOUT_S` (60, before first output) or `OCTAVIUS_PI_SILENCE_TIMEOUT_S` (30, after; thinking counts, tool runs do not). It resumes in the same pi session with a short note; a tool that already ran is not re-run.
 - A context overflow moves that turn alone to a bigger-window hop (`OCTAVIUS_PI_MODEL_CONTEXTS`), never touching the shared hop.
 - One shared current hop (`FailoverState`): new processes start on it, live ones `set_model` before their turn, and `OCTAVIUS_PI_FAILOVER_COOLDOWN_S` (300) later the next turn tries the primary again. Each failover logs at WARNING; `/health` → `pi_brain.failover`.

@@ -44,7 +44,7 @@ Browser / Android / Matrix sidecar ──/ws──> FastAPI (main.py)
                                               │  websocket_session.py + ws_* mixins
                                               ├─ STT: faster-whisper (127.0.0.1:8502) + Silero VAD
                                               ├─ turn brain, per turn:
-                                              │    pi (live; OCTAVIUS_BRAIN=pi, code default native): `pi --mode rpc` per conversation,
+                                              │    pi (live; OCTAVIUS_BRAIN=pi, code default native): `pi --mode rpc` per conversation, primary xray on lilripper:8020,
                                               │        tools via pi_harness + Octavius's own tools on 127.0.0.1:8032
                                               │    native (agent.py): streaming loop, ~20 core tools
                                               │        ├─ direct: web search/read, vault, papers, reader, PDF, download, memory, history
@@ -100,7 +100,7 @@ Tests: `tests/test_<module>.py` per subsystem; WebSocket behaviour in `tests/tes
 - **Run `scripts/octavius-models check` before blaming the app** (native chains, vision, reader, summary, subagents). A rotated token (401) and a vanished alias (400) both look like ordinary failovers; `/health`'s `endpoints_rejecting_credentials` and per-endpoint `last_error_kind` say which. → `config-and-secrets.md`
 - **Model catalogs and modalities churn.** Re-curl `/v1/models` (llama.cpp routers expose launch args there) before trusting an alias, `--parallel`, or image support. → `model-routing.md`
 - **`max_tokens` on a thinking model must budget for reasoning**, or it returns `finish_reason: length` with empty content. gemma4 puts reasoning in `reasoning_content`. → `model-routing.md`
-- **`lilripper:8020` is never a primary** (Dave loads models there by hand), and the `OCTAVIUS_LR_API_KEY` header must reach only lilripper (other hosts share port 8010). → `model-routing.md`, `config-and-secrets.md`
+- **`lilripper:8020` is never a primary in `models.json`** (Dave loads models there by hand); the one exception is pi's primary, `lrv-p01/xray`, since 2026-11-26. The `OCTAVIUS_LR_API_KEY` header must reach only lilripper (other hosts share port 8010). → `model-routing.md`, `config-and-secrets.md`
 - **Treat an unreachable MCP server as fatal at startup.** `connect_all()` catches connect errors and marks the server `connect_failed` in `/health` → `mcp.servers`, yet a web-search URL pointing at an unconfigured port crash-looped the service on 2026-08-26, so loopback MCP units must be up first. The other startup blocker is `assert_history_serveable`: `OCTAVIUS_DB_PATH` must match sites.toml's `[corpora.history] database` and the search sidecars must exist (see the startup log). → `mcp-servers.md`, `history-and-search.md`
 - **CSP: no inline `<script>`, `on*=` handlers, `style="..."`, `eval`, or `javascript:` URLs**; third-party JS is vendored; KaTeX via `katex.render`, never `renderToString`. → `frontend.md`
 - **Android depends on STT/VAD/`audio_done` semantics**: pure silence never auto-stops, an empty transcription sends no `audio_done`, and every other turn path must end with one. Change them only together with `../octavius-android`. → `voice-and-websocket.md`
