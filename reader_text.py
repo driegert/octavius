@@ -279,7 +279,7 @@ async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
                 {"role": "system", "content": MATH_TO_SPEECH_PROMPT},
                 {"role": "user", "content": text},
             ],
-            # Thinking off: a rewrite needs no reasoning, and with it on gemma4-12b spent all
+            # Thinking off: a rewrite needs no reasoning, and with it on gamma (Gemma4-12B) spent all
             # 8192 tokens thinking and returned no content (53 s, then the fallback) where
             # it answers correctly in under a second without (measured 2026-10-31).
             "chat_template_kwargs": {"enable_thinking": False},
@@ -299,7 +299,7 @@ async def _llm_convert_math(_client: httpx.AsyncClient, text: str) -> str:
             log.warning("Reader LLM at %s returned a truncated think block — trying next", url)
             continue
         if result and (MATH_RE.search(result) or _LEFTOVER_LATEX.search(result)):
-            # e.g. gemma4-12b echoing an aligned block before its rewrite
+            # e.g. gamma (Gemma4-12B) echoing an aligned block before its rewrite
             log.warning("Reader LLM at %s left LaTeX in its rewrite — trying next", url)
             continue
         if result:
@@ -480,7 +480,7 @@ async def _table_overview(table_md: str, caption_text: str | None) -> str | None
                 {"role": "system", "content": TABLE_OVERVIEW_PROMPT},
                 {"role": "user", "content": user},
             ],
-            # Thinking off, as for math: gemma4-12b otherwise spends the budget thinking.
+            # Thinking off, as for math: gamma (Gemma4-12B) otherwise spends the budget thinking.
             "chat_template_kwargs": {"enable_thinking": False},
             "max_tokens": 4096,
             "temperature": 0.1,
